@@ -1,6 +1,9 @@
 [package]
 name = "mango"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A compiler that compiles TypeScript to native machine code"
 
 [dependencies]
+inkwell = { version = "0.5", features = ["llvm18-0"] }
+clap = { version = "4", features = ["derive"] }
