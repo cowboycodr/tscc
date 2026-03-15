@@ -367,7 +367,8 @@ impl<'ctx> Codegen<'ctx> {
             StmtKind::FunctionDecl { .. }
             | StmtKind::Import { .. }
             | StmtKind::Break
-            | StmtKind::Continue => true,
+            | StmtKind::Continue
+            | StmtKind::Empty => true,
         }
     }
 
@@ -726,6 +727,8 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 Ok(())
             }
+
+            StmtKind::Empty => Ok(()),
         }
     }
 

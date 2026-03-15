@@ -18,6 +18,9 @@ use crate::modules::ModuleGraph;
 use crate::parser::parser::Parser;
 use crate::types::checker::TypeChecker;
 
+/// The C runtime source, embedded at compile time.
+const RUNTIME_C_SOURCE: &str = include_str!("../runtime/runtime.c");
+
 /// Compile a source string directly (no file read needed).
 /// Used by tests and programmatic callers.
 pub fn compile_source(source: &str, output: &str, optimize: bool) -> Result<(), String> {
@@ -196,13 +199,17 @@ pub fn link_and_output(codegen: &Codegen, output: &str) -> Result<(), String> {
         .write_object_file(&obj_path)
         .map_err(|e| format!("Failed to write object file: {}", e))?;
 
-    let runtime_src = find_runtime()?;
+    // Write the embedded runtime source to a temp file next to the output
+    let runtime_c_path = PathBuf::from(format!("{}_runtime.c", output));
     let runtime_obj = PathBuf::from(format!("{}_runtime.o", output));
+    std::fs::write(&runtime_c_path, RUNTIME_C_SOURCE)
+        .map_err(|e| format!("Failed to write runtime source: {}", e))?;
+
     let cc_status = Command::new("cc")
         .args([
             "-c",
             "-O2",
-            runtime_src.to_str().unwrap(),
+            runtime_c_path.to_str().unwrap(),
             "-o",
             runtime_obj.to_str().unwrap(),
         ])
@@ -210,6 +217,7 @@ pub fn link_and_output(codegen: &Codegen, output: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to compile runtime: {}", e))?;
 
     if !cc_status.success() {
+        let _ = std::fs::remove_file(&runtime_c_path);
         return Err("Failed to compile runtime".to_string());
     }
 
@@ -226,10 +234,14 @@ pub fn link_and_output(codegen: &Codegen, output: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to link: {}", e))?;
 
     if !link_status.success() {
+        let _ = std::fs::remove_file(&obj_path);
+        let _ = std::fs::remove_file(&runtime_c_path);
+        let _ = std::fs::remove_file(&runtime_obj);
         return Err("Failed to link executable".to_string());
     }
 
     let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&runtime_c_path);
     let _ = std::fs::remove_file(&runtime_obj);
 
     Ok(())
@@ -241,27 +253,4 @@ pub fn resolve_import_path(parent_dir: &Path, source: &str) -> Result<PathBuf, S
         target.set_extension("ts");
     }
     std::fs::canonicalize(&target).map_err(|e| format!("Cannot resolve '{}': {}", source, e))
-}
-
-pub fn find_runtime() -> Result<PathBuf, String> {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()));
-
-    let candidates = [
-        exe_dir
-            .as_ref()
-            .map(|d| d.join("runtime").join("runtime.c")),
-        exe_dir.as_ref().map(|d| d.join("runtime.c")),
-        Some(PathBuf::from("runtime/runtime.c")),
-        Some(PathBuf::from("runtime.c")),
-    ];
-
-    for candidate in candidates.iter().flatten() {
-        if candidate.exists() {
-            return Ok(candidate.clone());
-        }
-    }
-
-    Err("Could not find runtime.c. Make sure it's in the runtime/ directory.".to_string())
 }

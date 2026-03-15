@@ -23,6 +23,14 @@ impl Parser {
     // --- Statements ---
 
     fn statement(&mut self) -> Result<Statement, CompileError> {
+        // Empty statement — bare semicolons are valid TypeScript
+        if self.match_token(&Token::Semicolon) {
+            return Ok(Statement {
+                kind: StmtKind::Empty,
+                span: self.current_span(),
+            });
+        }
+
         match self.peek_token() {
             Token::Let | Token::Const => self.variable_declaration(false),
             Token::Function => self.function_declaration(false),
@@ -90,6 +98,8 @@ impl Parser {
 
         self.expect(&Token::LeftBrace, "Expected '{' before function body")?;
         let body = self.block_body()?;
+
+        self.consume_semicolon()?;
 
         Ok(Statement {
             kind: StmtKind::FunctionDecl {

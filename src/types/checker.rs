@@ -272,7 +272,7 @@ impl TypeChecker {
                 Ok(())
             }
 
-            StmtKind::Break | StmtKind::Continue => {
+            StmtKind::Break | StmtKind::Continue | StmtKind::Empty => {
                 // Validation that we're inside a loop could be added here
                 Ok(())
             }

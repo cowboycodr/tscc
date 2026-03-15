@@ -57,6 +57,7 @@ pub enum StmtKind {
     },
     Break,
     Continue,
+    Empty,
 }
 
 #[derive(Debug, Clone)]

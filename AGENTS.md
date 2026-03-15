@@ -153,4 +153,4 @@ fn feature_name() {
 - `inkwell` `AggregateValueEnum` doesn't impl `Into<BasicValueEnum>` — call `.into_struct_value().into()`
 - Template literals are desugared to string concatenation in the scanner (not a parser feature)
 - LLVM contexts are safe to create per-thread; each test gets its own
-- The `find_runtime()` helper works in tests because `cargo test` runs from project root
+- The C runtime source (`runtime/runtime.c`) is embedded into the binary at compile time via `include_str!()`. During linking, it is written to a temp file, compiled with `cc -O2`, linked, and cleaned up. This means tscc works from any directory without needing the source tree.
