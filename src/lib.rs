@@ -220,6 +220,7 @@ pub fn link_and_output(codegen: &Codegen, output: &str) -> Result<(), String> {
             "-o",
             output,
             "-lm",
+            "-Wl,-w",
         ])
         .status()
         .map_err(|e| format!("Failed to link: {}", e))?;

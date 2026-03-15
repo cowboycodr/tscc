@@ -37,10 +37,6 @@ enum Commands {
         /// Input .ts file
         file: String,
 
-        /// Output executable name (defaults to filename without .ts extension)
-        #[arg(short, long)]
-        output: Option<String>,
-
         /// Time the execution (equivalent to prefixing with `time`)
         #[arg(long)]
         benchmark: bool,
@@ -76,20 +72,17 @@ fn main() {
         }
         Commands::Run {
             file,
-            output,
             benchmark,
             debug,
         } => {
-            let output_name = output.unwrap_or_else(|| {
-                let stem = Path::new(&file)
-                    .file_stem()
-                    .unwrap()
-                    .to_string_lossy()
-                    .to_string();
-                format!("./{}", stem)
-            });
+            let temp_dir = std::env::temp_dir();
+            let output_name = temp_dir
+                .join(format!("tscc_run_{}", std::process::id()))
+                .to_string_lossy()
+                .to_string();
             let optimize = !debug;
             if let Err(e) = tscc::compile_file(&file, &output_name, false, optimize) {
+                let _ = std::fs::remove_file(&output_name);
                 eprintln!("\x1b[1;31merror\x1b[0m: {}", e);
                 std::process::exit(1);
             }
@@ -112,6 +105,7 @@ fn main() {
                     .expect("Failed to run compiled program")
             };
 
+            let _ = std::fs::remove_file(&output_name);
             std::process::exit(status.code().unwrap_or(1));
         }
     }
