@@ -73,6 +73,7 @@ pub enum Token {
     StarStar,         // **
     Question,         // ?
     QuestionQuestion, // ??
+    QuestionDot,      // ?.
 
     // Keywords (control flow)
     Break,

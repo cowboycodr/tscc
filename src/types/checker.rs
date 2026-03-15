@@ -146,10 +146,20 @@ impl TypeChecker {
                 let param_types: Vec<Type> = params
                     .iter()
                     .map(|p| {
-                        p.type_ann
+                        let ty = p
+                            .type_ann
                             .as_ref()
                             .map(|ann| self.resolve_type_annotation(ann))
-                            .unwrap_or(Type::Unknown)
+                            .unwrap_or(Type::Unknown);
+                        // Rest params are always array type
+                        if p.is_rest {
+                            match ty {
+                                Type::Array(_) => ty,
+                                _ => Type::Array(Box::new(Type::Number)),
+                            }
+                        } else {
+                            ty
+                        }
                     })
                     .collect();
 
@@ -456,6 +466,56 @@ impl TypeChecker {
                 Ok(())
             }
 
+            StmtKind::ForOf {
+                var_name,
+                iterable,
+                body,
+            } => {
+                self.check_expr(iterable)?;
+                self.push_scope();
+                // Element type is Number (arrays hold f64)
+                self.define(var_name.clone(), Type::Number, false);
+                for stmt in body {
+                    self.check_statement(stmt)?;
+                }
+                self.pop_scope();
+                Ok(())
+            }
+
+            StmtKind::ArrayDestructure {
+                names,
+                initializer,
+                is_const,
+            } => {
+                self.check_expr(initializer)?;
+                // Bind each name as Number (array elements are f64)
+                for name in names {
+                    self.define(name.clone(), Type::Number, *is_const);
+                }
+                Ok(())
+            }
+
+            StmtKind::ObjectDestructure {
+                names,
+                initializer,
+                is_const,
+            } => {
+                let init_type = self.check_expr(initializer)?;
+                let fields = match &init_type {
+                    Type::Object { fields } => Some(fields.clone()),
+                    Type::Class { fields, .. } => Some(fields.clone()),
+                    _ => None,
+                };
+                for (local, key) in names {
+                    let ty = fields
+                        .as_ref()
+                        .and_then(|fs| fs.iter().find(|(n, _)| n == key).map(|(_, t)| t.clone()))
+                        .unwrap_or(Type::Unknown);
+                    self.define(local.clone(), ty, *is_const);
+                }
+                Ok(())
+            }
+
             StmtKind::Break | StmtKind::Continue | StmtKind::Empty => {
                 // Validation that we're inside a loop could be added here
                 Ok(())
@@ -710,19 +770,22 @@ impl TypeChecker {
                         params,
                         return_type,
                     } => {
-                        if args.len() > params.len() {
+                        // Check if function is variadic (last param is Array = rest param)
+                        let is_variadic =
+                            params.last().map_or(false, |t| matches!(t, Type::Array(_)));
+                        if !is_variadic && args.len() > params.len() {
                             return Err(CompileError::error(
                                 format!("Expected {} arguments, got {}", params.len(), args.len()),
                                 expr.span.clone(),
                             ));
                         }
-                        // Allow fewer args — remaining params must have defaults
-                        // (we can't check defaults from the Type alone, so we trust the parser)
-                        if args.len() < params.len() {
-                            // Check if the callee is a known function with defaults
-                            // For now, allow it (default params are validated at parse time)
-                        }
-                        for (arg, param_type) in args.iter().zip(params.iter()) {
+                        // For variadic: check non-rest args; rest args are unchecked
+                        let check_count = if is_variadic {
+                            params.len().saturating_sub(1).min(args.len())
+                        } else {
+                            args.len().min(params.len())
+                        };
+                        for (arg, param_type) in args.iter().take(check_count).zip(params.iter()) {
                             let arg_type = self.check_expr(arg)?;
                             if !self.is_assignable(&arg_type, param_type) {
                                 return Err(CompileError::error(
@@ -732,6 +795,12 @@ impl TypeChecker {
                                     ),
                                     arg.span.clone(),
                                 ));
+                            }
+                        }
+                        // Check remaining rest args
+                        if is_variadic {
+                            for arg in args.iter().skip(check_count) {
+                                self.check_expr(arg)?;
                             }
                         }
                         Ok(*return_type.clone())
@@ -853,6 +922,27 @@ impl TypeChecker {
                     expr.span.clone(),
                 ))
             }
+
+            // Optional chaining: obj?.prop — same as obj.prop for now (no runtime null)
+            ExprKind::OptionalMember { object, property } => {
+                let obj_type = self.check_expr(object)?;
+                let fields = match &obj_type {
+                    Type::Object { fields } => Some(fields.clone()),
+                    Type::Class { fields, .. } => Some(fields.clone()),
+                    _ => None,
+                };
+                if let Some(fields) = fields {
+                    for (name, ty) in &fields {
+                        if name == property {
+                            return Ok(ty.clone());
+                        }
+                    }
+                }
+                Ok(Type::Unknown)
+            }
+
+            // Spread element: only valid inside array literals (handled there)
+            ExprKind::Spread { expr: inner } => self.check_expr(inner),
 
             ExprKind::Assignment { name, value } => {
                 let sym = self.lookup_symbol(name).ok_or_else(|| {

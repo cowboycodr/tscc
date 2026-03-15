@@ -54,7 +54,67 @@ impl Parser {
     fn variable_declaration(&mut self, is_exported: bool) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         let is_const = matches!(self.peek_token(), Token::Const);
-        self.advance();
+        self.advance(); // consume let/const/var
+
+        // Array destructuring: let [a, b, ...] = expr
+        if self.match_token(&Token::LeftBracket) {
+            let mut names = Vec::new();
+            while !self.check(&Token::RightBracket) && !self.is_at_end() {
+                names.push(self.expect_identifier("Expected identifier in array destructuring")?);
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(
+                &Token::RightBracket,
+                "Expected ']' after destructuring pattern",
+            )?;
+            self.expect(&Token::Assign, "Expected '=' in destructuring declaration")?;
+            let initializer = self.expression()?;
+            self.consume_semicolon()?;
+            return Ok(Statement {
+                kind: StmtKind::ArrayDestructure {
+                    names,
+                    initializer,
+                    is_const,
+                },
+                span: self.span_from(&start_span),
+            });
+        }
+
+        // Object destructuring: let { x, y } = expr  or  let { x: localX } = expr
+        if self.match_token(&Token::LeftBrace) {
+            let mut names = Vec::new();
+            while !self.check(&Token::RightBrace) && !self.is_at_end() {
+                let key =
+                    self.expect_identifier("Expected property name in object destructuring")?;
+                // Optional renaming: { key: localName }
+                let local = if self.match_token(&Token::Colon) {
+                    self.expect_identifier("Expected local name after ':' in destructuring")?
+                } else {
+                    key.clone()
+                };
+                names.push((local, key));
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(
+                &Token::RightBrace,
+                "Expected '}' after destructuring pattern",
+            )?;
+            self.expect(&Token::Assign, "Expected '=' in destructuring declaration")?;
+            let initializer = self.expression()?;
+            self.consume_semicolon()?;
+            return Ok(Statement {
+                kind: StmtKind::ObjectDestructure {
+                    names,
+                    initializer,
+                    is_const,
+                },
+                span: self.span_from(&start_span),
+            });
+        }
 
         let name = self.expect_identifier("Expected variable name")?;
 
@@ -297,13 +357,14 @@ impl Parser {
         if !self.check(&Token::RightParen) {
             loop {
                 let param_span = self.current_span();
+                let is_rest = self.match_token(&Token::Ellipsis);
                 let name = self.expect_identifier("Expected parameter name")?;
                 let type_ann = if self.match_token(&Token::Colon) {
                     Some(self.type_annotation()?)
                 } else {
                     None
                 };
-                let default = if self.match_token(&Token::Assign) {
+                let default = if !is_rest && self.match_token(&Token::Assign) {
                     Some(self.expression()?)
                 } else {
                     None
@@ -312,9 +373,11 @@ impl Parser {
                     name,
                     type_ann,
                     default,
+                    is_rest,
                     span: self.span_from(&param_span),
                 });
-                if !self.match_token(&Token::Comma) {
+                // Rest param must be last; stop parsing params after it
+                if is_rest || !self.match_token(&Token::Comma) {
                     break;
                 }
             }
@@ -396,6 +459,35 @@ impl Parser {
         self.advance();
 
         self.expect(&Token::LeftParen, "Expected '(' after 'for'")?;
+
+        // Detect `for (let/const/var x of iterable)`
+        if matches!(self.peek_token(), Token::Let | Token::Const | Token::Var) {
+            // Peek: tokens[current] = let/const, tokens[current+1] = ident, tokens[current+2] = of
+            let is_for_of = matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token),
+                Some(Token::Identifier(_))
+            ) && matches!(
+                self.tokens.get(self.current + 2).map(|t| &t.token),
+                Some(Token::Of)
+            );
+            if is_for_of {
+                self.advance(); // consume let/const/var
+                let var_name = self.expect_identifier("Expected variable name in for-of")?;
+                self.advance(); // consume 'of'
+                let iterable = self.expression()?;
+                self.expect(&Token::RightParen, "Expected ')' after for-of iterable")?;
+                self.expect(&Token::LeftBrace, "Expected '{' after for-of header")?;
+                let body = self.block_body()?;
+                return Ok(Statement {
+                    kind: StmtKind::ForOf {
+                        var_name,
+                        iterable,
+                        body,
+                    },
+                    span: self.span_from(&start_span),
+                });
+            }
+        }
 
         let init = if self.match_token(&Token::Semicolon) {
             None
@@ -753,6 +845,7 @@ impl Parser {
                             name: param_name,
                             type_ann: None,
                             default: None,
+                            is_rest: false,
                             span: span.clone(),
                         }],
                         return_type: None,
@@ -1211,6 +1304,20 @@ impl Parser {
                         property,
                     },
                 };
+            } else if self.match_token(&Token::QuestionDot) {
+                let property = self.expect_identifier("Expected property name after '?.'")?;
+                expr = Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        self.previous_span().end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::OptionalMember {
+                        object: Box::new(expr.clone()),
+                        property,
+                    },
+                };
             } else if self.match_token(&Token::LeftBracket) {
                 let index = self.expression()?;
                 self.expect(&Token::RightBracket, "Expected ']' after index")?;
@@ -1322,7 +1429,18 @@ impl Parser {
                 let mut elements = Vec::new();
                 if !self.check(&Token::RightBracket) {
                     loop {
-                        elements.push(self.expression()?);
+                        let elem_span = self.current_span();
+                        if self.match_token(&Token::Ellipsis) {
+                            let spread_expr = self.expression()?;
+                            elements.push(Expr {
+                                span: self.span_from(&elem_span),
+                                kind: ExprKind::Spread {
+                                    expr: Box::new(spread_expr),
+                                },
+                            });
+                        } else {
+                            elements.push(self.expression()?);
+                        }
                         if !self.match_token(&Token::Comma) {
                             break;
                         }
@@ -1477,6 +1595,7 @@ impl Parser {
                     name,
                     type_ann,
                     default: None,
+                    is_rest: false,
                     span: self.span_from(&param_span),
                 });
                 if !self.match_token(&Token::Comma) {

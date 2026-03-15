@@ -74,6 +74,22 @@ pub enum StmtKind {
         discriminant: Expr,
         cases: Vec<SwitchCase>,
     },
+    ForOf {
+        var_name: String,
+        iterable: Expr,
+        body: Vec<Statement>,
+    },
+    ArrayDestructure {
+        names: Vec<String>,
+        initializer: Expr,
+        is_const: bool,
+    },
+    ObjectDestructure {
+        /// (binding_name, key_name) pairs
+        names: Vec<(String, String)>,
+        initializer: Expr,
+        is_const: bool,
+    },
     Break,
     Continue,
     Empty,
@@ -120,6 +136,7 @@ pub struct Parameter {
     pub name: String,
     pub type_ann: Option<TypeAnnotation>,
     pub default: Option<Expr>,
+    pub is_rest: bool,
     pub span: Span,
 }
 
@@ -207,6 +224,13 @@ pub enum ExprKind {
     Member {
         object: Box<Expr>,
         property: String,
+    },
+    OptionalMember {
+        object: Box<Expr>,
+        property: String,
+    },
+    Spread {
+        expr: Box<Expr>,
     },
     Assignment {
         name: String,

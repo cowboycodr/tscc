@@ -70,6 +70,8 @@ impl Scanner {
             '?' => {
                 if self.match_char('?') {
                     self.add_token(Token::QuestionQuestion);
+                } else if self.match_char('.') {
+                    self.add_token(Token::QuestionDot);
                 } else {
                     self.add_token(Token::Question);
                 }

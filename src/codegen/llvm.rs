@@ -47,6 +47,8 @@ pub struct Codegen<'ctx> {
     function_return_types: HashMap<String, VarType>,
     /// Default parameter expressions for functions (for call-site insertion)
     function_param_defaults: HashMap<String, Vec<Option<Expr>>>,
+    /// Index of rest parameter for variadic functions (fn_name -> rest param index)
+    function_rest_param_index: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +130,7 @@ impl<'ctx> Codegen<'ctx> {
             current_this: None,
             function_return_types: HashMap::new(),
             function_param_defaults: HashMap::new(),
+            function_rest_param_index: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -420,6 +423,14 @@ impl<'ctx> Codegen<'ctx> {
                                 .iter()
                                 .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
                     })
+            }
+            // for-of iterates arrays (f64 elements) — not integer-safe
+            StmtKind::ForOf { .. } => false,
+            StmtKind::ArrayDestructure { initializer, .. } => {
+                Self::is_expr_integer_safe(initializer, fn_name, known)
+            }
+            StmtKind::ObjectDestructure { initializer, .. } => {
+                Self::is_expr_integer_safe(initializer, fn_name, known)
             }
             StmtKind::FunctionDecl { .. }
             | StmtKind::Import { .. }
@@ -978,6 +989,188 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
 
+            StmtKind::ForOf {
+                var_name,
+                iterable,
+                body,
+            } => {
+                let i64_type = self.context.i64_type();
+                let f64_type = self.context.f64_type();
+
+                // Compile the iterable to get an array struct value
+                let (arr_val, _arr_vt) = self.compile_expr(iterable, function)?;
+                let arr_struct = arr_val.into_struct_value();
+
+                // Extract data pointer and length (fixed before loop)
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(arr_struct, 0, "forof.data")
+                    .unwrap()
+                    .into_pointer_value();
+                let len = self
+                    .builder
+                    .build_extract_value(arr_struct, 1, "forof.len")
+                    .unwrap()
+                    .into_int_value();
+
+                // Loop counter alloca
+                let i_alloca = self.create_alloca(function, &VarType::Integer, "forof.i");
+                self.builder
+                    .build_store(i_alloca, i64_type.const_int(0, false))
+                    .unwrap();
+
+                let cond_bb = self.context.append_basic_block(function, "forof.cond");
+                let body_bb = self.context.append_basic_block(function, "forof.body");
+                let update_bb = self.context.append_basic_block(function, "forof.update");
+                let exit_bb = self.context.append_basic_block(function, "forof.exit");
+
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+                // Condition: i < len
+                self.builder.position_at_end(cond_bb);
+                let i_val = self
+                    .builder
+                    .build_load(i64_type, i_alloca, "i")
+                    .unwrap()
+                    .into_int_value();
+                let cond = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, i_val, len, "forof.cond")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(cond, body_bb, exit_bb)
+                    .unwrap();
+
+                // Body: load arr[i], bind to var_name
+                self.builder.position_at_end(body_bb);
+                self.push_scope();
+
+                let i_val = self
+                    .builder
+                    .build_load(i64_type, i_alloca, "i")
+                    .unwrap()
+                    .into_int_value();
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_gep(f64_type, data_ptr, &[i_val], "forof.elem_ptr")
+                        .unwrap()
+                };
+                let elem_val = self
+                    .builder
+                    .build_load(f64_type, elem_ptr, "forof.elem")
+                    .unwrap();
+
+                let elem_alloca = self.create_alloca(function, &VarType::Number, var_name);
+                self.builder.build_store(elem_alloca, elem_val).unwrap();
+                self.set_variable(var_name.clone(), elem_alloca, VarType::Number);
+
+                self.loop_stack.push(LoopContext {
+                    exit_bb,
+                    continue_bb: update_bb,
+                });
+                for s in body {
+                    self.compile_statement(s, function)?;
+                }
+                self.loop_stack.pop();
+                self.pop_scope();
+
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(update_bb).unwrap();
+                }
+
+                // Update: i++
+                self.builder.position_at_end(update_bb);
+                let i_val = self
+                    .builder
+                    .build_load(i64_type, i_alloca, "i")
+                    .unwrap()
+                    .into_int_value();
+                let i_next = self
+                    .builder
+                    .build_int_add(i_val, i64_type.const_int(1, false), "i.next")
+                    .unwrap();
+                self.builder.build_store(i_alloca, i_next).unwrap();
+                self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+                self.builder.position_at_end(exit_bb);
+                Ok(())
+            }
+
+            StmtKind::ArrayDestructure {
+                names, initializer, ..
+            } => {
+                let f64_type = self.context.f64_type();
+                let i64_type = self.context.i64_type();
+
+                let (arr_val, _) = self.compile_expr(initializer, function)?;
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(arr_val.into_struct_value(), 0, "destr.data")
+                    .unwrap()
+                    .into_pointer_value();
+
+                for (i, name) in names.iter().enumerate() {
+                    let idx = i64_type.const_int(i as u64, false);
+                    let elem_ptr = unsafe {
+                        self.builder
+                            .build_gep(f64_type, data_ptr, &[idx], "destr.ptr")
+                            .unwrap()
+                    };
+                    let elem_val = self
+                        .builder
+                        .build_load(f64_type, elem_ptr, "destr.val")
+                        .unwrap();
+                    let alloca = self.create_alloca(function, &VarType::Number, name);
+                    self.builder.build_store(alloca, elem_val).unwrap();
+                    self.set_variable(name.clone(), alloca, VarType::Number);
+                }
+                Ok(())
+            }
+
+            StmtKind::ObjectDestructure {
+                names, initializer, ..
+            } => {
+                let (obj_val, obj_vt) = self.compile_expr(initializer, function)?;
+                if let VarType::Object { ref fields, .. } = obj_vt {
+                    for (local, key) in names {
+                        // Find field index
+                        if let Some((idx, (_, field_vt))) =
+                            fields.iter().enumerate().find(|(_, (n, _))| n == key)
+                        {
+                            let field_vt = field_vt.clone();
+                            let val = self
+                                .builder
+                                .build_extract_value(
+                                    obj_val.into_struct_value(),
+                                    idx as u32,
+                                    &format!("destr.{}", key),
+                                )
+                                .unwrap();
+                            let alloca = self.create_alloca(function, &field_vt, local);
+                            self.builder.build_store(alloca, val).unwrap();
+                            self.set_variable(local.clone(), alloca, field_vt);
+                        } else {
+                            return Err(CompileError::error(
+                                format!("Property '{}' does not exist on object", key),
+                                stmt.span.clone(),
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(CompileError::error(
+                        "Object destructuring requires an object type",
+                        stmt.span.clone(),
+                    ));
+                }
+                Ok(())
+            }
+
             StmtKind::Break => {
                 if let Some(ctx) = self.loop_stack.last() {
                     let exit_bb = ctx.exit_bb;
@@ -1061,6 +1254,12 @@ impl<'ctx> Codegen<'ctx> {
         if defaults.iter().any(|d| d.is_some()) {
             self.function_param_defaults
                 .insert(name.to_string(), defaults);
+        }
+
+        // Store rest parameter index if present
+        if let Some((rest_idx, _)) = params.iter().enumerate().find(|(_, p)| p.is_rest) {
+            self.function_rest_param_index
+                .insert(name.to_string(), rest_idx);
         }
 
         // Store return type for call-site inference
@@ -1158,75 +1357,225 @@ impl<'ctx> Codegen<'ctx> {
             )),
 
             ExprKind::ArrayLiteral { elements } => {
-                let count = elements.len() as u64;
+                let has_spread = elements
+                    .iter()
+                    .any(|e| matches!(e.kind, ExprKind::Spread { .. }));
                 let f64_type = self.context.f64_type();
+                let i64_type = self.context.i64_type();
                 let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-                // Allocate memory: malloc(count * sizeof(double))
                 let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
                     self.module.add_function(
                         "malloc",
-                        ptr_type.fn_type(&[self.context.i64_type().into()], false),
+                        ptr_type.fn_type(&[i64_type.into()], false),
                         None,
                     )
                 });
-                let capacity = if count > 0 { count } else { 4 };
-                let alloc_size = self.context.i64_type().const_int(capacity * 8, false); // 8 bytes per f64
-                let data_ptr = self
-                    .builder
-                    .build_call(malloc_fn, &[alloc_size.into()], "arr_data")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .left()
-                    .unwrap()
-                    .into_pointer_value();
 
-                // Store each element
-                for (i, elem) in elements.iter().enumerate() {
-                    let (val, vt) = self.compile_expr(elem, function)?;
-                    let float_val = match vt {
-                        VarType::Integer => self
-                            .builder
-                            .build_signed_int_to_float(val.into_int_value(), f64_type, "i2f")
-                            .unwrap()
-                            .into(),
-                        _ => val,
-                    };
-                    let idx = self.context.i64_type().const_int(i as u64, false);
-                    let elem_ptr = unsafe {
-                        self.builder
-                            .build_gep(f64_type, data_ptr, &[idx], "elem_ptr")
-                            .unwrap()
-                    };
-                    self.builder.build_store(elem_ptr, float_val).unwrap();
+                if !has_spread {
+                    // Fast path: no spread — allocate exact size upfront
+                    let count = elements.len() as u64;
+                    let capacity = if count > 0 { count } else { 4 };
+                    let alloc_size = i64_type.const_int(capacity * 8, false);
+                    let data_ptr = self
+                        .builder
+                        .build_call(malloc_fn, &[alloc_size.into()], "arr_data")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_pointer_value();
+
+                    for (i, elem) in elements.iter().enumerate() {
+                        let (val, vt) = self.compile_expr(elem, function)?;
+                        let float_val = match vt {
+                            VarType::Integer => self
+                                .builder
+                                .build_signed_int_to_float(val.into_int_value(), f64_type, "i2f")
+                                .unwrap()
+                                .into(),
+                            _ => val,
+                        };
+                        let idx = i64_type.const_int(i as u64, false);
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_gep(f64_type, data_ptr, &[idx], "elem_ptr")
+                                .unwrap()
+                        };
+                        self.builder.build_store(elem_ptr, float_val).unwrap();
+                    }
+
+                    let arr = self.array_type.const_zero();
+                    let arr = self
+                        .builder
+                        .build_insert_value(arr, data_ptr, 0, "arr.data")
+                        .unwrap();
+                    let arr = self
+                        .builder
+                        .build_insert_value(
+                            arr.into_struct_value(),
+                            i64_type.const_int(count, false),
+                            1,
+                            "arr.len",
+                        )
+                        .unwrap();
+                    let arr = self
+                        .builder
+                        .build_insert_value(
+                            arr.into_struct_value(),
+                            i64_type.const_int(capacity, false),
+                            2,
+                            "arr.cap",
+                        )
+                        .unwrap();
+
+                    Ok((arr.into_struct_value().into(), VarType::Array))
+                } else {
+                    // Spread path: build incrementally using tscc_array_push
+                    let push_fn = self.module.get_function("tscc_array_push").unwrap();
+
+                    // Create an initial empty array with some capacity
+                    let init_cap = 8u64;
+                    let init_data = self
+                        .builder
+                        .build_call(
+                            malloc_fn,
+                            &[i64_type.const_int(init_cap * 8, false).into()],
+                            "spread_data",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                        .into_pointer_value();
+
+                    let init_arr = self.array_type.const_zero();
+                    let init_arr = self
+                        .builder
+                        .build_insert_value(init_arr, init_data, 0, "arr.data")
+                        .unwrap();
+                    let init_arr = self
+                        .builder
+                        .build_insert_value(
+                            init_arr.into_struct_value(),
+                            i64_type.const_int(0, false),
+                            1,
+                            "arr.len",
+                        )
+                        .unwrap();
+                    let init_arr = self
+                        .builder
+                        .build_insert_value(
+                            init_arr.into_struct_value(),
+                            i64_type.const_int(init_cap, false),
+                            2,
+                            "arr.cap",
+                        )
+                        .unwrap();
+
+                    // Store in alloca so push can modify it
+                    let result_alloca =
+                        self.create_alloca(function, &VarType::Array, "spread_result");
+                    self.builder
+                        .build_store(result_alloca, init_arr.into_struct_value())
+                        .unwrap();
+
+                    for elem in elements {
+                        if let ExprKind::Spread { expr: spread_expr } = &elem.kind {
+                            // Spread: iterate all elements of the spread array and push
+                            let (spread_val, _) = self.compile_expr(spread_expr, function)?;
+                            let spread_struct = spread_val.into_struct_value();
+                            let sp_data = self
+                                .builder
+                                .build_extract_value(spread_struct, 0, "sp_data")
+                                .unwrap()
+                                .into_pointer_value();
+                            let sp_len = self
+                                .builder
+                                .build_extract_value(spread_struct, 1, "sp_len")
+                                .unwrap()
+                                .into_int_value();
+
+                            // Loop: for si in 0..sp_len, push sp_data[si]
+                            let si_alloca = self.create_alloca(function, &VarType::Integer, "si");
+                            self.builder
+                                .build_store(si_alloca, i64_type.const_int(0, false))
+                                .unwrap();
+
+                            let sp_cond_bb =
+                                self.context.append_basic_block(function, "spread.cond");
+                            let sp_body_bb =
+                                self.context.append_basic_block(function, "spread.body");
+                            let sp_next_bb =
+                                self.context.append_basic_block(function, "spread.next");
+
+                            self.builder.build_unconditional_branch(sp_cond_bb).unwrap();
+
+                            self.builder.position_at_end(sp_cond_bb);
+                            let si_val = self
+                                .builder
+                                .build_load(i64_type, si_alloca, "si")
+                                .unwrap()
+                                .into_int_value();
+                            let sp_cond = self
+                                .builder
+                                .build_int_compare(IntPredicate::SLT, si_val, sp_len, "sp_cond")
+                                .unwrap();
+                            self.builder
+                                .build_conditional_branch(sp_cond, sp_body_bb, sp_next_bb)
+                                .unwrap();
+
+                            self.builder.position_at_end(sp_body_bb);
+                            let si_val = self
+                                .builder
+                                .build_load(i64_type, si_alloca, "si")
+                                .unwrap()
+                                .into_int_value();
+                            let sep = unsafe {
+                                self.builder
+                                    .build_gep(f64_type, sp_data, &[si_val], "sep")
+                                    .unwrap()
+                            };
+                            let sev = self.builder.build_load(f64_type, sep, "sev").unwrap();
+                            self.builder
+                                .build_call(push_fn, &[result_alloca.into(), sev.into()], "")
+                                .unwrap();
+                            let si_next = self
+                                .builder
+                                .build_int_add(si_val, i64_type.const_int(1, false), "si.next")
+                                .unwrap();
+                            self.builder.build_store(si_alloca, si_next).unwrap();
+                            self.builder.build_unconditional_branch(sp_cond_bb).unwrap();
+
+                            self.builder.position_at_end(sp_next_bb);
+                        } else {
+                            // Regular element: push it
+                            let (val, vt) = self.compile_expr(elem, function)?;
+                            let float_val: BasicValueEnum = match vt {
+                                VarType::Integer => self
+                                    .builder
+                                    .build_signed_int_to_float(
+                                        val.into_int_value(),
+                                        f64_type,
+                                        "i2f",
+                                    )
+                                    .unwrap()
+                                    .into(),
+                                _ => val,
+                            };
+                            self.builder
+                                .build_call(push_fn, &[result_alloca.into(), float_val.into()], "")
+                                .unwrap();
+                        }
+                    }
+
+                    // Load the completed array
+                    let result = self
+                        .builder
+                        .build_load(self.array_type, result_alloca, "spread_arr")
+                        .unwrap();
+                    Ok((result, VarType::Array))
                 }
-
-                // Build array struct { data_ptr, length, capacity }
-                let arr = self.array_type.const_zero();
-                let arr = self
-                    .builder
-                    .build_insert_value(arr, data_ptr, 0, "arr.data")
-                    .unwrap();
-                let arr = self
-                    .builder
-                    .build_insert_value(
-                        arr.into_struct_value(),
-                        self.context.i64_type().const_int(count, false),
-                        1,
-                        "arr.len",
-                    )
-                    .unwrap();
-                let arr = self
-                    .builder
-                    .build_insert_value(
-                        arr.into_struct_value(),
-                        self.context.i64_type().const_int(capacity, false),
-                        2,
-                        "arr.cap",
-                    )
-                    .unwrap();
-
-                Ok((arr.into_struct_value().into(), VarType::Array))
             }
 
             ExprKind::IndexAccess { object, index } => {
@@ -1368,6 +1717,14 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Member { object, property } => {
                 self.compile_member_access(object, property, function, &expr.span)
             }
+
+            // Optional chaining: obj?.prop — treated as obj.prop (no runtime null support yet)
+            ExprKind::OptionalMember { object, property } => {
+                self.compile_member_access(object, property, function, &expr.span)
+            }
+
+            // Spread is only valid inside ArrayLiteral — if reached standalone, return inner expr
+            ExprKind::Spread { expr: inner } => self.compile_expr(inner, function),
 
             ExprKind::Assignment { name, value } => {
                 let (val, val_type) = self.compile_expr(value, function)?;
@@ -2625,23 +2982,114 @@ impl<'ctx> Codegen<'ctx> {
             let caller_is_integer = matches!(self.number_mode, VarType::Integer);
 
             let mut compiled_args: Vec<BasicMetadataValueEnum> = Vec::new();
-            for arg in args {
-                let (val, vt) = self.compile_expr(arg, function)?;
-                // Convert f64 → i64 when calling an integer function from float context
-                let val =
-                    if is_target_integer && !caller_is_integer && matches!(vt, VarType::Number) {
-                        self.builder
-                            .build_float_to_signed_int(
-                                val.into_float_value(),
-                                self.context.i64_type(),
-                                "f2i",
-                            )
+
+            // Check if function has a rest parameter
+            let rest_idx = self.function_rest_param_index.get(name).copied();
+            if let Some(rest_idx) = rest_idx {
+                // Compile regular args 0..rest_idx
+                for arg in args.iter().take(rest_idx) {
+                    let (val, vt) = self.compile_expr(arg, function)?;
+                    let val =
+                        if is_target_integer && !caller_is_integer && matches!(vt, VarType::Number)
+                        {
+                            self.builder
+                                .build_float_to_signed_int(
+                                    val.into_float_value(),
+                                    self.context.i64_type(),
+                                    "f2i",
+                                )
+                                .unwrap()
+                                .into()
+                        } else {
+                            val
+                        };
+                    compiled_args.push(val.into());
+                }
+                // Pack rest args into an array
+                let rest_args = &args[rest_idx.min(args.len())..];
+                let f64_type = self.context.f64_type();
+                let i64_type = self.context.i64_type();
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+                let rest_count = rest_args.len() as u64;
+                let capacity = rest_count.max(4);
+                let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+                    self.module.add_function(
+                        "malloc",
+                        ptr_type.fn_type(&[i64_type.into()], false),
+                        None,
+                    )
+                });
+                let alloc_size = i64_type.const_int(capacity * 8, false);
+                let data_ptr = self
+                    .builder
+                    .build_call(malloc_fn, &[alloc_size.into()], "rest_data")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+                for (i, arg) in rest_args.iter().enumerate() {
+                    let (val, vt) = self.compile_expr(arg, function)?;
+                    let float_val: BasicValueEnum = match vt {
+                        VarType::Integer => self
+                            .builder
+                            .build_signed_int_to_float(val.into_int_value(), f64_type, "i2f")
                             .unwrap()
-                            .into()
-                    } else {
-                        val
+                            .into(),
+                        _ => val,
                     };
-                compiled_args.push(val.into());
+                    let idx = i64_type.const_int(i as u64, false);
+                    let elem_ptr = unsafe {
+                        self.builder
+                            .build_gep(f64_type, data_ptr, &[idx], "rp")
+                            .unwrap()
+                    };
+                    self.builder.build_store(elem_ptr, float_val).unwrap();
+                }
+                let rest_arr = self.array_type.const_zero();
+                let rest_arr = self
+                    .builder
+                    .build_insert_value(rest_arr, data_ptr, 0, "rest.data")
+                    .unwrap();
+                let rest_arr = self
+                    .builder
+                    .build_insert_value(
+                        rest_arr.into_struct_value(),
+                        i64_type.const_int(rest_count, false),
+                        1,
+                        "rest.len",
+                    )
+                    .unwrap();
+                let rest_arr = self
+                    .builder
+                    .build_insert_value(
+                        rest_arr.into_struct_value(),
+                        i64_type.const_int(capacity, false),
+                        2,
+                        "rest.cap",
+                    )
+                    .unwrap();
+                compiled_args.push(rest_arr.into_struct_value().into());
+            } else {
+                for arg in args {
+                    let (val, vt) = self.compile_expr(arg, function)?;
+                    // Convert f64 → i64 when calling an integer function from float context
+                    let val =
+                        if is_target_integer && !caller_is_integer && matches!(vt, VarType::Number)
+                        {
+                            self.builder
+                                .build_float_to_signed_int(
+                                    val.into_float_value(),
+                                    self.context.i64_type(),
+                                    "f2i",
+                                )
+                                .unwrap()
+                                .into()
+                        } else {
+                            val
+                        };
+                    compiled_args.push(val.into());
+                }
             }
 
             // Fill in default parameter values for missing arguments
@@ -4088,6 +4536,16 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 Self::collect_idents_in_stmts(body, out);
             }
+            StmtKind::ForOf { iterable, body, .. } => {
+                Self::collect_idents_in_expr(iterable, out);
+                Self::collect_idents_in_stmts(body, out);
+            }
+            StmtKind::ArrayDestructure { initializer, .. } => {
+                Self::collect_idents_in_expr(initializer, out);
+            }
+            StmtKind::ObjectDestructure { initializer, .. } => {
+                Self::collect_idents_in_expr(initializer, out);
+            }
             StmtKind::Block { statements } => Self::collect_idents_in_stmts(statements, out),
             _ => {}
         }
@@ -4111,8 +4569,11 @@ impl<'ctx> Codegen<'ctx> {
                     Self::collect_idents_in_expr(a, out);
                 }
             }
-            ExprKind::Member { object, .. } => {
+            ExprKind::Member { object, .. } | ExprKind::OptionalMember { object, .. } => {
                 Self::collect_idents_in_expr(object, out);
+            }
+            ExprKind::Spread { expr: inner } => {
+                Self::collect_idents_in_expr(inner, out);
             }
             ExprKind::Assignment { name, value } => {
                 out.insert(name.clone());

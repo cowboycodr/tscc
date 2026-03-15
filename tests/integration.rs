@@ -1312,16 +1312,14 @@ mod not_yet_implemented {
     }
 
     #[test]
-    #[ignore = "destructuring not implemented"]
     fn destructuring_assignment() {
         assert_eq!(run_ts("let [a, b] = [1, 2]\nconsole.log(a, b)"), "1 2\n");
     }
 
     #[test]
-    #[ignore = "destructuring not implemented"]
     fn object_destructuring() {
         assert_eq!(
-            run_ts(r#"let { x, y } = { x: 1, y: 2 }\nconsole.log(x, y)"#),
+            run_ts("let { x, y } = { x: 1, y: 2 }\nconsole.log(x, y)"),
             "1 2\n"
         );
     }
@@ -1364,10 +1362,8 @@ mod not_yet_implemented {
     }
 
     #[test]
-    #[ignore = "optional chaining not implemented"]
     fn optional_chaining() {
-        // Would need object support first
-        assert_eq!(run_ts(r#"let obj = { a: 1 }\nconsole.log(obj?.a)"#), "1\n");
+        assert_eq!(run_ts("let obj = { a: 1 }\nconsole.log(obj?.a)"), "1\n");
     }
 
     // --- Control flow ---
@@ -1429,14 +1425,13 @@ console.log(i)
     }
 
     #[test]
-    #[ignore = "for-of not implemented"]
     fn for_of() {
-        let src = r#"
+        let src = "
 let arr = [1, 2, 3]
 for (let x of arr) {
     console.log(x)
 }
-"#;
+";
         assert_eq!(run_ts(src), "1\n2\n3\n");
     }
 
@@ -1852,9 +1847,8 @@ greet("Mango")
     }
 
     #[test]
-    #[ignore = "rest parameters not implemented"]
     fn rest_parameters() {
-        let src = r#"
+        let src = "
 function sum(...nums: number[]): number {
     let total = 0
     for (let n of nums) {
@@ -1863,18 +1857,17 @@ function sum(...nums: number[]): number {
     return total
 }
 console.log(sum(1, 2, 3, 4))
-"#;
+";
         assert_eq!(run_ts(src), "10\n");
     }
 
     #[test]
-    #[ignore = "spread syntax not implemented"]
     fn spread_syntax() {
-        let src = r#"
+        let src = "
 let a = [1, 2, 3]
 let b = [...a, 4, 5]
 console.log(b)
-"#;
+";
         assert_eq!(run_ts(src), "[ 1, 2, 3, 4, 5 ]\n");
     }
 
