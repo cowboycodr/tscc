@@ -1474,25 +1474,22 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "string startsWith not implemented"]
     fn string_starts_with() {
         assert_eq!(run_ts(r#"console.log("hello".startsWith("he"))"#), "true\n");
     }
 
     #[test]
-    #[ignore = "string endsWith not implemented"]
     fn string_ends_with() {
         assert_eq!(run_ts(r#"console.log("hello".endsWith("lo"))"#), "true\n");
     }
 
     #[test]
-    #[ignore = "string repeat not implemented"]
     fn string_repeat() {
         assert_eq!(run_ts(r#"console.log("ab".repeat(3))"#), "ababab\n");
     }
 
     #[test]
-    #[ignore = "string split not implemented"]
+    #[ignore = "split requires string array support"]
     fn string_split() {
         assert_eq!(
             run_ts(r#"console.log("a,b,c".split(","))"#),
@@ -1501,7 +1498,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "string replace not implemented"]
     fn string_replace() {
         assert_eq!(
             run_ts(r#"console.log("hello".replace("l", "r"))"#),
@@ -1510,7 +1506,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "string padStart not implemented"]
     fn string_pad_start() {
         assert_eq!(run_ts(r#"console.log("5".padStart(3, "0"))"#), "005\n");
     }

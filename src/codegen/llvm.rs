@@ -288,6 +288,67 @@ impl<'ctx> Codegen<'ctx> {
                 .fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
+        self.module.add_function(
+            "tscc_string_startsWith",
+            i1_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "tscc_string_endsWith",
+            i1_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "tscc_string_repeat",
+            self.string_type
+                .fn_type(&[ptr_type.into(), i64_type.into(), f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "tscc_string_replace",
+            self.string_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "tscc_string_padStart",
+            self.string_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    f64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
 
         // --- Math functions ---
         let math_1 = f64_type.fn_type(&[f64_type.into()], false);
@@ -3500,6 +3561,114 @@ impl<'ctx> Codegen<'ctx> {
                         func,
                         &[ptr.into(), len.into(), start.into(), end_val.into()],
                         method,
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::String))
+            }
+            "startsWith" | "endsWith" => {
+                let (needle, _) = self.compile_expr(&args[0], function)?;
+                let np = self
+                    .builder
+                    .build_extract_value(needle.into_struct_value(), 0, "np")
+                    .unwrap();
+                let nl = self
+                    .builder
+                    .build_extract_value(needle.into_struct_value(), 1, "nl")
+                    .unwrap();
+                let func_name = format!("tscc_string_{}", method);
+                let func = self.module.get_function(&func_name).unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        func,
+                        &[ptr.into(), len.into(), np.into(), nl.into()],
+                        method,
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::Boolean))
+            }
+            "repeat" => {
+                let (count, _) = self.compile_expr(&args[0], function)?;
+                let func = self.module.get_function("tscc_string_repeat").unwrap();
+                let result = self
+                    .builder
+                    .build_call(func, &[ptr.into(), len.into(), count.into()], "repeat")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::String))
+            }
+            "replace" => {
+                let (search_val, _) = self.compile_expr(&args[0], function)?;
+                let (replace_val, _) = self.compile_expr(&args[1], function)?;
+                let sp = self
+                    .builder
+                    .build_extract_value(search_val.into_struct_value(), 0, "sp")
+                    .unwrap();
+                let sl = self
+                    .builder
+                    .build_extract_value(search_val.into_struct_value(), 1, "sl")
+                    .unwrap();
+                let rp = self
+                    .builder
+                    .build_extract_value(replace_val.into_struct_value(), 0, "rp")
+                    .unwrap();
+                let rl = self
+                    .builder
+                    .build_extract_value(replace_val.into_struct_value(), 1, "rl")
+                    .unwrap();
+                let func = self.module.get_function("tscc_string_replace").unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        func,
+                        &[
+                            ptr.into(),
+                            len.into(),
+                            sp.into(),
+                            sl.into(),
+                            rp.into(),
+                            rl.into(),
+                        ],
+                        "replace",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::String))
+            }
+            "padStart" => {
+                let (target_len, _) = self.compile_expr(&args[0], function)?;
+                let (pad_str, _) = self.compile_expr(&args[1], function)?;
+                let pad_ptr = self
+                    .builder
+                    .build_extract_value(pad_str.into_struct_value(), 0, "pad_ptr")
+                    .unwrap();
+                let pad_len = self
+                    .builder
+                    .build_extract_value(pad_str.into_struct_value(), 1, "pad_len")
+                    .unwrap();
+                let func = self.module.get_function("tscc_string_padStart").unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        func,
+                        &[
+                            ptr.into(),
+                            len.into(),
+                            target_len.into(),
+                            pad_ptr.into(),
+                            pad_len.into(),
+                        ],
+                        "padStart",
                     )
                     .unwrap()
                     .try_as_basic_value()

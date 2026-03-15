@@ -148,11 +148,11 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 190 tests passing, 49 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 195 tests passing, 44 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**190 passing** / **49 not yet implemented** — 80% of test suite
+**195 passing** / **44 not yet implemented** — 82% of test suite
 
 ### Literals & Primitives
 
@@ -245,12 +245,12 @@ Early stage. 190 tests passing, 49 pending. The goal is drop-in compatibility wi
 | `.trim()` | :white_check_mark: | `"  hello  ".trim()` |
 | Template literals | :white_check_mark: | `` `value is ${x}` `` |
 | Chained methods | :white_check_mark: | `"  Hello  ".trim().toUpperCase()` |
-| `.startsWith()` | :x: | `"hello".startsWith("he")` |
-| `.endsWith()` | :x: | `"hello".endsWith("lo")` |
-| `.repeat()` | :x: | `"ab".repeat(3)` |
+| `.startsWith()` | :white_check_mark: | `"hello".startsWith("he")` |
+| `.endsWith()` | :white_check_mark: | `"hello".endsWith("lo")` |
+| `.repeat()` | :white_check_mark: | `"ab".repeat(3)` |
 | `.split()` | :x: | `"a,b,c".split(",")` |
-| `.replace()` | :x: | `"hello".replace("l", "r")` |
-| `.padStart()` | :x: | `"5".padStart(3, "0")` |
+| `.replace()` | :white_check_mark: | `"hello".replace("l", "r")` |
+| `.padStart()` | :white_check_mark: | `"5".padStart(3, "0")` |
 
 ### Control Flow
 

@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 190 tests passing, 49 pending — 80% of test suite**
+**Current status: 195 tests passing, 44 pending — 82% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -11,12 +11,12 @@ Features are grouped by implementation effort. Items within each tier are roughl
 Small, self-contained changes. Each typically touches 1–3 files.
 
 ### String Methods
-- [ ] `.startsWith(s)` — `"hello".startsWith("he")`
-- [ ] `.endsWith(s)` — `"hello".endsWith("lo")`
-- [ ] `.repeat(n)` — `"ab".repeat(3)`
-- [ ] `.padStart(n, s)` — `"5".padStart(3, "0")`
-- [ ] `.replace(a, b)` — `"hello".replace("l", "r")`
-- [ ] `.split(s)` — `"a,b,c".split(",")` *(returns array — slightly more involved)*
+- [x] `.startsWith(s)` — `"hello".startsWith("he")`
+- [x] `.endsWith(s)` — `"hello".endsWith("lo")`
+- [x] `.repeat(n)` — `"ab".repeat(3)`
+- [x] `.padStart(n, s)` — `"5".padStart(3, "0")`
+- [x] `.replace(a, b)` — `"hello".replace("l", "r")`
+- [ ] `.split(s)` — `"a,b,c".split(",")` *(requires string array support)*
 
 ### Number Methods
 - [ ] `Number.isInteger(x)` — `Number.isInteger(42)`

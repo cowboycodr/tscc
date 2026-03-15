@@ -904,10 +904,28 @@ impl TypeChecker {
                                 return_type: Box::new(Type::Number),
                             });
                         }
-                        "includes" => {
+                        "includes" | "startsWith" | "endsWith" => {
                             return Ok(Type::Function {
                                 params: vec![Type::String],
                                 return_type: Box::new(Type::Boolean),
+                            });
+                        }
+                        "repeat" => {
+                            return Ok(Type::Function {
+                                params: vec![Type::Number],
+                                return_type: Box::new(Type::String),
+                            });
+                        }
+                        "replace" => {
+                            return Ok(Type::Function {
+                                params: vec![Type::String, Type::String],
+                                return_type: Box::new(Type::String),
+                            });
+                        }
+                        "padStart" => {
+                            return Ok(Type::Function {
+                                params: vec![Type::Number, Type::String],
+                                return_type: Box::new(Type::String),
                             });
                         }
                         _ => {}
@@ -1206,15 +1224,49 @@ impl TypeChecker {
                 self.check_expr(&args[0])?;
                 Ok(Type::Number)
             }
-            "includes" => {
+            "includes" | "startsWith" | "endsWith" => {
                 if args.len() != 1 {
                     return Err(CompileError::error(
-                        "includes expects 1 argument",
+                        format!("{} expects 1 argument", method),
                         span.clone(),
                     ));
                 }
                 self.check_expr(&args[0])?;
                 Ok(Type::Boolean)
+            }
+            "repeat" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        "repeat expects 1 argument",
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                Ok(Type::String)
+            }
+            "replace" => {
+                if args.len() != 2 {
+                    return Err(CompileError::error(
+                        "replace expects 2 arguments",
+                        span.clone(),
+                    ));
+                }
+                for arg in args {
+                    self.check_expr(arg)?;
+                }
+                Ok(Type::String)
+            }
+            "padStart" => {
+                if args.len() != 2 {
+                    return Err(CompileError::error(
+                        "padStart expects 2 arguments",
+                        span.clone(),
+                    ));
+                }
+                for arg in args {
+                    self.check_expr(arg)?;
+                }
+                Ok(Type::String)
             }
             "substring" | "slice" => {
                 if args.is_empty() || args.len() > 2 {

@@ -186,6 +186,91 @@ MgString tscc_string_trim(char* data, long long len) {
     MgString r = { out, new_len }; return r;
 }
 
+int tscc_string_startsWith(char* haystack, long long hay_len, char* needle, long long needle_len) {
+    if (needle_len > hay_len) return 0;
+    if (needle_len == 0) return 1;
+    return memcmp(haystack, needle, (size_t)needle_len) == 0 ? 1 : 0;
+}
+
+int tscc_string_endsWith(char* haystack, long long hay_len, char* needle, long long needle_len) {
+    if (needle_len > hay_len) return 0;
+    if (needle_len == 0) return 1;
+    return memcmp(&haystack[hay_len - needle_len], needle, (size_t)needle_len) == 0 ? 1 : 0;
+}
+
+MgString tscc_string_repeat(char* data, long long len, double count_d) {
+    long long count = (long long)count_d;
+    if (count <= 0 || len == 0) {
+        MgString r = { "", 0 }; return r;
+    }
+    long long new_len = len * count;
+    char* out = (char*)malloc((size_t)(new_len + 1));
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+    for (long long i = 0; i < count; i++) {
+        memcpy(&out[i * len], data, (size_t)len);
+    }
+    out[new_len] = '\0';
+    MgString r = { out, new_len }; return r;
+}
+
+MgString tscc_string_replace(char* data, long long len,
+                             char* search, long long search_len,
+                             char* replace, long long replace_len) {
+    if (search_len == 0 || search_len > len) {
+        char* out = (char*)malloc((size_t)(len + 1));
+        if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+        memcpy(out, data, (size_t)len);
+        out[len] = '\0';
+        MgString r = { out, len }; return r;
+    }
+    // Find first occurrence
+    long long pos = -1;
+    for (long long i = 0; i <= len - search_len; i++) {
+        if (memcmp(&data[i], search, (size_t)search_len) == 0) { pos = i; break; }
+    }
+    if (pos < 0) {
+        char* out = (char*)malloc((size_t)(len + 1));
+        if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+        memcpy(out, data, (size_t)len);
+        out[len] = '\0';
+        MgString r = { out, len }; return r;
+    }
+    long long new_len = len - search_len + replace_len;
+    char* out = (char*)malloc((size_t)(new_len + 1));
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+    memcpy(out, data, (size_t)pos);
+    memcpy(&out[pos], replace, (size_t)replace_len);
+    memcpy(&out[pos + replace_len], &data[pos + search_len],
+           (size_t)(len - pos - search_len));
+    out[new_len] = '\0';
+    MgString r = { out, new_len }; return r;
+}
+
+MgString tscc_string_padStart(char* data, long long len, double target_d,
+                              char* pad_data, long long pad_len) {
+    long long target = (long long)target_d;
+    if (target <= len || pad_len == 0) {
+        char* out = (char*)malloc((size_t)(len + 1));
+        if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+        memcpy(out, data, (size_t)len);
+        out[len] = '\0';
+        MgString r = { out, len }; return r;
+    }
+    long long pad_total = target - len;
+    char* out = (char*)malloc((size_t)(target + 1));
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+    long long pos = 0;
+    while (pos < pad_total) {
+        long long copy_len = pad_len;
+        if (pos + copy_len > pad_total) copy_len = pad_total - pos;
+        memcpy(&out[pos], pad_data, (size_t)copy_len);
+        pos += copy_len;
+    }
+    memcpy(&out[pad_total], data, (size_t)len);
+    out[target] = '\0';
+    MgString r = { out, target }; return r;
+}
+
 // ============================================================
 // Math functions
 // ============================================================
