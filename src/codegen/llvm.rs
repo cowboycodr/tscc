@@ -4529,6 +4529,16 @@ impl<'ctx> Codegen<'ctx> {
             }
             TypeAnnKind::StringLiteral(_) => VarType::String,
             TypeAnnKind::NumberLiteral(_) => self.number_mode.clone(),
+            TypeAnnKind::Union(variants) => {
+                // Union types are erased at codegen — use first variant's type
+                // as a fallback for uninitialized variables. The concrete value
+                // determines the actual LLVM type at runtime.
+                if let Some(first) = variants.first() {
+                    self.type_ann_to_var_type(first)
+                } else {
+                    self.number_mode.clone()
+                }
+            }
             TypeAnnKind::FunctionType {
                 params,
                 return_type,

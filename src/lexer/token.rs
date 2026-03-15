@@ -61,6 +61,7 @@ pub enum Token {
     LessEqual,
     GreaterEqual,
     AmpersandAmpersand,
+    Pipe,
     PipePipe,
     Bang,
     PlusPlus,

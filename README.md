@@ -148,11 +148,11 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 199 tests passing, 40 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 202 tests passing, 37 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**199 passing** / **40 not yet implemented** — 83% of test suite
+**202 passing** / **37 not yet implemented** — 85% of test suite
 
 ### Literals & Primitives
 
@@ -370,8 +370,8 @@ Early stage. 199 tests passing, 40 pending. The goal is drop-in compatibility wi
 |---|---|---|
 | Type annotations | :white_check_mark: | `let x: number`, `function f(): string` |
 | Type inference | :white_check_mark: | `let x = 42` (inferred as number) |
-| Union types | :x: | `string \| number` |
-| Type aliases | :x: | `type ID = string \| number` |
+| Union types | :white_check_mark: | `string \| number` |
+| Type aliases | :white_check_mark: | `type ID = string \| number` |
 | Enums (numeric) | :x: | `enum Color { Red, Green }` |
 | Enums (string) | :x: | `enum Direction { Up = "UP" }` |
 | Generics | :x: | `function identity<T>(x: T): T` |
@@ -379,7 +379,7 @@ Early stage. 199 tests passing, 40 pending. The goal is drop-in compatibility wi
 | Tuple types | :x: | `[number, string]` |
 | Type assertions | :white_check_mark: | `x as string` |
 | Type narrowing | :x: | `if (typeof val === "string")` |
-| String literal types | :x: | `type Dir = "up" \| "down"` |
+| String literal types | :white_check_mark: | `type Dir = "up" \| "down"` |
 | Intersection types | :x: | `Named & Aged` |
 | `readonly` | :white_check_mark: | `readonly host: string` |
 | `keyof` | :x: | `keyof Point` |

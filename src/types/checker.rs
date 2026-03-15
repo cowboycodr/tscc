@@ -1505,6 +1505,14 @@ impl TypeChecker {
                 return true;
             }
         }
+        // A value is assignable TO a union if it's assignable to any variant
+        if let Type::Union(variants) = to {
+            return variants.iter().any(|v| self.is_assignable(from, v));
+        }
+        // A union is assignable FROM if all variants are assignable to the target
+        if let Type::Union(variants) = from {
+            return variants.iter().all(|v| self.is_assignable(v, to));
+        }
         // Object structural compatibility: from has all fields of to
         if let (
             Type::Object {
@@ -1594,6 +1602,13 @@ impl TypeChecker {
             }
             TypeAnnKind::StringLiteral(s) => Type::StringLiteral(s.clone()),
             TypeAnnKind::NumberLiteral(n) => Type::NumberLiteral(n.to_string()),
+            TypeAnnKind::Union(variants) => {
+                let types: Vec<Type> = variants
+                    .iter()
+                    .map(|v| self.resolve_type_annotation(v))
+                    .collect();
+                Type::Union(types)
+            }
             TypeAnnKind::FunctionType {
                 params,
                 return_type,

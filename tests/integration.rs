@@ -1689,7 +1689,7 @@ printPoint({ x: 1, y: 2 })
     // --- Type system features ---
 
     #[test]
-    #[ignore = "union types not implemented"]
+    #[ignore = "union type codegen requires runtime type narrowing"]
     fn union_type() {
         let src = r#"
 function format(val: string | number): string {
@@ -1705,7 +1705,6 @@ console.log(format("hi"))
     }
 
     #[test]
-    #[ignore = "test requires union type parsing"]
     fn type_alias() {
         let src = r#"
 type ID = string | number
@@ -2042,7 +2041,6 @@ process(41)
     }
 
     #[test]
-    #[ignore = "string literal types not implemented"]
     fn string_literal_type() {
         let src = r#"
 type Direction = "up" | "down" | "left" | "right"
@@ -2130,7 +2128,6 @@ console.log(y)
     }
 
     #[test]
-    #[ignore = "test requires union types and string literal types"]
     fn satisfies_operator() {
         let src = r#"
 type Colors = "red" | "green" | "blue"

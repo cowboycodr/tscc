@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 199 tests passing, 40 pending — 83% of test suite**
+**Current status: 202 tests passing, 37 pending — 85% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -46,7 +46,7 @@ Each requires a new AST node and coordinated changes across parser → checker �
 
 - [ ] **Enums (numeric)** — `enum Color { Red, Green, Blue }`
 - [ ] **Enums (string)** — `enum Direction { Up = "UP", Down = "DOWN" }`
-- [ ] **Union types** — `string | number` *(type checker; codegen uses widest type)*
+- [x] **Union types** — `string | number` *(type checker; codegen uses widest type)*
 - [ ] **`try`/`catch`** — `try { ... } catch (e) { ... }` *(setjmp-based or LLVM landingpad)*
 - [ ] **`try`/`finally`** — `try { ... } finally { ... }`
 - [ ] **Function hoisting** — calling a function before its declaration *(pre-scan pass in checker)*
@@ -57,7 +57,7 @@ Each requires a new AST node and coordinated changes across parser → checker �
 - [ ] **Tuple types** — `[number, string]` *(fixed-length array with typed positions)*
 - [ ] **`JSON.stringify()`** — `JSON.stringify({ a: 1 })` *(runtime C function)*
 - [ ] **Intersection types** — `Named & Aged`
-- [ ] **String literal types** — `type Dir = "up" | "down"`
+- [x] **String literal types** — `type Dir = "up" | "down"`
 - [ ] **Type narrowing** — `if (typeof val === "string") { ... }`
 
 ---

@@ -818,6 +818,164 @@ impl Parser {
             }
         }
 
+        // Check for union type: Type | Type | ...
+        if self.check(&Token::Pipe) {
+            let mut variants = vec![base];
+            while self.match_token(&Token::Pipe) {
+                variants.push(self.type_annotation_base()?);
+            }
+            return Ok(TypeAnnotation {
+                kind: TypeAnnKind::Union(variants),
+                span: self.span_from(&span),
+            });
+        }
+
+        Ok(base)
+    }
+
+    /// Parse a single type (without union) — used by union parsing to avoid left-recursion
+    fn type_annotation_base(&mut self) -> Result<TypeAnnotation, CompileError> {
+        let span = self.current_span();
+
+        // typeof x
+        if self.match_token(&Token::Typeof) {
+            let name = self.expect_identifier("Expected identifier after 'typeof'")?;
+            let mut base = TypeAnnotation {
+                kind: TypeAnnKind::Typeof(name),
+                span: self.span_from(&span),
+            };
+            while self.check(&Token::LeftBracket) {
+                if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket)
+                {
+                    self.advance();
+                    self.advance();
+                    base = TypeAnnotation {
+                        kind: TypeAnnKind::Array(Box::new(base)),
+                        span: self.span_from(&span),
+                    };
+                } else {
+                    break;
+                }
+            }
+            return Ok(base);
+        }
+
+        // Function type
+        if self.check(&Token::LeftParen) {
+            if let Some(func_type) = self.try_function_type(&span)? {
+                return Ok(func_type);
+            }
+        }
+
+        let mut base = match self.peek_token() {
+            Token::NumberType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Number,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::StringType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::String,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::BooleanType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Boolean,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Void => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Void,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Null => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Null,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Undefined => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Undefined,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::String(s) => {
+                let s = s.clone();
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::StringLiteral(s),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Number(n) => {
+                let n = n;
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::NumberLiteral(n),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::LeftBrace => {
+                self.advance();
+                let mut fields = Vec::new();
+                while !self.check(&Token::RightBrace) && !self.is_at_end() {
+                    if let Token::Identifier(ref kw) = self.peek_token() {
+                        if kw == "readonly" {
+                            self.advance();
+                        }
+                    }
+                    let field_name = self.expect_identifier("Expected field name in type")?;
+                    self.expect(&Token::Colon, "Expected ':' in object type")?;
+                    let field_type = self.type_annotation()?;
+                    fields.push((field_name, field_type));
+                    if !self.match_token(&Token::Comma) {
+                        self.match_token(&Token::Semicolon);
+                    }
+                }
+                self.expect(&Token::RightBrace, "Expected '}' in object type")?;
+                TypeAnnotation {
+                    kind: TypeAnnKind::Object { fields },
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Named(name),
+                    span: self.span_from(&span),
+                }
+            }
+            _ => {
+                return Err(self.error("Expected type annotation"));
+            }
+        };
+
+        // Array suffix
+        while self.check(&Token::LeftBracket) {
+            if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket) {
+                self.advance();
+                self.advance();
+                base = TypeAnnotation {
+                    kind: TypeAnnKind::Array(Box::new(base)),
+                    span: self.span_from(&span),
+                };
+            } else {
+                break;
+            }
+        }
+
         Ok(base)
     }
 

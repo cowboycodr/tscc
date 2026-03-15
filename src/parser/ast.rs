@@ -170,6 +170,8 @@ pub enum TypeAnnKind {
     StringLiteral(String),
     /// Number literal type: 0, 1, 42, etc.
     NumberLiteral(f64),
+    /// Union type: string | number
+    Union(Vec<TypeAnnotation>),
     /// Function type: (params) => return_type
     FunctionType {
         params: Vec<TypeAnnotation>,

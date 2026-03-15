@@ -161,7 +161,7 @@ impl Scanner {
                 if self.match_char('|') {
                     self.add_token(Token::PipePipe);
                 } else {
-                    return Err(self.error("Unexpected character '|'. Did you mean '||'?"));
+                    self.add_token(Token::Pipe);
                 }
             }
 

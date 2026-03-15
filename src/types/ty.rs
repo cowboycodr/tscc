@@ -24,6 +24,8 @@ pub enum Type {
     StringLiteral(String),
     /// A specific number value used as a type (e.g. 1 in `type Bit = 0 | 1`)
     NumberLiteral(String),
+    /// Union type: string | number
+    Union(Vec<Type>),
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -64,6 +66,15 @@ impl std::fmt::Display for Type {
             Type::Class { name, .. } => write!(f, "{}", name),
             Type::StringLiteral(s) => write!(f, "\"{}\"", s),
             Type::NumberLiteral(n) => write!(f, "{}", n),
+            Type::Union(types) => {
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                Ok(())
+            }
             Type::Unknown => write!(f, "unknown"),
         }
     }
