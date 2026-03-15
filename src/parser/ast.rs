@@ -18,12 +18,14 @@ pub enum StmtKind {
         is_const: bool,
         type_ann: Option<TypeAnnotation>,
         initializer: Option<Expr>,
+        is_exported: bool,
     },
     FunctionDecl {
         name: String,
         params: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
+        is_exported: bool,
     },
     If {
         condition: Expr,
@@ -49,6 +51,17 @@ pub enum StmtKind {
     Block {
         statements: Vec<Statement>,
     },
+    Import {
+        specifiers: Vec<ImportSpecifier>,
+        source: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportSpecifier {
+    pub imported: String,
+    pub local: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +110,9 @@ pub enum ExprKind {
         op: UnaryOp,
         operand: Box<Expr>,
     },
+    Typeof {
+        operand: Box<Expr>,
+    },
     Call {
         callee: Box<Expr>,
         args: Vec<Expr>,
@@ -117,12 +133,10 @@ pub enum ExprKind {
     Grouping {
         expr: Box<Expr>,
     },
-    // Post-increment/decrement as expressions
     PostfixUpdate {
         name: String,
         op: UpdateOp,
     },
-    // Prefix increment/decrement
     PrefixUpdate {
         name: String,
         op: UpdateOp,

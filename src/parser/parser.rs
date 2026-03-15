@@ -24,21 +24,23 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Statement, CompileError> {
         match self.peek_token() {
-            Token::Let | Token::Const => self.variable_declaration(),
-            Token::Function => self.function_declaration(),
+            Token::Let | Token::Const => self.variable_declaration(false),
+            Token::Function => self.function_declaration(false),
             Token::If => self.if_statement(),
             Token::While => self.while_statement(),
             Token::For => self.for_statement(),
             Token::Return => self.return_statement(),
             Token::LeftBrace => self.block_statement(),
+            Token::Import => self.import_declaration(),
+            Token::Export => self.export_declaration(),
             _ => self.expression_statement(),
         }
     }
 
-    fn variable_declaration(&mut self) -> Result<Statement, CompileError> {
+    fn variable_declaration(&mut self, is_exported: bool) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         let is_const = matches!(self.peek_token(), Token::Const);
-        self.advance(); // consume let/const
+        self.advance();
 
         let name = self.expect_identifier("Expected variable name")?;
 
@@ -62,14 +64,15 @@ impl Parser {
                 is_const,
                 type_ann,
                 initializer,
+                is_exported,
             },
             span: self.span_from(&start_span),
         })
     }
 
-    fn function_declaration(&mut self) -> Result<Statement, CompileError> {
+    fn function_declaration(&mut self, is_exported: bool) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
-        self.advance(); // consume 'function'
+        self.advance();
 
         let name = self.expect_identifier("Expected function name")?;
 
@@ -92,9 +95,62 @@ impl Parser {
                 params,
                 return_type,
                 body,
+                is_exported,
             },
             span: self.span_from(&start_span),
         })
+    }
+
+    fn import_declaration(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'import'
+
+        self.expect(&Token::LeftBrace, "Expected '{' in import declaration")?;
+
+        let mut specifiers = Vec::new();
+        if !self.check(&Token::RightBrace) {
+            loop {
+                let spec_span = self.current_span();
+                let imported = self.expect_identifier("Expected imported name")?;
+
+                let local = if self.match_token(&Token::As) {
+                    self.expect_identifier("Expected local name after 'as'")?
+                } else {
+                    imported.clone()
+                };
+
+                specifiers.push(ImportSpecifier {
+                    imported,
+                    local,
+                    span: self.span_from(&spec_span),
+                });
+
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RightBrace, "Expected '}' in import declaration")?;
+
+        self.expect(&Token::From, "Expected 'from' after import specifiers")?;
+        let source = self.expect_string("Expected module path string")?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::Import { specifiers, source },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn export_declaration(&mut self) -> Result<Statement, CompileError> {
+        let _start_span = self.current_span();
+        self.advance(); // consume 'export'
+
+        match self.peek_token() {
+            Token::Function => self.function_declaration(true),
+            Token::Let | Token::Const => self.variable_declaration(true),
+            _ => Err(self.error("Expected function, let, or const after 'export'")),
+        }
     }
 
     fn parameter_list(&mut self) -> Result<Vec<Parameter>, CompileError> {
@@ -123,7 +179,7 @@ impl Parser {
 
     fn if_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
-        self.advance(); // consume 'if'
+        self.advance();
 
         self.expect(&Token::LeftParen, "Expected '(' after 'if'")?;
         let condition = self.expression()?;
@@ -134,7 +190,6 @@ impl Parser {
 
         let else_branch = if self.match_token(&Token::Else) {
             if self.check(&Token::If) {
-                // else if
                 let else_if = self.if_statement()?;
                 Some(vec![else_if])
             } else {
@@ -157,7 +212,7 @@ impl Parser {
 
     fn while_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
-        self.advance(); // consume 'while'
+        self.advance();
 
         self.expect(&Token::LeftParen, "Expected '(' after 'while'")?;
         let condition = self.expression()?;
@@ -174,15 +229,14 @@ impl Parser {
 
     fn for_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
-        self.advance(); // consume 'for'
+        self.advance();
 
         self.expect(&Token::LeftParen, "Expected '(' after 'for'")?;
 
-        // Init
         let init = if self.match_token(&Token::Semicolon) {
             None
         } else if matches!(self.peek_token(), Token::Let | Token::Const) {
-            let decl = self.variable_declaration()?;
+            let decl = self.variable_declaration(false)?;
             Some(Box::new(decl))
         } else {
             let expr = self.expression()?;
@@ -193,7 +247,6 @@ impl Parser {
             }))
         };
 
-        // Condition
         let condition = if self.check(&Token::Semicolon) {
             None
         } else {
@@ -201,7 +254,6 @@ impl Parser {
         };
         self.consume_semicolon()?;
 
-        // Update
         let update = if self.check(&Token::RightParen) {
             None
         } else {
@@ -225,7 +277,7 @@ impl Parser {
 
     fn return_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
-        self.advance(); // consume 'return'
+        self.advance();
 
         let value = if self.check(&Token::Semicolon) || self.check(&Token::RightBrace) {
             None
@@ -243,7 +295,7 @@ impl Parser {
 
     fn block_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
-        self.advance(); // consume '{'
+        self.advance();
         let statements = self.block_body()?;
         Ok(Statement {
             kind: StmtKind::Block { statements },
@@ -309,7 +361,7 @@ impl Parser {
         })
     }
 
-    // --- Expressions (Pratt/precedence climbing) ---
+    // --- Expressions ---
 
     fn expression(&mut self) -> Result<Expr, CompileError> {
         self.assignment()
@@ -334,10 +386,7 @@ impl Parser {
                     },
                 });
             }
-            return Err(CompileError {
-                message: "Invalid assignment target".to_string(),
-                span: expr.span,
-            });
+            return Err(CompileError::error("Invalid assignment target", expr.span));
         }
 
         Ok(expr)
@@ -524,6 +573,17 @@ impl Parser {
                     },
                 })
             }
+            Token::Typeof => {
+                let span = self.current_span();
+                self.advance();
+                let operand = self.unary()?;
+                Ok(Expr {
+                    span: self.span_from(&span),
+                    kind: ExprKind::Typeof {
+                        operand: Box::new(operand),
+                    },
+                })
+            }
             Token::PlusPlus => {
                 let span = self.current_span();
                 self.advance();
@@ -555,7 +615,6 @@ impl Parser {
     fn postfix(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.call()?;
 
-        // Handle postfix ++ and --
         match self.peek_token() {
             Token::PlusPlus => {
                 if let ExprKind::Identifier(name) = &expr.kind {
@@ -694,7 +753,6 @@ impl Parser {
             }
             Token::LeftParen => {
                 self.advance();
-                // Check if this is an arrow function: (params) => ...
                 if let Some(arrow) = self.try_arrow_function(&span)? {
                     return Ok(arrow);
                 }
@@ -712,15 +770,12 @@ impl Parser {
     }
 
     fn try_arrow_function(&mut self, start_span: &Span) -> Result<Option<Expr>, CompileError> {
-        // Save position to backtrack
         let saved = self.current;
 
-        // Try to parse parameter list
         let params_result = self.try_parse_arrow_params();
         match params_result {
             Some(params) => {
                 if self.match_token(&Token::RightParen) {
-                    // Check for optional return type annotation
                     let return_type = if self.match_token(&Token::Colon) {
                         Some(self.type_annotation()?)
                     } else {
@@ -728,7 +783,6 @@ impl Parser {
                     };
 
                     if self.match_token(&Token::Arrow) {
-                        // It's an arrow function
                         let body = if self.check(&Token::LeftBrace) {
                             self.advance();
                             ArrowBody::Block(self.block_body()?)
@@ -746,7 +800,6 @@ impl Parser {
                         }));
                     }
                 }
-                // Not an arrow function, backtrack
                 self.current = saved;
                 Ok(None)
             }
@@ -760,7 +813,7 @@ impl Parser {
     fn try_parse_arrow_params(&mut self) -> Option<Vec<Parameter>> {
         let mut params = Vec::new();
         if self.check(&Token::RightParen) {
-            return Some(params); // empty params
+            return Some(params);
         }
 
         loop {
@@ -857,13 +910,18 @@ impl Parser {
         }
     }
 
-    fn consume_semicolon(&mut self) -> Result<(), CompileError> {
-        if self.match_token(&Token::Semicolon) {
-            Ok(())
+    fn expect_string(&mut self, message: &str) -> Result<String, CompileError> {
+        if let Token::String(s) = self.peek_token() {
+            self.advance();
+            Ok(s)
         } else {
-            // Lenient: allow missing semicolons (like TypeScript)
-            Ok(())
+            Err(self.error(message))
         }
+    }
+
+    fn consume_semicolon(&mut self) -> Result<(), CompileError> {
+        self.match_token(&Token::Semicolon);
+        Ok(())
     }
 
     fn is_at_end(&self) -> bool {
@@ -871,9 +929,6 @@ impl Parser {
     }
 
     fn error(&self, message: &str) -> CompileError {
-        CompileError {
-            message: message.to_string(),
-            span: self.current_span(),
-        }
+        CompileError::error(message, self.current_span())
     }
 }

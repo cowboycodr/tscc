@@ -23,6 +23,16 @@ pub enum Token {
     Of,
     Void,
 
+    // Module keywords
+    Import,
+    Export,
+    From,
+    As,
+    Default,
+
+    // Operator keywords
+    Typeof,
+
     // Type keywords (used in annotations)
     NumberType,
     StringType,

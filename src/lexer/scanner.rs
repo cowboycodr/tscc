@@ -140,12 +140,10 @@ impl Scanner {
 
             '/' => {
                 if self.match_char('/') {
-                    // Line comment
                     while !self.is_at_end() && self.peek() != '\n' {
                         self.advance();
                     }
                 } else if self.match_char('*') {
-                    // Block comment
                     self.block_comment()?;
                 } else {
                     self.add_token(Token::Slash);
@@ -209,7 +207,7 @@ impl Scanner {
             return Err(self.error("Unterminated string literal"));
         }
 
-        self.advance(); // Closing quote
+        self.advance();
         self.add_token(Token::String(value));
         Ok(())
     }
@@ -220,7 +218,7 @@ impl Scanner {
         }
 
         if !self.is_at_end() && self.peek() == '.' && self.peek_next().is_ascii_digit() {
-            self.advance(); // consume the '.'
+            self.advance();
             while !self.is_at_end() && self.peek().is_ascii_digit() {
                 self.advance();
             }
@@ -260,6 +258,12 @@ impl Scanner {
             "number" => Token::NumberType,
             "string" => Token::StringType,
             "boolean" => Token::BooleanType,
+            "import" => Token::Import,
+            "export" => Token::Export,
+            "from" => Token::From,
+            "as" => Token::As,
+            "default" => Token::Default,
+            "typeof" => Token::Typeof,
             _ => Token::Identifier(text),
         };
         self.add_token(token);
@@ -342,9 +346,9 @@ impl Scanner {
     }
 
     fn error(&self, message: &str) -> CompileError {
-        CompileError {
-            message: message.to_string(),
-            span: Span::new(self.start, self.current, self.line, self.start_column),
-        }
+        CompileError::error(
+            message,
+            Span::new(self.start, self.current, self.line, self.start_column),
+        )
     }
 }

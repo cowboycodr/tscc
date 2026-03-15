@@ -23,6 +23,8 @@ pub struct Codegen<'ctx> {
     variables: Vec<HashMap<String, (PointerValue<'ctx>, VarType)>>,
     functions: HashMap<String, FunctionValue<'ctx>>,
     string_type: StructType<'ctx>,
+    /// If true, don't generate a main() — this is a library module
+    pub is_library: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +39,6 @@ impl<'ctx> Codegen<'ctx> {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
 
-        // String struct: { i8*, i64 } (pointer, length)
         let string_type = context.struct_type(
             &[
                 context.ptr_type(AddressSpace::default()).into(),
@@ -53,6 +54,7 @@ impl<'ctx> Codegen<'ctx> {
             variables: Vec::new(),
             functions: HashMap::new(),
             string_type,
+            is_library: false,
         };
 
         codegen.declare_runtime_functions();
@@ -60,67 +62,207 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn declare_runtime_functions(&mut self) {
-        // void mango_print_number(double)
         let f64_type = self.context.f64_type();
         let void_type = self.context.void_type();
-
-        let print_number_type = void_type.fn_type(&[f64_type.into()], false);
-        self.module
-            .add_function("mango_print_number", print_number_type, None);
-
-        // void mango_print_string(i8*, i64)
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let i64_type = self.context.i64_type();
-        let print_string_type = void_type.fn_type(&[ptr_type.into(), i64_type.into()], false);
-        self.module
-            .add_function("mango_print_string", print_string_type, None);
-
-        // void mango_print_boolean(i1)
         let i1_type = self.context.bool_type();
-        let print_bool_type = void_type.fn_type(&[i1_type.into()], false);
-        self.module
-            .add_function("mango_print_boolean", print_bool_type, None);
 
-        // void mango_print_null()
-        let print_null_type = void_type.fn_type(&[], false);
-        self.module
-            .add_function("mango_print_null", print_null_type, None);
-
-        // void mango_print_undefined()
-        let print_undefined_type = void_type.fn_type(&[], false);
-        self.module
-            .add_function("mango_print_undefined", print_undefined_type, None);
-
-        // { i8*, i64 } mango_string_concat(i8*, i64, i8*, i64)
-        let concat_type = self.string_type.fn_type(
-            &[
-                ptr_type.into(),
-                i64_type.into(),
-                ptr_type.into(),
-                i64_type.into(),
-            ],
-            false,
+        // --- Print functions ---
+        self.module.add_function(
+            "mango_print_number",
+            void_type.fn_type(&[f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_print_string",
+            void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_print_boolean",
+            void_type.fn_type(&[i1_type.into()], false),
+            None,
         );
         self.module
-            .add_function("mango_string_concat", concat_type, None);
-
-        // void mango_print_newline()
-        let print_newline_type = void_type.fn_type(&[], false);
+            .add_function("mango_print_null", void_type.fn_type(&[], false), None);
         self.module
-            .add_function("mango_print_newline", print_newline_type, None);
-
-        // { i8*, i64 } mango_number_to_string(double)
-        let num_to_str_type = self.string_type.fn_type(&[f64_type.into()], false);
+            .add_function("mango_print_undefined", void_type.fn_type(&[], false), None);
         self.module
-            .add_function("mango_number_to_string", num_to_str_type, None);
+            .add_function("mango_print_newline", void_type.fn_type(&[], false), None);
 
-        // { i8*, i64 } mango_boolean_to_string(i1)
-        let bool_to_str_type = self.string_type.fn_type(&[i1_type.into()], false);
+        // --- Stderr print (console.error / console.warn) ---
+        self.module.add_function(
+            "mango_eprint_number",
+            void_type.fn_type(&[f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_eprint_string",
+            void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_eprint_boolean",
+            void_type.fn_type(&[i1_type.into()], false),
+            None,
+        );
         self.module
-            .add_function("mango_boolean_to_string", bool_to_str_type, None);
+            .add_function("mango_eprint_newline", void_type.fn_type(&[], false), None);
+
+        // --- String operations ---
+        self.module.add_function(
+            "mango_string_concat",
+            self.string_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "mango_number_to_string",
+            self.string_type.fn_type(&[f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_boolean_to_string",
+            self.string_type.fn_type(&[i1_type.into()], false),
+            None,
+        );
+
+        // --- String methods ---
+        self.module.add_function(
+            "mango_string_toUpperCase",
+            self.string_type
+                .fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_string_toLowerCase",
+            self.string_type
+                .fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_string_charAt",
+            self.string_type
+                .fn_type(&[ptr_type.into(), i64_type.into(), f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_string_indexOf",
+            f64_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "mango_string_includes",
+            i1_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "mango_string_substring",
+            self.string_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    f64_type.into(),
+                    f64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "mango_string_slice",
+            self.string_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    f64_type.into(),
+                    f64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "mango_string_trim",
+            self.string_type
+                .fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+
+        // --- Math functions ---
+        let math_1 = f64_type.fn_type(&[f64_type.into()], false);
+        let math_2 = f64_type.fn_type(&[f64_type.into(), f64_type.into()], false);
+        let math_0 = f64_type.fn_type(&[], false);
+        for name in &[
+            "floor", "ceil", "round", "abs", "sqrt", "sin", "cos", "tan", "log", "exp",
+        ] {
+            self.module
+                .add_function(&format!("mango_math_{}", name), math_1, None);
+        }
+        for name in &["pow", "min", "max"] {
+            self.module
+                .add_function(&format!("mango_math_{}", name), math_2, None);
+        }
+        self.module.add_function("mango_math_random", math_0, None);
+
+        // --- Global functions ---
+        self.module.add_function(
+            "mango_parseInt",
+            f64_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_parseFloat",
+            f64_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
     }
 
     pub fn compile(&mut self, program: &Program) -> Result<(), CompileError> {
+        // First pass: compile all function declarations
+        for stmt in &program.statements {
+            if let StmtKind::FunctionDecl {
+                name,
+                params,
+                return_type,
+                body,
+                ..
+            } = &stmt.kind
+            {
+                self.compile_function_decl(name, params, return_type, body)?;
+            }
+        }
+
+        if self.is_library {
+            // Library modules: compile top-level variable declarations as globals
+            // (skip for now — top-level code in libraries requires init functions)
+            return Ok(());
+        }
+
         // Create main function
         let i32_type = self.context.i32_type();
         let main_fn_type = i32_type.fn_type(&[], false);
@@ -131,10 +273,13 @@ impl<'ctx> Codegen<'ctx> {
         self.push_scope();
 
         for stmt in &program.statements {
+            // Skip function declarations (already compiled)
+            if matches!(&stmt.kind, StmtKind::FunctionDecl { .. }) {
+                continue;
+            }
             self.compile_statement(stmt, main_fn)?;
         }
 
-        // Return 0 from main if no explicit return
         if self
             .builder
             .get_insert_block()
@@ -169,7 +314,6 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_store(alloca, val).unwrap();
                     (alloca, vt)
                 } else {
-                    // Default initialization based on type annotation
                     let vt = type_ann
                         .as_ref()
                         .map(|ann| self.type_ann_to_var_type(ann))
@@ -183,13 +327,8 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
 
-            StmtKind::FunctionDecl {
-                name,
-                params,
-                return_type,
-                body,
-            } => {
-                self.compile_function_decl(name, params, return_type, body)?;
+            StmtKind::FunctionDecl { .. } => {
+                // Already compiled in first pass
                 Ok(())
             }
 
@@ -199,7 +338,7 @@ impl<'ctx> Codegen<'ctx> {
                 else_branch,
             } => {
                 let (cond_val, _) = self.compile_expr(condition, function)?;
-                let cond_bool = self.to_bool(cond_val, function)?;
+                let cond_bool = self.to_bool(cond_val)?;
 
                 let then_bb = self.context.append_basic_block(function, "then");
                 let else_bb = self.context.append_basic_block(function, "else");
@@ -209,7 +348,6 @@ impl<'ctx> Codegen<'ctx> {
                     .build_conditional_branch(cond_bool.into_int_value(), then_bb, else_bb)
                     .unwrap();
 
-                // Then branch
                 self.builder.position_at_end(then_bb);
                 self.push_scope();
                 for s in then_branch {
@@ -226,7 +364,6 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_unconditional_branch(merge_bb).unwrap();
                 }
 
-                // Else branch
                 self.builder.position_at_end(else_bb);
                 if let Some(else_stmts) = else_branch {
                     self.push_scope();
@@ -255,16 +392,13 @@ impl<'ctx> Codegen<'ctx> {
                 let exit_bb = self.context.append_basic_block(function, "while.exit");
 
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
-
-                // Condition
                 self.builder.position_at_end(cond_bb);
                 let (cond_val, _) = self.compile_expr(condition, function)?;
-                let cond_bool = self.to_bool(cond_val, function)?;
+                let cond_bool = self.to_bool(cond_val)?;
                 self.builder
                     .build_conditional_branch(cond_bool.into_int_value(), body_bb, exit_bb)
                     .unwrap();
 
-                // Body
                 self.builder.position_at_end(body_bb);
                 self.push_scope();
                 for s in body {
@@ -292,7 +426,6 @@ impl<'ctx> Codegen<'ctx> {
                 body,
             } => {
                 self.push_scope();
-
                 if let Some(init) = init {
                     self.compile_statement(init, function)?;
                 }
@@ -304,11 +437,10 @@ impl<'ctx> Codegen<'ctx> {
 
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
 
-                // Condition
                 self.builder.position_at_end(cond_bb);
                 if let Some(cond) = condition {
                     let (cond_val, _) = self.compile_expr(cond, function)?;
-                    let cond_bool = self.to_bool(cond_val, function)?;
+                    let cond_bool = self.to_bool(cond_val)?;
                     self.builder
                         .build_conditional_branch(cond_bool.into_int_value(), body_bb, exit_bb)
                         .unwrap();
@@ -316,7 +448,6 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_unconditional_branch(body_bb).unwrap();
                 }
 
-                // Body
                 self.builder.position_at_end(body_bb);
                 for s in body {
                     self.compile_statement(s, function)?;
@@ -331,7 +462,6 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_unconditional_branch(update_bb).unwrap();
                 }
 
-                // Update
                 self.builder.position_at_end(update_bb);
                 if let Some(upd) = update {
                     self.compile_expr(upd, function)?;
@@ -366,6 +496,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.pop_scope();
                 Ok(())
             }
+
+            StmtKind::Import { .. } => Ok(()),
         }
     }
 
@@ -404,14 +536,11 @@ impl<'ctx> Codegen<'ctx> {
         self.functions.insert(name.to_string(), function);
 
         let entry = self.context.append_basic_block(function, "entry");
-
-        // Save current position
         let current_bb = self.builder.get_insert_block();
 
         self.builder.position_at_end(entry);
         self.push_scope();
 
-        // Bind parameters
         for (i, (param, vt)) in params.iter().zip(param_types.iter()).enumerate() {
             let param_val = function.get_nth_param(i as u32).unwrap();
             let alloca = self.create_alloca(function, vt, &param.name);
@@ -423,7 +552,6 @@ impl<'ctx> Codegen<'ctx> {
             self.compile_statement(stmt, function)?;
         }
 
-        // Add default return if needed
         if self
             .builder
             .get_insert_block()
@@ -444,7 +572,6 @@ impl<'ctx> Codegen<'ctx> {
 
         self.pop_scope();
 
-        // Restore builder position
         if let Some(bb) = current_bb {
             self.builder.position_at_end(bb);
         }
@@ -458,31 +585,26 @@ impl<'ctx> Codegen<'ctx> {
         function: FunctionValue<'ctx>,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
         match &expr.kind {
-            ExprKind::NumberLiteral(n) => {
-                let val = self.context.f64_type().const_float(*n);
-                Ok((val.into(), VarType::Number))
-            }
+            ExprKind::NumberLiteral(n) => Ok((
+                self.context.f64_type().const_float(*n).into(),
+                VarType::Number,
+            )),
 
-            ExprKind::StringLiteral(s) => {
-                let val = self.create_string_literal(s);
-                Ok((val, VarType::String))
-            }
+            ExprKind::StringLiteral(s) => Ok((self.create_string_literal(s), VarType::String)),
 
-            ExprKind::BooleanLiteral(b) => {
-                let val = self.context.bool_type().const_int(*b as u64, false);
-                Ok((val.into(), VarType::Boolean))
-            }
+            ExprKind::BooleanLiteral(b) => Ok((
+                self.context.bool_type().const_int(*b as u64, false).into(),
+                VarType::Boolean,
+            )),
 
-            ExprKind::NullLiteral | ExprKind::UndefinedLiteral => {
-                // Represent as 0.0 number for now
-                let val = self.context.f64_type().const_float(0.0);
-                Ok((val.into(), VarType::Number))
-            }
+            ExprKind::NullLiteral | ExprKind::UndefinedLiteral => Ok((
+                self.context.f64_type().const_float(0.0).into(),
+                VarType::Number,
+            )),
 
             ExprKind::Identifier(name) => {
-                let (ptr, vt) = self.get_variable(name).ok_or_else(|| CompileError {
-                    message: format!("Undefined variable '{}'", name),
-                    span: expr.span.clone(),
+                let (ptr, vt) = self.get_variable(name).ok_or_else(|| {
+                    CompileError::error(format!("Undefined variable '{}'", name), expr.span.clone())
                 })?;
                 let llvm_type = self.var_type_to_llvm(&vt);
                 let val = self.builder.build_load(llvm_type, ptr, name).unwrap();
@@ -502,7 +624,7 @@ impl<'ctx> Codegen<'ctx> {
                         Ok((result.into(), VarType::Number))
                     }
                     UnaryOp::Not => {
-                        let bool_val = self.to_bool(val, function)?;
+                        let bool_val = self.to_bool(val)?;
                         let result = self
                             .builder
                             .build_not(bool_val.into_int_value(), "not")
@@ -512,23 +634,20 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
 
+            ExprKind::Typeof { operand } => self.compile_typeof(operand, function),
+
             ExprKind::Call { callee, args } => {
                 self.compile_call(callee, args, function, &expr.span)
             }
 
-            ExprKind::Member { .. } => {
-                // Member expressions are handled as part of Call for console.log
-                Err(CompileError {
-                    message: "Standalone member access not yet supported".to_string(),
-                    span: expr.span.clone(),
-                })
+            ExprKind::Member { object, property } => {
+                self.compile_member_access(object, property, function, &expr.span)
             }
 
             ExprKind::Assignment { name, value } => {
                 let (val, val_type) = self.compile_expr(value, function)?;
-                let (ptr, _) = self.get_variable(name).ok_or_else(|| CompileError {
-                    message: format!("Undefined variable '{}'", name),
-                    span: expr.span.clone(),
+                let (ptr, _) = self.get_variable(name).ok_or_else(|| {
+                    CompileError::error(format!("Undefined variable '{}'", name), expr.span.clone())
                 })?;
                 self.builder.build_store(ptr, val).unwrap();
                 Ok((val, val_type))
@@ -537,9 +656,8 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Grouping { expr } => self.compile_expr(expr, function),
 
             ExprKind::PostfixUpdate { name, op } | ExprKind::PrefixUpdate { name, op } => {
-                let (ptr, vt) = self.get_variable(name).ok_or_else(|| CompileError {
-                    message: format!("Undefined variable '{}'", name),
-                    span: expr.span.clone(),
+                let (ptr, vt) = self.get_variable(name).ok_or_else(|| {
+                    CompileError::error(format!("Undefined variable '{}'", name), expr.span.clone())
                 })?;
                 let llvm_type = self.var_type_to_llvm(&vt);
                 let old_val = self
@@ -559,7 +677,6 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 self.builder.build_store(ptr, new_val).unwrap();
 
-                // Postfix returns old value, prefix returns new
                 let result = match &expr.kind {
                     ExprKind::PostfixUpdate { .. } => old_val,
                     _ => new_val,
@@ -567,11 +684,78 @@ impl<'ctx> Codegen<'ctx> {
                 Ok((result.into(), VarType::Number))
             }
 
-            ExprKind::ArrowFunction { .. } => Err(CompileError {
-                message: "Arrow functions as expressions not yet supported in codegen".to_string(),
-                span: expr.span.clone(),
-            }),
+            ExprKind::ArrowFunction { .. } => Err(CompileError::error(
+                "Arrow functions as expressions not yet supported in codegen",
+                expr.span.clone(),
+            )),
         }
+    }
+
+    fn compile_typeof(
+        &mut self,
+        operand: &Expr,
+        function: FunctionValue<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let (_val, vt) = self.compile_expr(operand, function)?;
+        let type_str = match vt {
+            VarType::Number => "number",
+            VarType::String => "string",
+            VarType::Boolean => "boolean",
+        };
+        Ok((self.create_string_literal(type_str), VarType::String))
+    }
+
+    fn compile_member_access(
+        &mut self,
+        object: &Expr,
+        property: &str,
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        // Math constants
+        if let ExprKind::Identifier(name) = &object.kind {
+            if name == "Math" {
+                let val = match property {
+                    "PI" => std::f64::consts::PI,
+                    "E" => std::f64::consts::E,
+                    "LN2" => std::f64::consts::LN_2,
+                    "LN10" => std::f64::consts::LN_10,
+                    "SQRT2" => std::f64::consts::SQRT_2,
+                    _ => {
+                        return Err(CompileError::error(
+                            format!("Cannot access Math.{} as a property", property),
+                            span.clone(),
+                        ));
+                    }
+                };
+                return Ok((
+                    self.context.f64_type().const_float(val).into(),
+                    VarType::Number,
+                ));
+            }
+        }
+
+        // String .length
+        let (obj_val, obj_vt) = self.compile_expr(object, function)?;
+        if matches!(obj_vt, VarType::String) && property == "length" {
+            let len = self
+                .builder
+                .build_extract_value(obj_val.into_struct_value(), 1, "strlen")
+                .unwrap();
+            let len_f64 = self
+                .builder
+                .build_signed_int_to_float(len.into_int_value(), self.context.f64_type(), "lenf")
+                .unwrap();
+            return Ok((len_f64.into(), VarType::Number));
+        }
+
+        Err(CompileError::error(
+            format!(
+                "Standalone member access '.{}' not supported in this context",
+                property
+            ),
+            span.clone(),
+        ))
     }
 
     fn compile_binary(
@@ -588,24 +772,23 @@ impl<'ctx> Codegen<'ctx> {
         if op == BinOp::Add
             && (matches!(left_vt, VarType::String) || matches!(right_vt, VarType::String))
         {
-            let left_str = self.to_string(left_val, &left_vt, function)?;
-            let right_str = self.to_string(right_val, &right_vt, function)?;
+            let left_str = self.to_string(left_val, &left_vt)?;
+            let right_str = self.to_string(right_val, &right_vt)?;
 
             let concat_fn = self.module.get_function("mango_string_concat").unwrap();
-
-            let left_ptr = self
+            let lp = self
                 .builder
                 .build_extract_value(left_str.into_struct_value(), 0, "lptr")
                 .unwrap();
-            let left_len = self
+            let ll = self
                 .builder
                 .build_extract_value(left_str.into_struct_value(), 1, "llen")
                 .unwrap();
-            let right_ptr = self
+            let rp = self
                 .builder
                 .build_extract_value(right_str.into_struct_value(), 0, "rptr")
                 .unwrap();
-            let right_len = self
+            let rl = self
                 .builder
                 .build_extract_value(right_str.into_struct_value(), 1, "rlen")
                 .unwrap();
@@ -614,19 +797,13 @@ impl<'ctx> Codegen<'ctx> {
                 .builder
                 .build_call(
                     concat_fn,
-                    &[
-                        left_ptr.into(),
-                        left_len.into(),
-                        right_ptr.into(),
-                        right_len.into(),
-                    ],
+                    &[lp.into(), ll.into(), rp.into(), rl.into()],
                     "concat",
                 )
                 .unwrap()
                 .try_as_basic_value()
                 .left()
                 .unwrap();
-
             return Ok((result, VarType::String));
         }
 
@@ -678,7 +855,7 @@ impl<'ctx> Codegen<'ctx> {
                             FloatPredicate::ONE,
                             lf,
                             self.context.f64_type().const_float(0.0),
-                            "lbool",
+                            "lb",
                         )
                         .unwrap();
                     let rb = self
@@ -687,7 +864,7 @@ impl<'ctx> Codegen<'ctx> {
                             FloatPredicate::ONE,
                             rf,
                             self.context.f64_type().const_float(0.0),
-                            "rbool",
+                            "rb",
                         )
                         .unwrap();
                     self.builder.build_and(lb, rb, "and").unwrap().into()
@@ -699,7 +876,7 @@ impl<'ctx> Codegen<'ctx> {
                             FloatPredicate::ONE,
                             lf,
                             self.context.f64_type().const_float(0.0),
-                            "lbool",
+                            "lb",
                         )
                         .unwrap();
                     let rb = self
@@ -708,7 +885,7 @@ impl<'ctx> Codegen<'ctx> {
                             FloatPredicate::ONE,
                             rf,
                             self.context.f64_type().const_float(0.0),
-                            "rbool",
+                            "rb",
                         )
                         .unwrap();
                     self.builder.build_or(lb, rb, "or").unwrap().into()
@@ -721,7 +898,6 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 _ => VarType::Boolean,
             };
-
             return Ok((result, result_type));
         }
 
@@ -729,7 +905,6 @@ impl<'ctx> Codegen<'ctx> {
         if matches!(left_vt, VarType::Boolean) && matches!(right_vt, VarType::Boolean) {
             let li = left_val.into_int_value();
             let ri = right_val.into_int_value();
-
             let result: BasicValueEnum = match op {
                 BinOp::Equal | BinOp::StrictEqual => self
                     .builder
@@ -744,20 +919,19 @@ impl<'ctx> Codegen<'ctx> {
                 BinOp::And => self.builder.build_and(li, ri, "and").unwrap().into(),
                 BinOp::Or => self.builder.build_or(li, ri, "or").unwrap().into(),
                 _ => {
-                    return Err(CompileError {
-                        message: "Invalid operator for boolean operands".to_string(),
-                        span: Span::new(0, 0, 0, 0),
-                    })
+                    return Err(CompileError::error(
+                        "Invalid operator for boolean operands",
+                        Span::new(0, 0, 0, 0),
+                    ))
                 }
             };
-
             return Ok((result, VarType::Boolean));
         }
 
-        Err(CompileError {
-            message: "Unsupported binary operation".to_string(),
-            span: Span::new(0, 0, 0, 0),
-        })
+        Err(CompileError::error(
+            "Unsupported binary operation",
+            Span::new(0, 0, 0, 0),
+        ))
     }
 
     fn compile_call(
@@ -767,25 +941,41 @@ impl<'ctx> Codegen<'ctx> {
         function: FunctionValue<'ctx>,
         span: &Span,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
-        // Handle console.log specially
         if let ExprKind::Member { object, property } = &callee.kind {
             if let ExprKind::Identifier(name) = &object.kind {
-                if name == "console" && property == "log" {
-                    return self.compile_console_log(args, function, span);
+                // console.log / console.error / console.warn
+                if name == "console" {
+                    let is_stderr = property == "error" || property == "warn";
+                    if property == "log" || is_stderr {
+                        return self.compile_console_print(args, function, is_stderr);
+                    }
                 }
+                // Math methods
+                if name == "Math" {
+                    return self.compile_math_call(property, args, function, span);
+                }
+            }
+
+            // String methods: object.method(args)
+            let (obj_val, obj_vt) = self.compile_expr(object, function)?;
+            if matches!(obj_vt, VarType::String) {
+                return self.compile_string_method(obj_val, property, args, function, span);
             }
         }
 
-        // Regular function call
+        // Global functions: parseInt, parseFloat
         if let ExprKind::Identifier(name) = &callee.kind {
+            if name == "parseInt" || name == "parseFloat" {
+                return self.compile_global_func(name, args, function, span);
+            }
+
             let func = self
                 .functions
                 .get(name)
                 .copied()
                 .or_else(|| self.module.get_function(name))
-                .ok_or_else(|| CompileError {
-                    message: format!("Undefined function '{}'", name),
-                    span: span.clone(),
+                .ok_or_else(|| {
+                    CompileError::error(format!("Undefined function '{}'", name), span.clone())
                 })?;
 
             let mut compiled_args: Vec<BasicMetadataValueEnum> = Vec::new();
@@ -800,9 +990,7 @@ impl<'ctx> Codegen<'ctx> {
                 .unwrap();
 
             if let Some(val) = result.try_as_basic_value().left() {
-                // Determine return type from the function's return type
-                let ret_vt = if func.get_type().get_return_type().is_some() {
-                    let ret_type = func.get_type().get_return_type().unwrap();
+                let ret_vt = if let Some(ret_type) = func.get_type().get_return_type() {
                     if ret_type.is_float_type() {
                         VarType::Number
                     } else if ret_type.is_int_type() {
@@ -815,29 +1003,43 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 Ok((val, ret_vt))
             } else {
-                // Void function - return dummy value
                 Ok((
                     self.context.f64_type().const_float(0.0).into(),
                     VarType::Number,
                 ))
             }
         } else {
-            Err(CompileError {
-                message: "Only direct function calls are supported".to_string(),
-                span: span.clone(),
-            })
+            Err(CompileError::error(
+                "Only direct function calls are supported",
+                span.clone(),
+            ))
         }
     }
 
-    fn compile_console_log(
+    fn compile_console_print(
         &mut self,
         args: &[Expr],
         function: FunctionValue<'ctx>,
-        _span: &Span,
+        is_stderr: bool,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let (print_num, print_str, print_bool, print_nl) = if is_stderr {
+            (
+                "mango_eprint_number",
+                "mango_eprint_string",
+                "mango_eprint_boolean",
+                "mango_eprint_newline",
+            )
+        } else {
+            (
+                "mango_print_number",
+                "mango_print_string",
+                "mango_print_boolean",
+                "mango_print_newline",
+            )
+        };
+
         for (i, arg) in args.iter().enumerate() {
             if i > 0 {
-                // Print space between arguments
                 let space = self.create_string_literal(" ");
                 let ptr = self
                     .builder
@@ -847,19 +1049,17 @@ impl<'ctx> Codegen<'ctx> {
                     .builder
                     .build_extract_value(space.into_struct_value(), 1, "sl")
                     .unwrap();
-                let print_str_fn = self.module.get_function("mango_print_string").unwrap();
+                let f = self.module.get_function(print_str).unwrap();
                 self.builder
-                    .build_call(print_str_fn, &[ptr.into(), len.into()], "")
+                    .build_call(f, &[ptr.into(), len.into()], "")
                     .unwrap();
             }
 
             let (val, vt) = self.compile_expr(arg, function)?;
             match vt {
                 VarType::Number => {
-                    let print_fn = self.module.get_function("mango_print_number").unwrap();
-                    self.builder
-                        .build_call(print_fn, &[val.into()], "")
-                        .unwrap();
+                    let f = self.module.get_function(print_num).unwrap();
+                    self.builder.build_call(f, &[val.into()], "").unwrap();
                 }
                 VarType::String => {
                     let ptr = self
@@ -870,28 +1070,215 @@ impl<'ctx> Codegen<'ctx> {
                         .builder
                         .build_extract_value(val.into_struct_value(), 1, "len")
                         .unwrap();
-                    let print_fn = self.module.get_function("mango_print_string").unwrap();
+                    let f = self.module.get_function(print_str).unwrap();
                     self.builder
-                        .build_call(print_fn, &[ptr.into(), len.into()], "")
+                        .build_call(f, &[ptr.into(), len.into()], "")
                         .unwrap();
                 }
                 VarType::Boolean => {
-                    let print_fn = self.module.get_function("mango_print_boolean").unwrap();
-                    self.builder
-                        .build_call(print_fn, &[val.into()], "")
-                        .unwrap();
+                    let f = self.module.get_function(print_bool).unwrap();
+                    self.builder.build_call(f, &[val.into()], "").unwrap();
                 }
             }
         }
 
-        // Print newline
-        let newline_fn = self.module.get_function("mango_print_newline").unwrap();
-        self.builder.build_call(newline_fn, &[], "").unwrap();
-
+        let nl = self.module.get_function(print_nl).unwrap();
+        self.builder.build_call(nl, &[], "").unwrap();
         Ok((
             self.context.f64_type().const_float(0.0).into(),
             VarType::Number,
         ))
+    }
+
+    fn compile_math_call(
+        &mut self,
+        method: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let func_name = format!("mango_math_{}", method);
+        let func = self.module.get_function(&func_name).ok_or_else(|| {
+            CompileError::error(format!("Unknown Math method '{}'", method), span.clone())
+        })?;
+
+        let mut compiled_args: Vec<BasicMetadataValueEnum> = Vec::new();
+        for arg in args {
+            let (val, _) = self.compile_expr(arg, function)?;
+            compiled_args.push(val.into());
+        }
+
+        let result = self
+            .builder
+            .build_call(func, &compiled_args, method)
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap();
+        Ok((result, VarType::Number))
+    }
+
+    fn compile_string_method(
+        &mut self,
+        obj_val: BasicValueEnum<'ctx>,
+        method: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let ptr = self
+            .builder
+            .build_extract_value(obj_val.into_struct_value(), 0, "sptr")
+            .unwrap();
+        let len = self
+            .builder
+            .build_extract_value(obj_val.into_struct_value(), 1, "slen")
+            .unwrap();
+
+        match method {
+            "toUpperCase" | "toLowerCase" | "trim" => {
+                let func_name = format!("mango_string_{}", method);
+                let func = self.module.get_function(&func_name).unwrap();
+                let result = self
+                    .builder
+                    .build_call(func, &[ptr.into(), len.into()], method)
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::String))
+            }
+            "charAt" => {
+                let (idx, _) = self.compile_expr(&args[0], function)?;
+                let func = self.module.get_function("mango_string_charAt").unwrap();
+                let result = self
+                    .builder
+                    .build_call(func, &[ptr.into(), len.into(), idx.into()], "charAt")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::String))
+            }
+            "indexOf" => {
+                let (needle, _) = self.compile_expr(&args[0], function)?;
+                let np = self
+                    .builder
+                    .build_extract_value(needle.into_struct_value(), 0, "np")
+                    .unwrap();
+                let nl = self
+                    .builder
+                    .build_extract_value(needle.into_struct_value(), 1, "nl")
+                    .unwrap();
+                let func = self.module.get_function("mango_string_indexOf").unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        func,
+                        &[ptr.into(), len.into(), np.into(), nl.into()],
+                        "indexOf",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::Number))
+            }
+            "includes" => {
+                let (needle, _) = self.compile_expr(&args[0], function)?;
+                let np = self
+                    .builder
+                    .build_extract_value(needle.into_struct_value(), 0, "np")
+                    .unwrap();
+                let nl = self
+                    .builder
+                    .build_extract_value(needle.into_struct_value(), 1, "nl")
+                    .unwrap();
+                let func = self.module.get_function("mango_string_includes").unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        func,
+                        &[ptr.into(), len.into(), np.into(), nl.into()],
+                        "includes",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::Boolean))
+            }
+            "substring" | "slice" => {
+                let (start, _) = self.compile_expr(&args[0], function)?;
+                let end_val = if args.len() > 1 {
+                    self.compile_expr(&args[1], function)?.0
+                } else {
+                    // Default end = length as f64
+                    let len_f64 = self
+                        .builder
+                        .build_signed_int_to_float(
+                            len.into_int_value(),
+                            self.context.f64_type(),
+                            "lenf",
+                        )
+                        .unwrap();
+                    len_f64.into()
+                };
+                let func_name = format!("mango_string_{}", method);
+                let func = self.module.get_function(&func_name).unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        func,
+                        &[ptr.into(), len.into(), start.into(), end_val.into()],
+                        method,
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::String))
+            }
+            _ => Err(CompileError::error(
+                format!("Unknown string method '{}'", method),
+                span.clone(),
+            )),
+        }
+    }
+
+    fn compile_global_func(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        if args.len() != 1 {
+            return Err(CompileError::error(
+                format!("{} expects 1 argument, got {}", name, args.len()),
+                span.clone(),
+            ));
+        }
+        let (arg_val, _) = self.compile_expr(&args[0], function)?;
+        let ptr = self
+            .builder
+            .build_extract_value(arg_val.into_struct_value(), 0, "p")
+            .unwrap();
+        let len = self
+            .builder
+            .build_extract_value(arg_val.into_struct_value(), 1, "l")
+            .unwrap();
+
+        let func_name = format!("mango_{}", name);
+        let func = self.module.get_function(&func_name).unwrap();
+        let result = self
+            .builder
+            .build_call(func, &[ptr.into(), len.into()], name)
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap();
+        Ok((result, VarType::Number))
     }
 
     // --- Helpers ---
@@ -918,40 +1305,33 @@ impl<'ctx> Codegen<'ctx> {
         &self,
         val: BasicValueEnum<'ctx>,
         vt: &VarType,
-        _function: FunctionValue<'ctx>,
     ) -> Result<BasicValueEnum<'ctx>, CompileError> {
         match vt {
             VarType::String => Ok(val),
             VarType::Number => {
-                let conv_fn = self.module.get_function("mango_number_to_string").unwrap();
-                let result = self
+                let f = self.module.get_function("mango_number_to_string").unwrap();
+                Ok(self
                     .builder
-                    .build_call(conv_fn, &[val.into()], "numstr")
+                    .build_call(f, &[val.into()], "numstr")
                     .unwrap()
                     .try_as_basic_value()
                     .left()
-                    .unwrap();
-                Ok(result)
+                    .unwrap())
             }
             VarType::Boolean => {
-                let conv_fn = self.module.get_function("mango_boolean_to_string").unwrap();
-                let result = self
+                let f = self.module.get_function("mango_boolean_to_string").unwrap();
+                Ok(self
                     .builder
-                    .build_call(conv_fn, &[val.into()], "boolstr")
+                    .build_call(f, &[val.into()], "boolstr")
                     .unwrap()
                     .try_as_basic_value()
                     .left()
-                    .unwrap();
-                Ok(result)
+                    .unwrap())
             }
         }
     }
 
-    fn to_bool(
-        &self,
-        val: BasicValueEnum<'ctx>,
-        _function: FunctionValue<'ctx>,
-    ) -> Result<BasicValueEnum<'ctx>, CompileError> {
+    fn to_bool(&self, val: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>, CompileError> {
         if val.is_float_value() {
             let result = self
                 .builder
@@ -964,9 +1344,8 @@ impl<'ctx> Codegen<'ctx> {
                 .unwrap();
             Ok(result.into())
         } else if val.is_int_value() {
-            Ok(val) // Already a bool (i1)
+            Ok(val)
         } else {
-            // Struct (string) - truthy if length > 0
             let len = self
                 .builder
                 .build_extract_value(val.into_struct_value(), 1, "slen")
@@ -996,9 +1375,9 @@ impl<'ctx> Codegen<'ctx> {
             Some(inst) => builder.position_before(&inst),
             None => builder.position_at_end(entry),
         }
-
-        let llvm_type = self.var_type_to_llvm(vt);
-        builder.build_alloca(llvm_type, name).unwrap()
+        builder
+            .build_alloca(self.var_type_to_llvm(vt), name)
+            .unwrap()
     }
 
     fn var_type_to_llvm(&self, vt: &VarType) -> BasicTypeEnum<'ctx> {
@@ -1014,7 +1393,7 @@ impl<'ctx> Codegen<'ctx> {
             TypeAnnKind::Number => VarType::Number,
             TypeAnnKind::String => VarType::String,
             TypeAnnKind::Boolean => VarType::Boolean,
-            _ => VarType::Number, // default
+            _ => VarType::Number,
         }
     }
 
@@ -1029,17 +1408,14 @@ impl<'ctx> Codegen<'ctx> {
     fn push_scope(&mut self) {
         self.variables.push(HashMap::new());
     }
-
     fn pop_scope(&mut self) {
         self.variables.pop();
     }
-
     fn set_variable(&mut self, name: String, ptr: PointerValue<'ctx>, vt: VarType) {
         if let Some(scope) = self.variables.last_mut() {
             scope.insert(name, (ptr, vt));
         }
     }
-
     fn get_variable(&self, name: &str) -> Option<(PointerValue<'ctx>, VarType)> {
         for scope in self.variables.iter().rev() {
             if let Some((ptr, vt)) = scope.get(name) {
@@ -1053,7 +1429,6 @@ impl<'ctx> Codegen<'ctx> {
 
     pub fn write_object_file(&self, path: &Path) -> Result<(), String> {
         Target::initialize_all(&InitializationConfig::default());
-
         let triple = TargetMachine::get_default_triple();
         let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
         let machine = target
@@ -1066,15 +1441,24 @@ impl<'ctx> Codegen<'ctx> {
                 CodeModel::Default,
             )
             .ok_or("Failed to create target machine")?;
-
         machine
             .write_to_file(&self.module, FileType::Object, path)
             .map_err(|e| e.to_string())?;
-
         Ok(())
     }
 
     pub fn print_ir(&self) -> String {
         self.module.print_to_string().to_string()
+    }
+
+    /// Compile a function from an imported module into this LLVM module
+    pub fn compile_exported_function(
+        &mut self,
+        name: &str,
+        params: &[Parameter],
+        return_type: &Option<TypeAnnotation>,
+        body: &[Statement],
+    ) -> Result<(), CompileError> {
+        self.compile_function_decl(name, params, return_type, body)
     }
 }
