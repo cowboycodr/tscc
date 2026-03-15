@@ -1605,34 +1605,30 @@ outer: for (let i = 0; i < 3; i++) {
     // --- Objects ---
 
     #[test]
-    #[ignore = "objects not implemented"]
     fn object_literal() {
         assert_eq!(
-            run_ts(r#"let obj = { x: 1, y: 2 }\nconsole.log(obj.x)"#),
+            run_ts("let obj = { x: 1, y: 2 }\nconsole.log(obj.x)"),
             "1\n"
         );
     }
 
     #[test]
-    #[ignore = "objects not implemented"]
     fn object_property_access() {
         assert_eq!(
-            run_ts(r#"let obj = { name: "mango" }\nconsole.log(obj.name)"#),
+            run_ts("let obj = { name: \"mango\" }\nconsole.log(obj.name)"),
             "mango\n"
         );
     }
 
     #[test]
-    #[ignore = "objects not implemented"]
     fn object_bracket_access() {
         assert_eq!(
-            run_ts(r#"let obj = { x: 42 }\nconsole.log(obj["x"])"#),
+            run_ts("let obj = { x: 42 }\nconsole.log(obj[\"x\"])"),
             "42\n"
         );
     }
 
     #[test]
-    #[ignore = "objects not implemented"]
     fn object_method() {
         let src = r#"
 let obj = {
@@ -1649,7 +1645,6 @@ console.log(obj.getX())
     // --- Classes ---
 
     #[test]
-    #[ignore = "classes not implemented"]
     fn class_basic() {
         let src = r#"
 class Point {
@@ -1670,7 +1665,6 @@ console.log(p.toString())
     }
 
     #[test]
-    #[ignore = "classes not implemented"]
     fn class_inheritance() {
         let src = r#"
 class Animal {
@@ -1696,7 +1690,6 @@ console.log(d.speak())
     // --- Interfaces ---
 
     #[test]
-    #[ignore = "interfaces not implemented"]
     fn interface_basic() {
         let src = r#"
 interface Point {

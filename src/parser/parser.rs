@@ -34,6 +34,8 @@ impl Parser {
         match self.peek_token() {
             Token::Let | Token::Const => self.variable_declaration(false),
             Token::Function => self.function_declaration(false),
+            Token::Class => self.class_declaration(),
+            Token::Interface => self.interface_declaration(),
             Token::If => self.if_statement(),
             Token::While => self.while_statement(),
             Token::For => self.for_statement(),
@@ -109,6 +111,129 @@ impl Parser {
                 body,
                 is_exported,
             },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn class_declaration(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'class'
+
+        let name = self.expect_identifier("Expected class name")?;
+
+        let parent = if self.match_token(&Token::Extends) {
+            Some(self.expect_identifier("Expected parent class name")?)
+        } else {
+            None
+        };
+
+        self.expect(&Token::LeftBrace, "Expected '{' before class body")?;
+
+        let mut fields = Vec::new();
+        let mut constructor = None;
+        let mut methods = Vec::new();
+
+        while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            let member_span = self.current_span();
+
+            // Constructor
+            if self.check(&Token::Constructor) {
+                self.advance(); // consume 'constructor'
+                self.expect(&Token::LeftParen, "Expected '(' after 'constructor'")?;
+                let params = self.parameter_list()?;
+                self.expect(
+                    &Token::RightParen,
+                    "Expected ')' after constructor parameters",
+                )?;
+                self.expect(&Token::LeftBrace, "Expected '{' before constructor body")?;
+                let body = self.block_body()?;
+                self.consume_semicolon()?;
+                constructor = Some(ClassConstructor {
+                    params,
+                    body,
+                    span: self.span_from(&member_span),
+                });
+                continue;
+            }
+
+            // Method or field: starts with an identifier
+            let member_name = self.expect_identifier("Expected class member name")?;
+
+            if self.check(&Token::LeftParen) {
+                // Method: name(params): ReturnType { body }
+                self.advance(); // consume '('
+                let params = self.parameter_list()?;
+                self.expect(&Token::RightParen, "Expected ')' after method parameters")?;
+                let return_type = if self.match_token(&Token::Colon) {
+                    Some(self.type_annotation()?)
+                } else {
+                    None
+                };
+                self.expect(&Token::LeftBrace, "Expected '{' before method body")?;
+                let body = self.block_body()?;
+                self.consume_semicolon()?;
+                methods.push(ClassMethod {
+                    name: member_name,
+                    params,
+                    return_type,
+                    body,
+                    span: self.span_from(&member_span),
+                });
+            } else {
+                // Field: name: Type
+                let type_ann = if self.match_token(&Token::Colon) {
+                    Some(self.type_annotation()?)
+                } else {
+                    None
+                };
+                self.consume_semicolon()?;
+                fields.push(ClassField {
+                    name: member_name,
+                    type_ann,
+                    span: self.span_from(&member_span),
+                });
+            }
+        }
+
+        self.expect(&Token::RightBrace, "Expected '}' after class body")?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::ClassDecl {
+                name,
+                parent,
+                fields,
+                constructor,
+                methods,
+            },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn interface_declaration(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'interface'
+
+        let name = self.expect_identifier("Expected interface name")?;
+
+        self.expect(&Token::LeftBrace, "Expected '{' before interface body")?;
+
+        let mut fields = Vec::new();
+        while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            let field_name = self.expect_identifier("Expected field name")?;
+            self.expect(&Token::Colon, "Expected ':' after field name")?;
+            let type_ann = self.type_annotation()?;
+            // Allow semicolons or commas as separators, or just newlines
+            self.match_token(&Token::Semicolon);
+            self.match_token(&Token::Comma);
+            fields.push((field_name, type_ann));
+        }
+
+        self.expect(&Token::RightBrace, "Expected '}' after interface body")?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::InterfaceDecl { name, fields },
             span: self.span_from(&start_span),
         })
     }
@@ -358,39 +483,177 @@ impl Parser {
 
     fn type_annotation(&mut self) -> Result<TypeAnnotation, CompileError> {
         let span = self.current_span();
-        let kind = match self.peek_token() {
+
+        // Check for function type: (params) => ReturnType
+        if self.check(&Token::LeftParen) {
+            if let Some(func_type) = self.try_function_type(&span)? {
+                return Ok(func_type);
+            }
+        }
+
+        let mut base = match self.peek_token() {
             Token::NumberType => {
                 self.advance();
-                TypeAnnKind::Number
+                TypeAnnotation {
+                    kind: TypeAnnKind::Number,
+                    span: self.span_from(&span),
+                }
             }
             Token::StringType => {
                 self.advance();
-                TypeAnnKind::String
+                TypeAnnotation {
+                    kind: TypeAnnKind::String,
+                    span: self.span_from(&span),
+                }
             }
             Token::BooleanType => {
                 self.advance();
-                TypeAnnKind::Boolean
+                TypeAnnotation {
+                    kind: TypeAnnKind::Boolean,
+                    span: self.span_from(&span),
+                }
             }
             Token::Void => {
                 self.advance();
-                TypeAnnKind::Void
+                TypeAnnotation {
+                    kind: TypeAnnKind::Void,
+                    span: self.span_from(&span),
+                }
             }
             Token::Null => {
                 self.advance();
-                TypeAnnKind::Null
+                TypeAnnotation {
+                    kind: TypeAnnKind::Null,
+                    span: self.span_from(&span),
+                }
             }
             Token::Undefined => {
                 self.advance();
-                TypeAnnKind::Undefined
+                TypeAnnotation {
+                    kind: TypeAnnKind::Undefined,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::LeftBrace => {
+                // Object type: { x: number, y: string }
+                self.advance();
+                let mut fields = Vec::new();
+                while !self.check(&Token::RightBrace) && !self.is_at_end() {
+                    let field_name = self.expect_identifier("Expected field name in type")?;
+                    self.expect(&Token::Colon, "Expected ':' in object type")?;
+                    let field_type = self.type_annotation()?;
+                    fields.push((field_name, field_type));
+                    // Allow comma or semicolon as separator
+                    if !self.match_token(&Token::Comma) {
+                        self.match_token(&Token::Semicolon);
+                    }
+                }
+                self.expect(&Token::RightBrace, "Expected '}' in object type")?;
+                TypeAnnotation {
+                    kind: TypeAnnKind::Object { fields },
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Named(name),
+                    span: self.span_from(&span),
+                }
             }
             _ => {
                 return Err(self.error("Expected type annotation"));
             }
         };
-        Ok(TypeAnnotation {
-            kind,
-            span: self.span_from(&span),
-        })
+
+        // Check for array type suffix: Type[]
+        while self.check(&Token::LeftBracket) {
+            // Peek ahead to see if it's []
+            if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket) {
+                self.advance(); // consume [
+                self.advance(); // consume ]
+                base = TypeAnnotation {
+                    kind: TypeAnnKind::Array(Box::new(base)),
+                    span: self.span_from(&span),
+                };
+            } else {
+                break;
+            }
+        }
+
+        Ok(base)
+    }
+
+    fn try_function_type(
+        &mut self,
+        start_span: &Span,
+    ) -> Result<Option<TypeAnnotation>, CompileError> {
+        let saved = self.current;
+        self.advance(); // consume '('
+
+        // Try to parse parameter types
+        let mut param_types = Vec::new();
+        if !self.check(&Token::RightParen) {
+            loop {
+                // Could be "name: Type" or just "Type"
+                if let Token::Identifier(_) = self.peek_token() {
+                    let saved_inner = self.current;
+                    self.advance(); // consume identifier
+                    if self.match_token(&Token::Colon) {
+                        // name: Type format
+                        match self.type_annotation() {
+                            Ok(t) => param_types.push(t),
+                            Err(_) => {
+                                self.current = saved;
+                                return Ok(None);
+                            }
+                        }
+                    } else {
+                        // Just an identifier used as a type name — rollback
+                        self.current = saved_inner;
+                        match self.type_annotation() {
+                            Ok(t) => param_types.push(t),
+                            Err(_) => {
+                                self.current = saved;
+                                return Ok(None);
+                            }
+                        }
+                    }
+                } else {
+                    match self.type_annotation() {
+                        Ok(t) => param_types.push(t),
+                        Err(_) => {
+                            self.current = saved;
+                            return Ok(None);
+                        }
+                    }
+                }
+                if !self.match_token(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+
+        if !self.match_token(&Token::RightParen) {
+            self.current = saved;
+            return Ok(None);
+        }
+
+        if !self.match_token(&Token::Arrow) {
+            self.current = saved;
+            return Ok(None);
+        }
+
+        let return_type = self.type_annotation()?;
+
+        Ok(Some(TypeAnnotation {
+            kind: TypeAnnKind::FunctionType {
+                params: param_types,
+                return_type: Box::new(return_type),
+            },
+            span: self.span_from(start_span),
+        }))
     }
 
     // --- Expressions ---
@@ -414,6 +677,22 @@ impl Parser {
                     ),
                     kind: ExprKind::Assignment {
                         name: name.clone(),
+                        value: Box::new(value),
+                    },
+                });
+            }
+            // Member assignment: obj.prop = value or this.prop = value
+            if let ExprKind::Member { object, property } = &expr.kind {
+                return Ok(Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        value.span.end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::MemberAssignment {
+                        object: object.clone(),
+                        property: property.clone(),
                         value: Box::new(value),
                     },
                 });
@@ -881,6 +1160,35 @@ impl Parser {
                     span: self.span_from(&span),
                 })
             }
+            Token::This => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::This,
+                    span: self.span_from(&span),
+                })
+            }
+            Token::New => {
+                self.advance();
+                let class_name = self.expect_identifier("Expected class name after 'new'")?;
+                self.expect(&Token::LeftParen, "Expected '(' after class name")?;
+                let mut args = Vec::new();
+                if !self.check(&Token::RightParen) {
+                    loop {
+                        args.push(self.expression()?);
+                        if !self.match_token(&Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(
+                    &Token::RightParen,
+                    "Expected ')' after constructor arguments",
+                )?;
+                Ok(Expr {
+                    kind: ExprKind::NewExpr { class_name, args },
+                    span: self.span_from(&span),
+                })
+            }
             Token::Identifier(_) => {
                 let name = self.expect_identifier("")?;
                 Ok(Expr {
@@ -902,6 +1210,68 @@ impl Parser {
                 self.expect(&Token::RightBracket, "Expected ']' after array elements")?;
                 Ok(Expr {
                     kind: ExprKind::ArrayLiteral { elements },
+                    span: self.span_from(&span),
+                })
+            }
+            Token::LeftBrace => {
+                // Object literal: { key: value, ... }
+                self.advance();
+                let mut properties = Vec::new();
+                while !self.check(&Token::RightBrace) && !self.is_at_end() {
+                    let prop_span = self.current_span();
+                    let key = self.expect_identifier("Expected property name")?;
+
+                    if self.check(&Token::LeftParen) {
+                        // Method shorthand: name(params) { body }
+                        self.advance(); // consume '('
+                        let params = self.parameter_list()?;
+                        self.expect(&Token::RightParen, "Expected ')'")?;
+                        let return_type = if self.match_token(&Token::Colon) {
+                            Some(self.type_annotation()?)
+                        } else {
+                            None
+                        };
+                        self.expect(&Token::LeftBrace, "Expected '{' before method body")?;
+                        let body_stmts = self.block_body()?;
+                        // Build a block expression for the method body — but we actually
+                        // store it as an arrow function for codegen simplicity
+                        let value = Expr {
+                            kind: ExprKind::ArrowFunction {
+                                params: params.clone(),
+                                return_type: return_type.clone(),
+                                body: ArrowBody::Block(body_stmts),
+                            },
+                            span: self.span_from(&prop_span),
+                        };
+                        properties.push(ObjectProperty {
+                            key,
+                            value,
+                            is_method: true,
+                            params,
+                            return_type,
+                            span: self.span_from(&prop_span),
+                        });
+                    } else {
+                        // Regular property: key: value
+                        self.expect(&Token::Colon, "Expected ':' after property name")?;
+                        let value = self.expression()?;
+                        properties.push(ObjectProperty {
+                            key,
+                            value,
+                            is_method: false,
+                            params: Vec::new(),
+                            return_type: None,
+                            span: self.span_from(&prop_span),
+                        });
+                    }
+
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Token::RightBrace, "Expected '}' after object literal")?;
+                Ok(Expr {
+                    kind: ExprKind::ObjectLiteral { properties },
                     span: self.span_from(&span),
                 })
             }

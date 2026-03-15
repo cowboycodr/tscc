@@ -11,6 +11,15 @@ pub enum Type {
         return_type: Box<Type>,
     },
     Array(Box<Type>),
+    /// Object with known field names and types (ordered)
+    Object {
+        fields: Vec<(String, Type)>,
+    },
+    /// A named class type. `fields` stores the instance fields + methods.
+    Class {
+        name: String,
+        fields: Vec<(String, Type)>,
+    },
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -38,6 +47,17 @@ impl std::fmt::Display for Type {
                 write!(f, ") => {}", return_type)
             }
             Type::Array(elem) => write!(f, "{}[]", elem),
+            Type::Object { fields } => {
+                write!(f, "{{ ")?;
+                for (i, (name, ty)) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}: {}", name, ty)?;
+                }
+                write!(f, " }}")
+            }
+            Type::Class { name, .. } => write!(f, "{}", name),
             Type::Unknown => write!(f, "unknown"),
         }
     }

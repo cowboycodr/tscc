@@ -37,6 +37,10 @@ pub struct Codegen<'ctx> {
     loop_stack: Vec<LoopContext<'ctx>>,
     /// Counter for generating unique arrow function names
     arrow_counter: usize,
+    /// Registered class struct types by class name: (struct_type, fields, parent_name)
+    class_struct_types: HashMap<String, (StructType<'ctx>, Vec<(String, VarType)>, Option<String>)>,
+    /// Current `this` pointer (set during method compilation)
+    current_this: Option<(PointerValue<'ctx>, VarType)>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,7 +50,14 @@ enum VarType {
     String,
     Boolean,
     Array,
-    FunctionPtr { fn_name: String },
+    FunctionPtr {
+        fn_name: String,
+    },
+    /// Object/class instance with ordered fields
+    Object {
+        struct_type_name: String,
+        fields: Vec<(String, VarType)>,
+    },
 }
 
 struct LoopContext<'ctx> {
@@ -90,6 +101,8 @@ impl<'ctx> Codegen<'ctx> {
             number_mode: VarType::Number,
             loop_stack: Vec::new(),
             arrow_counter: 0,
+            class_struct_types: HashMap::new(),
+            current_this: None,
         };
 
         codegen.declare_runtime_functions();
@@ -368,7 +381,9 @@ impl<'ctx> Codegen<'ctx> {
             | StmtKind::Import { .. }
             | StmtKind::Break
             | StmtKind::Continue
-            | StmtKind::Empty => true,
+            | StmtKind::Empty
+            | StmtKind::ClassDecl { .. }
+            | StmtKind::InterfaceDecl { .. } => true,
         }
     }
 
@@ -417,7 +432,27 @@ impl<'ctx> Codegen<'ctx> {
         // Analysis pass: detect functions that can use i64 instead of f64
         self.integer_functions = Self::analyze_integer_functions(program);
 
-        // First pass: compile all function declarations
+        // First pass: register interfaces and classes (so type_ann_to_var_type works)
+        for stmt in &program.statements {
+            match &stmt.kind {
+                StmtKind::InterfaceDecl { name, fields } => {
+                    let field_vts: Vec<(String, VarType)> = fields
+                        .iter()
+                        .map(|(fname, ann)| (fname.clone(), self.type_ann_to_var_type(ann)))
+                        .collect();
+                    let field_llvm_types: Vec<BasicTypeEnum> = field_vts
+                        .iter()
+                        .map(|(_, vt)| self.var_type_to_llvm(vt))
+                        .collect();
+                    let struct_type = self.context.struct_type(&field_llvm_types, false);
+                    self.class_struct_types
+                        .insert(name.clone(), (struct_type, field_vts, None));
+                }
+                _ => {}
+            }
+        }
+
+        // Second pass: compile all function declarations
         for stmt in &program.statements {
             if let StmtKind::FunctionDecl {
                 name,
@@ -452,8 +487,11 @@ impl<'ctx> Codegen<'ctx> {
         self.push_scope();
 
         for stmt in &program.statements {
-            // Skip function declarations (already compiled)
-            if matches!(&stmt.kind, StmtKind::FunctionDecl { .. }) {
+            // Skip function and interface declarations (already compiled in first pass)
+            if matches!(
+                &stmt.kind,
+                StmtKind::FunctionDecl { .. } | StmtKind::InterfaceDecl { .. }
+            ) {
                 continue;
             }
             self.compile_statement(stmt, main_fn)?;
@@ -514,6 +552,31 @@ impl<'ctx> Codegen<'ctx> {
 
             StmtKind::FunctionDecl { .. } => {
                 // Already compiled in first pass
+                Ok(())
+            }
+
+            StmtKind::ClassDecl {
+                name,
+                parent,
+                fields,
+                constructor,
+                methods,
+            } => self.compile_class_decl(name, parent, fields, constructor, methods, function),
+
+            StmtKind::InterfaceDecl { name, fields } => {
+                // Interfaces produce no runtime code, but we register the struct layout
+                // so type_ann_to_var_type can resolve Named(interface_name)
+                let field_vts: Vec<(String, VarType)> = fields
+                    .iter()
+                    .map(|(fname, ann)| (fname.clone(), self.type_ann_to_var_type(ann)))
+                    .collect();
+                let field_llvm_types: Vec<BasicTypeEnum> = field_vts
+                    .iter()
+                    .map(|(_, vt)| self.var_type_to_llvm(vt))
+                    .collect();
+                let struct_type = self.context.struct_type(&field_llvm_types, false);
+                self.class_struct_types
+                    .insert(name.clone(), (struct_type, field_vts, None));
                 Ok(())
             }
 
@@ -972,9 +1035,34 @@ impl<'ctx> Codegen<'ctx> {
                         .build_load(self.context.f64_type(), elem_ptr, "elem")
                         .unwrap();
                     Ok((val, VarType::Number))
+                } else if let VarType::Object { ref fields, .. } = obj_vt {
+                    // Bracket access with string literal: obj["key"]
+                    if let ExprKind::StringLiteral(key) = &index.kind {
+                        for (i, (name, field_vt)) in fields.iter().enumerate() {
+                            if name == key {
+                                let val = self
+                                    .builder
+                                    .build_extract_value(
+                                        obj_val.into_struct_value(),
+                                        i as u32,
+                                        &format!("obj.{}", key),
+                                    )
+                                    .unwrap();
+                                return Ok((val.into(), field_vt.clone()));
+                            }
+                        }
+                        return Err(CompileError::error(
+                            format!("Property '{}' does not exist on object", key),
+                            expr.span.clone(),
+                        ));
+                    }
+                    Err(CompileError::error(
+                        "Dynamic object property access not supported",
+                        expr.span.clone(),
+                    ))
                 } else {
                     Err(CompileError::error(
-                        "Index access only supported on arrays",
+                        "Index access only supported on arrays and objects",
                         expr.span.clone(),
                     ))
                 }
@@ -1152,7 +1240,562 @@ impl<'ctx> Codegen<'ctx> {
 
                 Ok((fn_ptr.into(), VarType::FunctionPtr { fn_name }))
             }
+
+            ExprKind::ObjectLiteral { properties } => {
+                self.compile_object_literal(properties, function, &expr.span)
+            }
+
+            ExprKind::This => {
+                if let Some((this_ptr, this_vt)) = &self.current_this {
+                    let llvm_type = self.var_type_to_llvm(this_vt);
+                    let val = self
+                        .builder
+                        .build_load(llvm_type, *this_ptr, "this")
+                        .unwrap();
+                    Ok((val, this_vt.clone()))
+                } else {
+                    Err(CompileError::error(
+                        "'this' is not available in this context",
+                        expr.span.clone(),
+                    ))
+                }
+            }
+
+            ExprKind::MemberAssignment {
+                object,
+                property,
+                value,
+            } => self.compile_member_assignment(object, property, value, function, &expr.span),
+
+            ExprKind::NewExpr { class_name, args } => {
+                self.compile_new_expr(class_name, args, function, &expr.span)
+            }
         }
+    }
+
+    fn compile_object_literal(
+        &mut self,
+        properties: &[ObjectProperty],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        // Compile all property values and determine their VarTypes
+        let mut field_vals: Vec<(String, BasicValueEnum<'ctx>, VarType)> = Vec::new();
+
+        // First pass: compile non-method properties to determine field types
+        for prop in properties {
+            if !prop.is_method {
+                let (val, vt) = self.compile_expr(&prop.value, function)?;
+                field_vals.push((prop.key.clone(), val, vt));
+            } else {
+                // Placeholder — will be filled in second pass
+                let fn_name = format!("__method_{}_{}", self.arrow_counter, prop.key);
+                self.arrow_counter += 1;
+                let null_ptr = self.context.ptr_type(AddressSpace::default()).const_null();
+                field_vals.push((
+                    prop.key.clone(),
+                    null_ptr.into(),
+                    VarType::FunctionPtr {
+                        fn_name: fn_name.clone(),
+                    },
+                ));
+            }
+        }
+
+        // Build the VarType::Object so methods can use `this`
+        let pre_fields: Vec<(String, VarType)> = field_vals
+            .iter()
+            .map(|(name, _, vt)| (name.clone(), vt.clone()))
+            .collect();
+        let pre_struct_name = format!("__obj_{}", self.arrow_counter);
+        self.arrow_counter += 1;
+        let pre_obj_vt = VarType::Object {
+            struct_type_name: pre_struct_name.clone(),
+            fields: pre_fields.clone(),
+        };
+
+        // Second pass: compile methods with `this` set up
+        let mut method_idx = 0;
+        for prop in properties {
+            if prop.is_method {
+                let fn_name = if let VarType::FunctionPtr { ref fn_name } = field_vals
+                    .iter()
+                    .find(|(k, _, _)| k == &prop.key)
+                    .unwrap()
+                    .2
+                {
+                    fn_name.clone()
+                } else {
+                    unreachable!()
+                };
+
+                let body_stmts = if let ExprKind::ArrowFunction { body, .. } = &prop.value.kind {
+                    match body {
+                        ArrowBody::Block(stmts) => stmts.clone(),
+                        ArrowBody::Expr(e) => vec![Statement {
+                            kind: StmtKind::Return {
+                                value: Some(*e.clone()),
+                            },
+                            span: e.span.clone(),
+                        }],
+                    }
+                } else {
+                    return Err(CompileError::error("Invalid method body", span.clone()));
+                };
+
+                // Build method function with self pointer as first parameter
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+                let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_type.into()];
+                let mut param_vts: Vec<VarType> = Vec::new();
+                for param in &prop.params {
+                    let vt = param
+                        .type_ann
+                        .as_ref()
+                        .map(|ann| self.type_ann_to_var_type(ann))
+                        .unwrap_or(VarType::Number);
+                    param_types.push(self.var_type_to_llvm(&vt).into());
+                    param_vts.push(vt);
+                }
+
+                let ret_vt = prop
+                    .return_type
+                    .as_ref()
+                    .map(|ann| self.type_ann_to_var_type(ann))
+                    .unwrap_or(VarType::Number);
+                let ret_type = self.var_type_to_llvm(&ret_vt);
+                let fn_type = ret_type.fn_type(&param_types, false);
+                let method_fn = self.module.add_function(&fn_name, fn_type, None);
+
+                let nounwind_kind = Attribute::get_named_enum_kind_id("nounwind");
+                let nounwind = self.context.create_enum_attribute(nounwind_kind, 0);
+                method_fn.add_attribute(AttributeLoc::Function, nounwind);
+
+                self.functions.insert(fn_name.clone(), method_fn);
+
+                let entry = self.context.append_basic_block(method_fn, "entry");
+                let saved_block = self.builder.get_insert_block();
+                self.builder.position_at_end(entry);
+
+                let this_ptr = method_fn.get_nth_param(0).unwrap().into_pointer_value();
+                let prev_this = self.current_this.clone();
+                self.current_this = Some((this_ptr, pre_obj_vt.clone()));
+
+                self.push_scope();
+
+                for (i, param) in prop.params.iter().enumerate() {
+                    let vt = param_vts[i].clone();
+                    let param_val = method_fn.get_nth_param((i + 1) as u32).unwrap();
+                    let alloca = self.create_alloca(method_fn, &vt, &param.name);
+                    self.builder.build_store(alloca, param_val).unwrap();
+                    self.set_variable(param.name.clone(), alloca, vt);
+                }
+
+                for stmt in &body_stmts {
+                    self.compile_statement(stmt, method_fn)?;
+                }
+
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    let default_ret = self.default_value(&ret_vt);
+                    self.builder.build_return(Some(&default_ret)).unwrap();
+                }
+
+                self.pop_scope();
+                self.current_this = prev_this;
+
+                if let Some(bb) = saved_block {
+                    self.builder.position_at_end(bb);
+                }
+
+                // Update the field_vals with the actual function pointer
+                let func = self.functions.get(&fn_name).copied().unwrap();
+                let fn_ptr = func.as_global_value().as_pointer_value();
+                for (key, val, _) in &mut field_vals {
+                    if key == &prop.key {
+                        *val = fn_ptr.into();
+                        break;
+                    }
+                }
+
+                method_idx += 1;
+            }
+        }
+        let _ = method_idx;
+
+        // Use the pre-computed field info
+        let fields = pre_fields;
+        let obj_vt = pre_obj_vt;
+
+        // Build the LLVM struct type
+        let field_types: Vec<BasicTypeEnum> = fields
+            .iter()
+            .map(|(_, vt)| self.var_type_to_llvm(vt))
+            .collect();
+        let struct_type = self.context.struct_type(&field_types, false);
+
+        // Build the struct value
+        let mut struct_val = struct_type.const_zero();
+        for (i, (_, val, _)) in field_vals.iter().enumerate() {
+            struct_val = self
+                .builder
+                .build_insert_value(struct_val, *val, i as u32, "obj.field")
+                .unwrap()
+                .into_struct_value();
+        }
+
+        Ok((struct_val.into(), obj_vt))
+    }
+
+    fn compile_member_assignment(
+        &mut self,
+        object: &Expr,
+        property: &str,
+        value: &Expr,
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let (new_val, new_vt) = self.compile_expr(value, function)?;
+
+        // For `this.prop = value`, we need to store through the `this` pointer
+        if matches!(object.kind, ExprKind::This) {
+            if let Some((this_ptr, this_vt)) = self.current_this.clone() {
+                if let VarType::Object { ref fields, .. } = this_vt {
+                    for (i, (name, _)) in fields.iter().enumerate() {
+                        if name == property {
+                            let llvm_type = self.var_type_to_llvm(&this_vt);
+                            let struct_type = llvm_type.into_struct_type();
+                            let field_ptr = self
+                                .builder
+                                .build_struct_gep(
+                                    struct_type,
+                                    this_ptr,
+                                    i as u32,
+                                    &format!("this.{}", property),
+                                )
+                                .unwrap();
+                            self.builder.build_store(field_ptr, new_val).unwrap();
+                            return Ok((new_val, new_vt));
+                        }
+                    }
+                }
+            }
+            return Err(CompileError::error(
+                format!("Property '{}' not found on 'this'", property),
+                span.clone(),
+            ));
+        }
+
+        // For named variables: obj.prop = value
+        if let ExprKind::Identifier(var_name) = &object.kind {
+            let (ptr, vt) = self.get_variable(var_name).ok_or_else(|| {
+                CompileError::error(format!("Undefined variable '{}'", var_name), span.clone())
+            })?;
+            if let VarType::Object { ref fields, .. } = vt {
+                for (i, (name, _)) in fields.iter().enumerate() {
+                    if name == property {
+                        let llvm_type = self.var_type_to_llvm(&vt);
+                        let struct_type = llvm_type.into_struct_type();
+                        let field_ptr = self
+                            .builder
+                            .build_struct_gep(
+                                struct_type,
+                                ptr,
+                                i as u32,
+                                &format!("obj.{}", property),
+                            )
+                            .unwrap();
+                        self.builder.build_store(field_ptr, new_val).unwrap();
+                        return Ok((new_val, new_vt));
+                    }
+                }
+            }
+        }
+
+        Err(CompileError::error(
+            format!("Cannot assign to property '{}' in this context", property),
+            span.clone(),
+        ))
+    }
+
+    fn compile_new_expr(
+        &mut self,
+        class_name: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let (struct_type, field_info, parent_class) = self
+            .class_struct_types
+            .get(class_name)
+            .cloned()
+            .ok_or_else(|| {
+                CompileError::error(format!("Undefined class '{}'", class_name), span.clone())
+            })?;
+
+        let obj_vt = VarType::Object {
+            struct_type_name: class_name.to_string(),
+            fields: field_info.clone(),
+        };
+
+        // Allocate the struct on the stack
+        let alloca = self.create_alloca(function, &obj_vt, &format!("{}_inst", class_name));
+
+        // Zero-initialize
+        let zero = struct_type.const_zero();
+        self.builder.build_store(alloca, zero).unwrap();
+
+        // Call constructor if it exists (check own constructor, then parent's)
+        let ctor_name = format!("{}_constructor", class_name);
+        let ctor_fn = self.functions.get(&ctor_name).copied();
+        if let Some(ctor) = ctor_fn {
+            let mut ctor_args: Vec<BasicMetadataValueEnum> = vec![alloca.into()];
+            for arg in args {
+                let (val, _) = self.compile_expr(arg, function)?;
+                ctor_args.push(val.into());
+            }
+            self.builder.build_call(ctor, &ctor_args, "").unwrap();
+        } else if let Some(ref pname) = parent_class {
+            // No own constructor — call parent constructor
+            let parent_ctor_name = format!("{}_constructor", pname);
+            if let Some(parent_ctor) = self.functions.get(&parent_ctor_name).copied() {
+                let mut ctor_args: Vec<BasicMetadataValueEnum> = vec![alloca.into()];
+                for arg in args {
+                    let (val, _) = self.compile_expr(arg, function)?;
+                    ctor_args.push(val.into());
+                }
+                self.builder
+                    .build_call(parent_ctor, &ctor_args, "")
+                    .unwrap();
+            }
+        }
+
+        // Load and return the struct
+        let val = self.builder.build_load(struct_type, alloca, "obj").unwrap();
+
+        Ok((val, obj_vt))
+    }
+
+    fn compile_class_decl(
+        &mut self,
+        name: &str,
+        parent: &Option<String>,
+        fields: &[ClassField],
+        constructor: &Option<ClassConstructor>,
+        methods: &[ClassMethod],
+        function: FunctionValue<'ctx>,
+    ) -> Result<(), CompileError> {
+        let _ = function; // Class decl doesn't use the current function directly
+
+        // Collect all fields (parent first, then own)
+        let mut all_fields: Vec<(String, VarType)> = Vec::new();
+
+        if let Some(parent_name) = parent {
+            if let Some((_, parent_fields, _)) = self.class_struct_types.get(parent_name) {
+                all_fields.extend(parent_fields.clone());
+            }
+        }
+
+        // Add own value fields
+        for field in fields {
+            let vt = field
+                .type_ann
+                .as_ref()
+                .map(|ann| self.type_ann_to_var_type(ann))
+                .unwrap_or(VarType::Number);
+            // Override parent field if same name
+            all_fields.retain(|(n, _)| n != &field.name);
+            all_fields.push((field.name.clone(), vt));
+        }
+
+        // Add method fields (as function pointers)
+        for method in methods {
+            all_fields.retain(|(n, _)| n != &method.name);
+            let method_fn_name = format!("{}_{}", name, method.name);
+            all_fields.push((
+                method.name.clone(),
+                VarType::FunctionPtr {
+                    fn_name: method_fn_name,
+                },
+            ));
+        }
+
+        // Create the LLVM struct type
+        let field_llvm_types: Vec<BasicTypeEnum> = all_fields
+            .iter()
+            .map(|(_, vt)| self.var_type_to_llvm(vt))
+            .collect();
+        let struct_type = self.context.struct_type(&field_llvm_types, false);
+
+        self.class_struct_types.insert(
+            name.to_string(),
+            (struct_type, all_fields.clone(), parent.clone()),
+        );
+
+        let obj_vt = VarType::Object {
+            struct_type_name: name.to_string(),
+            fields: all_fields.clone(),
+        };
+
+        // Compile constructor
+        if let Some(ctor) = constructor {
+            let ctor_name = format!("{}_constructor", name);
+            let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+            // Constructor takes a pointer to the struct (self) + parameters
+            let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_type.into()];
+            for param in &ctor.params {
+                let vt = param
+                    .type_ann
+                    .as_ref()
+                    .map(|ann| self.type_ann_to_var_type(ann))
+                    .unwrap_or(VarType::Number);
+                param_types.push(self.var_type_to_llvm(&vt).into());
+            }
+
+            let fn_type = self.context.void_type().fn_type(&param_types, false);
+            let ctor_fn = self.module.add_function(&ctor_name, fn_type, None);
+
+            // Add nounwind attribute
+            let nounwind_kind = Attribute::get_named_enum_kind_id("nounwind");
+            let nounwind = self.context.create_enum_attribute(nounwind_kind, 0);
+            ctor_fn.add_attribute(AttributeLoc::Function, nounwind);
+
+            self.functions.insert(ctor_name.clone(), ctor_fn);
+
+            let entry = self.context.append_basic_block(ctor_fn, "entry");
+            let saved_block = self.builder.get_insert_block();
+            self.builder.position_at_end(entry);
+
+            // Set up `this` as the first parameter (pointer to struct)
+            let this_ptr = ctor_fn.get_nth_param(0).unwrap().into_pointer_value();
+            let prev_this = self.current_this.clone();
+            self.current_this = Some((this_ptr, obj_vt.clone()));
+
+            self.push_scope();
+
+            // Register constructor parameters
+            for (i, param) in ctor.params.iter().enumerate() {
+                let vt = param
+                    .type_ann
+                    .as_ref()
+                    .map(|ann| self.type_ann_to_var_type(ann))
+                    .unwrap_or(VarType::Number);
+                let param_val = ctor_fn.get_nth_param((i + 1) as u32).unwrap();
+                let alloca = self.create_alloca(ctor_fn, &vt, &param.name);
+                self.builder.build_store(alloca, param_val).unwrap();
+                self.set_variable(param.name.clone(), alloca, vt);
+            }
+
+            for stmt in &ctor.body {
+                self.compile_statement(stmt, ctor_fn)?;
+            }
+
+            // Ensure the constructor returns void
+            if self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_terminator()
+                .is_none()
+            {
+                self.builder.build_return(None).unwrap();
+            }
+
+            self.pop_scope();
+            self.current_this = prev_this;
+
+            if let Some(bb) = saved_block {
+                self.builder.position_at_end(bb);
+            }
+        }
+
+        // Compile methods
+        for method in methods {
+            let method_fn_name = format!("{}_{}", name, method.name);
+            let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+            // Method takes self pointer + parameters
+            let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_type.into()];
+            let mut param_vts: Vec<VarType> = Vec::new();
+            for param in &method.params {
+                let vt = param
+                    .type_ann
+                    .as_ref()
+                    .map(|ann| self.type_ann_to_var_type(ann))
+                    .unwrap_or(VarType::Number);
+                param_types.push(self.var_type_to_llvm(&vt).into());
+                param_vts.push(vt);
+            }
+
+            let ret_vt = method
+                .return_type
+                .as_ref()
+                .map(|ann| self.type_ann_to_var_type(ann))
+                .unwrap_or(VarType::Number);
+
+            let ret_type = self.var_type_to_llvm(&ret_vt);
+            let fn_type = ret_type.fn_type(&param_types, false);
+            let method_fn = self.module.add_function(&method_fn_name, fn_type, None);
+
+            let nounwind_kind = Attribute::get_named_enum_kind_id("nounwind");
+            let nounwind = self.context.create_enum_attribute(nounwind_kind, 0);
+            method_fn.add_attribute(AttributeLoc::Function, nounwind);
+
+            self.functions.insert(method_fn_name.clone(), method_fn);
+
+            let entry = self.context.append_basic_block(method_fn, "entry");
+            let saved_block = self.builder.get_insert_block();
+            self.builder.position_at_end(entry);
+
+            let this_ptr = method_fn.get_nth_param(0).unwrap().into_pointer_value();
+            let prev_this = self.current_this.clone();
+            self.current_this = Some((this_ptr, obj_vt.clone()));
+
+            self.push_scope();
+
+            for (i, param) in method.params.iter().enumerate() {
+                let vt = param_vts[i].clone();
+                let param_val = method_fn.get_nth_param((i + 1) as u32).unwrap();
+                let alloca = self.create_alloca(method_fn, &vt, &param.name);
+                self.builder.build_store(alloca, param_val).unwrap();
+                self.set_variable(param.name.clone(), alloca, vt);
+            }
+
+            let saved_mode = self.number_mode.clone();
+            // Methods are not integer-narrowed
+            self.number_mode = VarType::Number;
+
+            for stmt in &method.body {
+                self.compile_statement(stmt, method_fn)?;
+            }
+
+            // If no terminator, add a default return
+            if self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_terminator()
+                .is_none()
+            {
+                let default_ret = self.default_value(&ret_vt);
+                self.builder.build_return(Some(&default_ret)).unwrap();
+            }
+
+            self.number_mode = saved_mode;
+            self.pop_scope();
+            self.current_this = prev_this;
+
+            if let Some(bb) = saved_block {
+                self.builder.position_at_end(bb);
+            }
+        }
+
+        Ok(())
     }
 
     fn compile_typeof(
@@ -1165,7 +1808,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Number | VarType::Integer => "number",
             VarType::String => "string",
             VarType::Boolean => "boolean",
-            VarType::Array => "object",
+            VarType::Array | VarType::Object { .. } => "object",
             VarType::FunctionPtr { .. } => "function",
         };
         Ok((self.create_string_literal(type_str), VarType::String))
@@ -1228,6 +1871,27 @@ impl<'ctx> Codegen<'ctx> {
                 .build_signed_int_to_float(len.into_int_value(), self.context.f64_type(), "lenf")
                 .unwrap();
             return Ok((len_f64.into(), VarType::Number));
+        }
+
+        // Object/class property access
+        if let VarType::Object { ref fields, .. } = obj_vt {
+            for (i, (name, field_vt)) in fields.iter().enumerate() {
+                if name == property {
+                    let val = self
+                        .builder
+                        .build_extract_value(
+                            obj_val.into_struct_value(),
+                            i as u32,
+                            &format!("obj.{}", property),
+                        )
+                        .unwrap();
+                    return Ok((val.into(), field_vt.clone()));
+                }
+            }
+            return Err(CompileError::error(
+                format!("Property '{}' does not exist on object", property),
+                span.clone(),
+            ));
         }
 
         Err(CompileError::error(
@@ -1575,6 +2239,94 @@ impl<'ctx> Codegen<'ctx> {
             if matches!(obj_vt, VarType::Array) {
                 return self.compile_array_method(object, obj_val, property, args, function, span);
             }
+
+            // Object/class method calls
+            if let VarType::Object {
+                ref fields,
+                ref struct_type_name,
+                ..
+            } = obj_vt
+            {
+                for (_, (fname, fvt)) in fields.iter().enumerate() {
+                    if fname == property {
+                        if let VarType::FunctionPtr { fn_name } = fvt {
+                            // Call the method function, passing `self` pointer as first arg
+                            let method_fn =
+                                self.functions.get(fn_name).copied().ok_or_else(|| {
+                                    CompileError::error(
+                                        format!("Method '{}' not compiled", property),
+                                        span.clone(),
+                                    )
+                                })?;
+
+                            // We need to get a pointer to the object for `this`
+                            // If the object is a variable, use its alloca
+                            let obj_ptr = if let ExprKind::Identifier(var_name) = &object.kind {
+                                let (ptr, _) = self.get_variable(var_name).unwrap();
+                                ptr
+                            } else {
+                                // Object is a temporary — store it in an alloca
+                                let alloca = self.create_alloca(function, &obj_vt, "tmp_obj");
+                                self.builder.build_store(alloca, obj_val).unwrap();
+                                alloca
+                            };
+
+                            let mut call_args: Vec<BasicMetadataValueEnum> = vec![obj_ptr.into()];
+                            for arg in args {
+                                let (val, _) = self.compile_expr(arg, function)?;
+                                call_args.push(val.into());
+                            }
+
+                            let result = self
+                                .builder
+                                .build_call(method_fn, &call_args, "method_call")
+                                .unwrap();
+
+                            if let Some(val) = result.try_as_basic_value().left() {
+                                // Determine return type from the method's return type
+                                let ret_type = method_fn.get_type().get_return_type();
+                                let ret_vt = if let Some(rt) = ret_type {
+                                    if rt.is_float_type() {
+                                        VarType::Number
+                                    } else if rt.is_int_type() {
+                                        let bw = rt.into_int_type().get_bit_width();
+                                        if bw == 1 {
+                                            VarType::Boolean
+                                        } else {
+                                            VarType::Integer
+                                        }
+                                    } else if rt.is_struct_type() {
+                                        // Check if it's a string type
+                                        let st = rt.into_struct_type();
+                                        if st.count_fields() == 2 {
+                                            VarType::String
+                                        } else if let Some((_, fi, _)) =
+                                            self.class_struct_types.get(struct_type_name)
+                                        {
+                                            VarType::Object {
+                                                struct_type_name: struct_type_name.clone(),
+                                                fields: fi.clone(),
+                                            }
+                                        } else {
+                                            VarType::String
+                                        }
+                                    } else {
+                                        VarType::Number
+                                    }
+                                } else {
+                                    VarType::Number
+                                };
+                                return Ok((val, ret_vt));
+                            } else {
+                                return Ok((
+                                    self.context.f64_type().const_float(0.0).into(),
+                                    VarType::Number,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Global functions: parseInt, parseFloat
@@ -1776,6 +2528,70 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder
                         .build_call(f, &[ptr.into(), len.into()], "")
                         .unwrap();
+                }
+                VarType::Object { ref fields, .. } => {
+                    // Print object as { key: value, key2: value2 }
+                    self.print_string_literal("{ ", print_str);
+                    for (fi, (fname, fvt)) in fields.iter().enumerate() {
+                        if fi > 0 {
+                            self.print_string_literal(", ", print_str);
+                        }
+                        // Print field name + ": "
+                        self.print_string_literal(&format!("{}: ", fname), print_str);
+                        // Extract field value from struct
+                        let field_val = self
+                            .builder
+                            .build_extract_value(
+                                val.into_struct_value(),
+                                fi as u32,
+                                &format!("obj.{}", fname),
+                            )
+                            .unwrap();
+                        // Print the value based on its type
+                        match fvt {
+                            VarType::Number => {
+                                let f = self.module.get_function(print_num).unwrap();
+                                self.builder.build_call(f, &[field_val.into()], "").unwrap();
+                            }
+                            VarType::Integer => {
+                                let float_val = self
+                                    .builder
+                                    .build_signed_int_to_float(
+                                        field_val.into_int_value(),
+                                        self.context.f64_type(),
+                                        "i2f",
+                                    )
+                                    .unwrap();
+                                let f = self.module.get_function(print_num).unwrap();
+                                self.builder.build_call(f, &[float_val.into()], "").unwrap();
+                            }
+                            VarType::String => {
+                                // Wrap string values in single quotes
+                                self.print_string_literal("'", print_str);
+                                let sp = self
+                                    .builder
+                                    .build_extract_value(field_val.into_struct_value(), 0, "sp")
+                                    .unwrap();
+                                let sl = self
+                                    .builder
+                                    .build_extract_value(field_val.into_struct_value(), 1, "sl")
+                                    .unwrap();
+                                let f = self.module.get_function(print_str).unwrap();
+                                self.builder
+                                    .build_call(f, &[sp.into(), sl.into()], "")
+                                    .unwrap();
+                                self.print_string_literal("'", print_str);
+                            }
+                            VarType::Boolean => {
+                                let f = self.module.get_function(print_bool).unwrap();
+                                self.builder.build_call(f, &[field_val.into()], "").unwrap();
+                            }
+                            _ => {
+                                self.print_string_literal("[complex]", print_str);
+                            }
+                        }
+                    }
+                    self.print_string_literal(" }", print_str);
                 }
             }
         }
@@ -2125,6 +2941,23 @@ impl<'ctx> Codegen<'ctx> {
         struct_val.into_struct_value().into()
     }
 
+    /// Helper: emit calls to print a string constant via the given print function name.
+    fn print_string_literal(&self, s: &str, print_fn_name: &str) {
+        let str_val = self.create_string_literal(s);
+        let ptr = self
+            .builder
+            .build_extract_value(str_val.into_struct_value(), 0, "p")
+            .unwrap();
+        let len = self
+            .builder
+            .build_extract_value(str_val.into_struct_value(), 1, "l")
+            .unwrap();
+        let f = self.module.get_function(print_fn_name).unwrap();
+        self.builder
+            .build_call(f, &[ptr.into(), len.into()], "")
+            .unwrap();
+    }
+
     fn to_string(
         &self,
         val: BasicValueEnum<'ctx>,
@@ -2172,6 +3005,7 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(self.create_string_literal("[object Array]"))
             }
             VarType::FunctionPtr { .. } => Ok(self.create_string_literal("[Function]")),
+            VarType::Object { .. } => Ok(self.create_string_literal("[object Object]")),
         }
     }
 
@@ -2248,6 +3082,22 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Boolean => self.context.bool_type().into(),
             VarType::Array => self.array_type.into(),
             VarType::FunctionPtr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            VarType::Object {
+                struct_type_name,
+                fields,
+            } => {
+                // Look up or create a named struct type for this object shape
+                if let Some((st, _, _)) = self.class_struct_types.get(struct_type_name) {
+                    (*st).into()
+                } else {
+                    // Create an anonymous struct type from field types
+                    let field_types: Vec<BasicTypeEnum> = fields
+                        .iter()
+                        .map(|(_, fvt)| self.var_type_to_llvm(fvt))
+                        .collect();
+                    self.context.struct_type(&field_types, false).into()
+                }
+            }
         }
     }
 
@@ -2256,7 +3106,38 @@ impl<'ctx> Codegen<'ctx> {
             TypeAnnKind::Number => self.number_mode.clone(),
             TypeAnnKind::String => VarType::String,
             TypeAnnKind::Boolean => VarType::Boolean,
-            _ => self.number_mode.clone(),
+            TypeAnnKind::Void | TypeAnnKind::Null | TypeAnnKind::Undefined => {
+                self.number_mode.clone()
+            }
+            TypeAnnKind::Array(_) => VarType::Array,
+            TypeAnnKind::Object { fields } => {
+                let field_vts: Vec<(String, VarType)> = fields
+                    .iter()
+                    .map(|(name, ann)| (name.clone(), self.type_ann_to_var_type(ann)))
+                    .collect();
+                VarType::Object {
+                    struct_type_name: format!("__anon_obj_{}", field_vts.len()),
+                    fields: field_vts,
+                }
+            }
+            TypeAnnKind::Named(name) => {
+                // Look up class struct types
+                if let Some((_, field_info, _)) = self.class_struct_types.get(name) {
+                    VarType::Object {
+                        struct_type_name: name.clone(),
+                        fields: field_info.clone(),
+                    }
+                } else {
+                    // Unknown named type — treat as number for now
+                    self.number_mode.clone()
+                }
+            }
+            TypeAnnKind::FunctionType { .. } => {
+                // Function types are opaque pointers
+                VarType::FunctionPtr {
+                    fn_name: String::new(),
+                }
+            }
         }
     }
 
@@ -2272,6 +3153,20 @@ impl<'ctx> Codegen<'ctx> {
                 .ptr_type(AddressSpace::default())
                 .const_null()
                 .into(),
+            VarType::Object { fields, .. } => {
+                let llvm_type = self.var_type_to_llvm(vt);
+                let st = llvm_type.into_struct_type();
+                let mut val = st.const_zero();
+                for (i, (_, field_vt)) in fields.iter().enumerate() {
+                    let default = self.default_value(field_vt);
+                    val = self
+                        .builder
+                        .build_insert_value(val, default, i as u32, "obj.init")
+                        .unwrap()
+                        .into_struct_value();
+                }
+                val.into()
+            }
         }
     }
 

@@ -27,6 +27,17 @@ pub enum StmtKind {
         body: Vec<Statement>,
         is_exported: bool,
     },
+    ClassDecl {
+        name: String,
+        parent: Option<String>,
+        fields: Vec<ClassField>,
+        constructor: Option<ClassConstructor>,
+        methods: Vec<ClassMethod>,
+    },
+    InterfaceDecl {
+        name: String,
+        fields: Vec<(String, TypeAnnotation)>,
+    },
     If {
         condition: Expr,
         then_branch: Vec<Statement>,
@@ -61,6 +72,29 @@ pub enum StmtKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct ClassField {
+    pub name: String,
+    pub type_ann: Option<TypeAnnotation>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassConstructor {
+    pub params: Vec<Parameter>,
+    pub body: Vec<Statement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassMethod {
+    pub name: String,
+    pub params: Vec<Parameter>,
+    pub return_type: Option<TypeAnnotation>,
+    pub body: Vec<Statement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub struct ImportSpecifier {
     pub imported: String,
     pub local: String,
@@ -88,11 +122,35 @@ pub enum TypeAnnKind {
     Void,
     Null,
     Undefined,
+    Array(Box<TypeAnnotation>),
+    Object {
+        fields: Vec<(String, TypeAnnotation)>,
+    },
+    /// A named type reference (e.g., a class or interface name)
+    Named(String),
+    /// Function type: (params) => return_type
+    FunctionType {
+        params: Vec<TypeAnnotation>,
+        return_type: Box<TypeAnnotation>,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct Expr {
     pub kind: ExprKind,
+    pub span: Span,
+}
+
+/// A single property in an object literal.
+#[derive(Debug, Clone)]
+pub struct ObjectProperty {
+    pub key: String,
+    pub value: Expr,
+    pub is_method: bool,
+    /// For methods: the parameters
+    pub params: Vec<Parameter>,
+    /// For methods: the return type annotation
+    pub return_type: Option<TypeAnnotation>,
     pub span: Span,
 }
 
@@ -104,8 +162,12 @@ pub enum ExprKind {
     NullLiteral,
     UndefinedLiteral,
     Identifier(String),
+    This,
     ArrayLiteral {
         elements: Vec<Expr>,
+    },
+    ObjectLiteral {
+        properties: Vec<ObjectProperty>,
     },
     IndexAccess {
         object: Box<Expr>,
@@ -135,10 +197,20 @@ pub enum ExprKind {
         name: String,
         value: Box<Expr>,
     },
+    /// Assignment to an object property: obj.prop = value
+    MemberAssignment {
+        object: Box<Expr>,
+        property: String,
+        value: Box<Expr>,
+    },
     ArrowFunction {
         params: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: ArrowBody,
+    },
+    NewExpr {
+        class_name: String,
+        args: Vec<Expr>,
     },
     Conditional {
         condition: Box<Expr>,

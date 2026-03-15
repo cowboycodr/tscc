@@ -22,6 +22,13 @@ pub enum Token {
     For,
     Of,
     Void,
+    Class,
+    New,
+    This,
+    Extends,
+    Super,
+    Interface,
+    Constructor,
 
     // Module keywords
     Import,

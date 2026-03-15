@@ -285,6 +285,13 @@ impl Scanner {
             "as" => Token::As,
             "default" => Token::Default,
             "typeof" => Token::Typeof,
+            "class" => Token::Class,
+            "new" => Token::New,
+            "this" => Token::This,
+            "extends" => Token::Extends,
+            "super" => Token::Super,
+            "interface" => Token::Interface,
+            "constructor" => Token::Constructor,
             _ => Token::Identifier(text),
         };
         self.add_token(token);

@@ -22,6 +22,12 @@ pub struct TypeChecker {
     pub exported_symbols: HashMap<String, Type>,
     /// Symbols imported from other modules (populated before check)
     pub imported_symbols: HashMap<String, Type>,
+    /// Current `this` type (set inside class methods / object methods)
+    current_this_type: Option<Type>,
+    /// Registered class types by name
+    class_types: HashMap<String, Type>,
+    /// Registered interface types by name
+    interface_types: HashMap<String, Type>,
 }
 
 impl TypeChecker {
@@ -31,6 +37,9 @@ impl TypeChecker {
             current_return_type: None,
             exported_symbols: HashMap::new(),
             imported_symbols: HashMap::new(),
+            current_this_type: None,
+            class_types: HashMap::new(),
+            interface_types: HashMap::new(),
         };
         checker.push_scope();
         checker.register_builtins();
@@ -178,6 +187,153 @@ impl TypeChecker {
                 Ok(())
             }
 
+            StmtKind::ClassDecl {
+                name,
+                parent,
+                fields,
+                constructor,
+                methods,
+            } => {
+                // Collect parent fields if inheriting
+                let mut all_fields: Vec<(String, Type)> = Vec::new();
+                if let Some(parent_name) = parent {
+                    if let Some(parent_type) = self.class_types.get(parent_name) {
+                        if let Type::Class { fields: pf, .. } = parent_type {
+                            all_fields.extend(pf.clone());
+                        }
+                    } else {
+                        return Err(CompileError::error(
+                            format!("Cannot find base class '{}'", parent_name),
+                            stmt.span.clone(),
+                        ));
+                    }
+                }
+
+                // Add own fields
+                for field in fields {
+                    let ty = field
+                        .type_ann
+                        .as_ref()
+                        .map(|ann| self.resolve_type_annotation(ann))
+                        .unwrap_or(Type::Unknown);
+                    // Override parent field if same name
+                    all_fields.retain(|(n, _)| n != &field.name);
+                    all_fields.push((field.name.clone(), ty));
+                }
+
+                // Add methods
+                for method in methods {
+                    let param_types: Vec<Type> = method
+                        .params
+                        .iter()
+                        .map(|p| {
+                            p.type_ann
+                                .as_ref()
+                                .map(|ann| self.resolve_type_annotation(ann))
+                                .unwrap_or(Type::Unknown)
+                        })
+                        .collect();
+                    let ret_type = method
+                        .return_type
+                        .as_ref()
+                        .map(|ann| self.resolve_type_annotation(ann))
+                        .unwrap_or(Type::Void);
+                    let method_type = Type::Function {
+                        params: param_types,
+                        return_type: Box::new(ret_type),
+                    };
+                    // Override parent method if same name
+                    all_fields.retain(|(n, _)| n != &method.name);
+                    all_fields.push((method.name.clone(), method_type));
+                }
+
+                let class_type = Type::Class {
+                    name: name.clone(),
+                    fields: all_fields.clone(),
+                };
+
+                self.class_types.insert(name.clone(), class_type.clone());
+                self.define(name.clone(), class_type.clone(), true);
+
+                // Now type-check constructor and methods with `this` context
+                let this_type = Type::Object {
+                    fields: all_fields.clone(),
+                };
+                let prev_this = self.current_this_type.clone();
+                self.current_this_type = Some(this_type);
+
+                if let Some(ctor) = constructor {
+                    self.push_scope();
+                    let prev_ret = self.current_return_type.clone();
+                    self.current_return_type = Some(Type::Void);
+
+                    for param in &ctor.params {
+                        let ty = param
+                            .type_ann
+                            .as_ref()
+                            .map(|ann| self.resolve_type_annotation(ann))
+                            .unwrap_or(Type::Unknown);
+                        self.define(param.name.clone(), ty, false);
+                    }
+                    for s in &ctor.body {
+                        self.check_statement(s)?;
+                    }
+
+                    self.current_return_type = prev_ret;
+                    self.pop_scope();
+                }
+
+                for method in methods {
+                    let param_types: Vec<Type> = method
+                        .params
+                        .iter()
+                        .map(|p| {
+                            p.type_ann
+                                .as_ref()
+                                .map(|ann| self.resolve_type_annotation(ann))
+                                .unwrap_or(Type::Unknown)
+                        })
+                        .collect();
+                    let ret_type = method
+                        .return_type
+                        .as_ref()
+                        .map(|ann| self.resolve_type_annotation(ann))
+                        .unwrap_or(Type::Void);
+
+                    self.push_scope();
+                    let prev_ret = self.current_return_type.clone();
+                    self.current_return_type = Some(ret_type);
+
+                    for (param, param_type) in method.params.iter().zip(param_types.iter()) {
+                        self.define(param.name.clone(), param_type.clone(), false);
+                    }
+                    for s in &method.body {
+                        self.check_statement(s)?;
+                    }
+
+                    self.current_return_type = prev_ret;
+                    self.pop_scope();
+                }
+
+                self.current_this_type = prev_this;
+                Ok(())
+            }
+
+            StmtKind::InterfaceDecl { name, fields } => {
+                let field_types: Vec<(String, Type)> = fields
+                    .iter()
+                    .map(|(n, ann)| (n.clone(), self.resolve_type_annotation(ann)))
+                    .collect();
+                let iface_type = Type::Object {
+                    fields: field_types,
+                };
+                self.interface_types
+                    .insert(name.clone(), iface_type.clone());
+                // Also define as a type in scope so it can be referenced
+                self.define(name.clone(), iface_type, true);
+                Ok(())
+            }
+
             StmtKind::If {
                 condition,
                 then_branch,
@@ -291,6 +447,13 @@ impl TypeChecker {
                 CompileError::error(format!("Cannot find name '{}'", name), expr.span.clone())
             }),
 
+            ExprKind::This => self.current_this_type.clone().ok_or_else(|| {
+                CompileError::error(
+                    "'this' is only valid inside a class method or object method",
+                    expr.span.clone(),
+                )
+            }),
+
             ExprKind::ArrayLiteral { elements } => {
                 let mut elem_type = Type::Unknown;
                 for elem in elements {
@@ -305,11 +468,123 @@ impl TypeChecker {
                 Ok(Type::Array(Box::new(elem_type)))
             }
 
+            ExprKind::ObjectLiteral { properties } => {
+                let mut fields = Vec::new();
+                for prop in properties {
+                    if prop.is_method {
+                        // For methods, build a function type
+                        let param_types: Vec<Type> = prop
+                            .params
+                            .iter()
+                            .map(|p| {
+                                p.type_ann
+                                    .as_ref()
+                                    .map(|ann| self.resolve_type_annotation(ann))
+                                    .unwrap_or(Type::Unknown)
+                            })
+                            .collect();
+                        let ret_type = prop
+                            .return_type
+                            .as_ref()
+                            .map(|ann| self.resolve_type_annotation(ann))
+                            .unwrap_or(Type::Void);
+                        let method_type = Type::Function {
+                            params: param_types,
+                            return_type: Box::new(ret_type),
+                        };
+                        fields.push((prop.key.clone(), method_type));
+                    } else {
+                        let ty = self.check_expr(&prop.value)?;
+                        fields.push((prop.key.clone(), ty));
+                    }
+                }
+
+                // For methods that use `this`, we need to type-check their bodies
+                // with the object type set as `this`
+                let obj_type = Type::Object {
+                    fields: fields.clone(),
+                };
+                let prev_this = self.current_this_type.clone();
+                self.current_this_type = Some(obj_type.clone());
+
+                for prop in properties {
+                    if prop.is_method {
+                        if let ExprKind::ArrowFunction { params, body, .. } = &prop.value.kind {
+                            let param_types: Vec<Type> = params
+                                .iter()
+                                .map(|p| {
+                                    p.type_ann
+                                        .as_ref()
+                                        .map(|ann| self.resolve_type_annotation(ann))
+                                        .unwrap_or(Type::Unknown)
+                                })
+                                .collect();
+                            let ret_type = prop
+                                .return_type
+                                .as_ref()
+                                .map(|ann| self.resolve_type_annotation(ann))
+                                .unwrap_or(Type::Void);
+
+                            self.push_scope();
+                            let prev_ret = self.current_return_type.clone();
+                            self.current_return_type = Some(ret_type);
+
+                            for (param, param_type) in params.iter().zip(param_types.iter()) {
+                                self.define(param.name.clone(), param_type.clone(), false);
+                            }
+
+                            match body {
+                                ArrowBody::Block(stmts) => {
+                                    for s in stmts {
+                                        self.check_statement(s)?;
+                                    }
+                                }
+                                ArrowBody::Expr(e) => {
+                                    self.check_expr(e)?;
+                                }
+                            }
+
+                            self.current_return_type = prev_ret;
+                            self.pop_scope();
+                        }
+                    }
+                }
+
+                self.current_this_type = prev_this;
+                Ok(obj_type)
+            }
+
             ExprKind::IndexAccess { object, index } => {
                 let obj_type = self.check_expr(object)?;
-                self.check_expr(index)?;
+                let idx_type = self.check_expr(index)?;
                 match &obj_type {
                     Type::Array(elem) => Ok(*elem.clone()),
+                    Type::Object { fields } => {
+                        // Bracket access with string literal: obj["key"]
+                        if let ExprKind::StringLiteral(key) = &index.kind {
+                            for (name, ty) in fields {
+                                if name == key {
+                                    return Ok(ty.clone());
+                                }
+                            }
+                            return Err(CompileError::error(
+                                format!("Property '{}' does not exist on object", key),
+                                expr.span.clone(),
+                            ));
+                        }
+                        let _ = idx_type;
+                        Ok(Type::Unknown)
+                    }
+                    Type::Class { fields, .. } => {
+                        if let ExprKind::StringLiteral(key) = &index.kind {
+                            for (name, ty) in fields {
+                                if name == key {
+                                    return Ok(ty.clone());
+                                }
+                            }
+                        }
+                        Ok(Type::Unknown)
+                    }
                     _ => Ok(Type::Unknown),
                 }
             }
@@ -366,6 +641,38 @@ impl TypeChecker {
                     // Array methods called on expressions
                     if let Type::Array(ref elem_type) = obj_type {
                         return self.check_array_method_call(property, args, elem_type, &expr.span);
+                    }
+                    // Object/class method calls
+                    let fields = match &obj_type {
+                        Type::Object { fields } => Some(fields.clone()),
+                        Type::Class { fields, .. } => Some(fields.clone()),
+                        _ => None,
+                    };
+                    if let Some(fields) = fields {
+                        for (name, ty) in &fields {
+                            if name == property {
+                                if let Type::Function {
+                                    params,
+                                    return_type,
+                                } = ty
+                                {
+                                    if args.len() != params.len() {
+                                        return Err(CompileError::error(
+                                            format!(
+                                                "Expected {} arguments, got {}",
+                                                params.len(),
+                                                args.len()
+                                            ),
+                                            expr.span.clone(),
+                                        ));
+                                    }
+                                    for arg in args {
+                                        self.check_expr(arg)?;
+                                    }
+                                    return Ok(*return_type.clone());
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -437,6 +744,20 @@ impl TypeChecker {
                 }
 
                 let obj_type = self.check_expr(object)?;
+
+                // Object/class field access
+                let fields = match &obj_type {
+                    Type::Object { fields } => Some(fields),
+                    Type::Class { fields, .. } => Some(fields),
+                    _ => None,
+                };
+                if let Some(fields) = fields {
+                    for (name, ty) in fields {
+                        if name == property {
+                            return Ok(ty.clone());
+                        }
+                    }
+                }
 
                 // Array properties and methods
                 if let Type::Array(ref elem_type) = obj_type {
@@ -525,6 +846,68 @@ impl TypeChecker {
                 }
 
                 Ok(var_type)
+            }
+
+            ExprKind::MemberAssignment {
+                object,
+                property,
+                value,
+            } => {
+                let obj_type = self.check_expr(object)?;
+                let val_type = self.check_expr(value)?;
+
+                // Look up property type
+                let fields = match &obj_type {
+                    Type::Object { fields } => Some(fields),
+                    Type::Class { fields, .. } => Some(fields),
+                    _ => None,
+                };
+                if let Some(fields) = fields {
+                    for (name, ty) in fields {
+                        if name == property {
+                            if !self.is_assignable(&val_type, ty) {
+                                return Err(CompileError::error(
+                                    format!(
+                                        "Type '{}' is not assignable to type '{}'",
+                                        val_type, ty
+                                    ),
+                                    expr.span.clone(),
+                                ));
+                            }
+                            return Ok(val_type);
+                        }
+                    }
+                }
+
+                // Allow assignment to `this.x` even if not found in fields (constructor sets fields)
+                if matches!(object.kind, ExprKind::This) {
+                    return Ok(val_type);
+                }
+
+                Err(CompileError::error(
+                    format!(
+                        "Property '{}' does not exist on type '{}'",
+                        property, obj_type
+                    ),
+                    expr.span.clone(),
+                ))
+            }
+
+            ExprKind::NewExpr { class_name, args } => {
+                let class_type = self.class_types.get(class_name).cloned().ok_or_else(|| {
+                    CompileError::error(
+                        format!("Cannot find class '{}'", class_name),
+                        expr.span.clone(),
+                    )
+                })?;
+
+                // Type-check constructor arguments
+                for arg in args {
+                    self.check_expr(arg)?;
+                }
+
+                // Return the class type
+                Ok(class_type)
             }
 
             ExprKind::ArrowFunction {
@@ -710,7 +1093,7 @@ impl TypeChecker {
                 Ok(Type::Boolean)
             }
             "substring" | "slice" => {
-                if args.len() < 1 || args.len() > 2 {
+                if args.is_empty() || args.len() > 2 {
                     return Err(CompileError::error(
                         format!("{} expects 1 or 2 arguments", method),
                         span.clone(),
@@ -814,6 +1197,39 @@ impl TypeChecker {
         if from == &Type::Unknown || to == &Type::Unknown {
             return true;
         }
+        // Object structural compatibility: from has all fields of to
+        if let (
+            Type::Object {
+                fields: from_fields,
+            },
+            Type::Object { fields: to_fields },
+        ) = (from, to)
+        {
+            return to_fields.iter().all(|(name, ty)| {
+                from_fields
+                    .iter()
+                    .any(|(n, t)| n == name && self.is_assignable(t, ty))
+            });
+        }
+        // Class instance is assignable to Object with matching fields
+        if let (
+            Type::Class {
+                fields: from_fields,
+                ..
+            },
+            Type::Object { fields: to_fields },
+        ) = (from, to)
+        {
+            return to_fields.iter().all(|(name, ty)| {
+                from_fields
+                    .iter()
+                    .any(|(n, t)| n == name && self.is_assignable(t, ty))
+            });
+        }
+        // Same-name class types
+        if let (Type::Class { name: n1, .. }, Type::Class { name: n2, .. }) = (from, to) {
+            return n1 == n2;
+        }
         false
     }
 
@@ -825,6 +1241,33 @@ impl TypeChecker {
             TypeAnnKind::Void => Type::Void,
             TypeAnnKind::Null => Type::Null,
             TypeAnnKind::Undefined => Type::Undefined,
+            TypeAnnKind::Array(inner) => Type::Array(Box::new(self.resolve_type_annotation(inner))),
+            TypeAnnKind::Object { fields } => Type::Object {
+                fields: fields
+                    .iter()
+                    .map(|(n, ann)| (n.clone(), self.resolve_type_annotation(ann)))
+                    .collect(),
+            },
+            TypeAnnKind::Named(name) => {
+                // Look up interface or class type
+                if let Some(ty) = self.interface_types.get(name) {
+                    return ty.clone();
+                }
+                if let Some(ty) = self.class_types.get(name) {
+                    return ty.clone();
+                }
+                Type::Unknown
+            }
+            TypeAnnKind::FunctionType {
+                params,
+                return_type,
+            } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.resolve_type_annotation(p))
+                    .collect(),
+                return_type: Box::new(self.resolve_type_annotation(return_type)),
+            },
         }
     }
 

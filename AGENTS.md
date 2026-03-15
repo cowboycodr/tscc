@@ -154,3 +154,9 @@ fn feature_name() {
 - Template literals are desugared to string concatenation in the scanner (not a parser feature)
 - LLVM contexts are safe to create per-thread; each test gets its own
 - The C runtime source (`runtime/runtime.c`) is embedded into the binary at compile time via `include_str!()`. During linking, it is written to a temp file, compiled with `cc -O2`, linked, and cleaned up. This means tscc works from any directory without needing the source tree.
+- **Objects are LLVM struct types** — each object shape gets a unique anonymous struct. Property access is `extract_value` at a compile-time index. No runtime hash maps.
+- **Classes compile to struct types** — fields are struct fields, methods are compiled as separate functions with an implicit `self` pointer (first parameter). `new` allocates on the stack, calls the constructor, returns the struct by value.
+- **Inheritance uses struct prefix layout** — child class includes parent fields first, then own fields. If child has no constructor, parent constructor is called automatically.
+- **Interfaces are type-only** — they register a struct layout in codegen (for `type_ann_to_var_type` to resolve Named types) but generate no runtime code.
+- **`this` in methods** is a pointer to the struct, passed as the first parameter. `this.prop` compiles to `struct_gep` + load/store.
+- **Object methods** are compiled as regular LLVM functions with a `self` pointer. Method calls pass the object's alloca as the first argument.

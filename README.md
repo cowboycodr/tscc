@@ -105,6 +105,26 @@ Second: 20
 42
 ```
 
+Objects and classes compile to zero-overhead LLVM structs:
+
+```ts
+class Point {
+    x: number
+    y: number
+    constructor(x: number, y: number) {
+        this.x = x
+        this.y = y
+    }
+    toString(): string {
+        return this.x + "," + this.y
+    }
+}
+
+let p = new Point(3, 4)
+console.log(p)            // { x: 3, y: 4, toString: [complex] }
+console.log(p.toString()) // 3,4
+```
+
 See [`examples/`](examples/) for more.
 
 ## Architecture
@@ -122,17 +142,17 @@ TypeScript source
     Native binary
 ```
 
-Written in Rust. Single crate. ~4,000 lines of Rust + ~285 lines of C runtime.
+Written in Rust. Single crate. ~7,700 lines of Rust + ~285 lines of C runtime.
 
 The C runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It's compiled and linked into every binary.
 
 ## Status
 
-Early stage. 167 tests passing, 72 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 174 tests passing, 65 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**167 passing** / **72 not yet implemented** — 70% of test suite
+**174 passing** / **65 not yet implemented** — 73% of test suite
 
 ### Literals & Primitives
 
@@ -168,8 +188,6 @@ Early stage. 167 tests passing, 72 pending. The goal is drop-in compatibility wi
 | Uninitialized `let` | :white_check_mark: | `let x: number` (defaults to 0) |
 | Optional semicolons | :white_check_mark: | `let x = 42` |
 | `var` declarations | :x: | `var x = 42` |
-| Array destructuring | :x: | `let [a, b] = [1, 2]` |
-| Object destructuring | :x: | `let { x, y } = { x: 1, y: 2 }` |
 
 ### Arithmetic Operators
 
@@ -333,13 +351,18 @@ Early stage. 167 tests passing, 72 pending. The goal is drop-in compatibility wi
 
 | Feature | Status | Test |
 |---|---|---|
-| Object literals | :x: | `{ x: 1, y: 2 }` |
-| Property access | :x: | `obj.x` |
-| Bracket access | :x: | `obj["x"]` |
-| Object methods | :x: | `obj.getX()` |
-| Class declarations | :x: | `class Point { ... }` |
-| Class inheritance | :x: | `class Dog extends Animal` |
-| Interfaces | :x: | `interface Point { x: number }` |
+| Object literals | :white_check_mark: | `{ x: 1, y: 2 }` |
+| Property access | :white_check_mark: | `obj.x` |
+| Bracket access | :white_check_mark: | `obj["x"]` |
+| Object methods | :white_check_mark: | `obj.getX()` |
+| `console.log(obj)` | :white_check_mark: | `{ name: 'Kian', age: 19 }` |
+| Class declarations | :white_check_mark: | `class Point { ... }` |
+| `new` + constructor | :white_check_mark: | `new Point(3, 4)` |
+| Class methods | :white_check_mark: | `p.toString()` |
+| Class inheritance | :white_check_mark: | `class Dog extends Animal` |
+| Interfaces | :white_check_mark: | `interface Point { x: number }` |
+| Array destructuring | :x: | `let [a, b] = [1, 2]` |
+| Object destructuring | :x: | `let { x, y } = { x: 1, y: 2 }` |
 
 ### Type System
 
