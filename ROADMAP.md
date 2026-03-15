@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 195 tests passing, 44 pending — 82% of test suite**
+**Current status: 199 tests passing, 40 pending — 83% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -26,12 +26,12 @@ Small, self-contained changes. Each typically touches 1–3 files.
 
 ### Type-Only Features
 These require only parser/checker changes — zero LLVM codegen.
-- [ ] Type aliases — `type ID = string | number`
-- [ ] Type assertions — `x as string` *(parse and discard; return inner expr)*
-- [ ] `satisfies` operator — `"red" satisfies Colors` *(type-check only)*
-- [ ] `as const` — `[1, 2, 3] as const` *(treat as identity)*
-- [ ] `readonly` modifier — `readonly host: string`
-- [ ] `typeof` in type position — `let y: typeof x`
+- [x] Type aliases — `type ID = string | number` *(parser + checker; test blocked on union types)*
+- [x] Type assertions — `x as string` *(parse and discard; return inner expr)*
+- [x] `satisfies` operator — `"red" satisfies Colors` *(type-check only; test blocked on union types)*
+- [x] `as const` — `[1, 2, 3] as const` *(treat as identity)*
+- [x] `readonly` modifier — `readonly host: string`
+- [x] `typeof` in type position — `let y: typeof x`
 
 ### Small Language Features
 - [ ] Function expressions — `let f = function(x) { return x }` *(same as arrow, different keyword)*

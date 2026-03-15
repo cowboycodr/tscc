@@ -499,7 +499,8 @@ impl<'ctx> Codegen<'ctx> {
             | StmtKind::Continue
             | StmtKind::Empty
             | StmtKind::ClassDecl { .. }
-            | StmtKind::InterfaceDecl { .. } => true,
+            | StmtKind::InterfaceDecl { .. }
+            | StmtKind::TypeAlias { .. } => true,
         }
     }
 
@@ -603,10 +604,12 @@ impl<'ctx> Codegen<'ctx> {
         self.push_scope();
 
         for stmt in &program.statements {
-            // Skip function and interface declarations (already compiled in first pass)
+            // Skip declarations already handled in earlier passes or type-only
             if matches!(
                 &stmt.kind,
-                StmtKind::FunctionDecl { .. } | StmtKind::InterfaceDecl { .. }
+                StmtKind::FunctionDecl { .. }
+                    | StmtKind::InterfaceDecl { .. }
+                    | StmtKind::TypeAlias { .. }
             ) {
                 continue;
             }
@@ -693,6 +696,11 @@ impl<'ctx> Codegen<'ctx> {
                 let struct_type = self.context.struct_type(&field_llvm_types, false);
                 self.class_struct_types
                     .insert(name.clone(), (struct_type, field_vts, None));
+                Ok(())
+            }
+
+            StmtKind::TypeAlias { .. } => {
+                // Type aliases are erased — no runtime code
                 Ok(())
             }
 
@@ -1834,6 +1842,11 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             ExprKind::Grouping { expr } => self.compile_expr(expr, function),
+
+            // Type assertion and satisfies — erased at codegen, compile inner expr
+            ExprKind::TypeAssertion { expr, .. } | ExprKind::Satisfies { expr, .. } => {
+                self.compile_expr(expr, function)
+            }
 
             ExprKind::PostfixUpdate { name, op } | ExprKind::PrefixUpdate { name, op } => {
                 let (ptr, vt) = self.get_variable(name).ok_or_else(|| {
@@ -4507,6 +4520,12 @@ impl<'ctx> Codegen<'ctx> {
                     // Unknown named type — treat as number for now
                     self.number_mode.clone()
                 }
+            }
+            TypeAnnKind::Typeof(_) => {
+                // typeof is resolved by the type checker; at codegen the variable's
+                // actual type is used from its initializer, so this is only hit
+                // for uninitialized variables — fall back to number.
+                self.number_mode.clone()
             }
             TypeAnnKind::FunctionType {
                 params,

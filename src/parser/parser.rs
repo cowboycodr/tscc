@@ -47,6 +47,18 @@ impl Parser {
             Token::LeftBrace => self.block_statement(),
             Token::Import => self.import_declaration(),
             Token::Export => self.export_declaration(),
+            // type alias: type X = Y (contextual keyword)
+            Token::Identifier(ref name) if name == "type" => {
+                // Peek ahead: if followed by an identifier, it's a type alias
+                if matches!(
+                    self.tokens.get(self.current + 1).map(|t| &t.token),
+                    Some(Token::Identifier(_))
+                ) {
+                    self.type_alias_declaration()
+                } else {
+                    self.expression_statement()
+                }
+            }
             _ => self.expression_statement(),
         }
     }
@@ -282,6 +294,12 @@ impl Parser {
 
         let mut fields = Vec::new();
         while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            // Skip 'readonly' modifier (parsed and discarded)
+            if let Token::Identifier(ref kw) = self.peek_token() {
+                if kw == "readonly" {
+                    self.advance();
+                }
+            }
             let field_name = self.expect_identifier("Expected field name")?;
             self.expect(&Token::Colon, "Expected ':' after field name")?;
             let type_ann = self.type_annotation()?;
@@ -296,6 +314,21 @@ impl Parser {
 
         Ok(Statement {
             kind: StmtKind::InterfaceDecl { name, fields },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn type_alias_declaration(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'type' identifier
+
+        let name = self.expect_identifier("Expected type alias name")?;
+        self.expect(&Token::Assign, "Expected '=' in type alias")?;
+        let type_ann = self.type_annotation()?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::TypeAlias { name, type_ann },
             span: self.span_from(&start_span),
         })
     }
@@ -647,6 +680,30 @@ impl Parser {
     fn type_annotation(&mut self) -> Result<TypeAnnotation, CompileError> {
         let span = self.current_span();
 
+        // typeof x — variable type lookup
+        if self.match_token(&Token::Typeof) {
+            let name = self.expect_identifier("Expected identifier after 'typeof'")?;
+            let mut base = TypeAnnotation {
+                kind: TypeAnnKind::Typeof(name),
+                span: self.span_from(&span),
+            };
+            // Check for array type suffix: typeof x[]
+            while self.check(&Token::LeftBracket) {
+                if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket)
+                {
+                    self.advance();
+                    self.advance();
+                    base = TypeAnnotation {
+                        kind: TypeAnnKind::Array(Box::new(base)),
+                        span: self.span_from(&span),
+                    };
+                } else {
+                    break;
+                }
+            }
+            return Ok(base);
+        }
+
         // Check for function type: (params) => ReturnType
         if self.check(&Token::LeftParen) {
             if let Some(func_type) = self.try_function_type(&span)? {
@@ -856,7 +913,48 @@ impl Parser {
             }
         }
 
-        let expr = self.ternary()?;
+        let mut expr = self.ternary()?;
+
+        // Type assertion: expr as Type  /  expr as const
+        while self.check(&Token::As)
+            || matches!(self.peek_token(), Token::Identifier(ref kw) if kw == "satisfies")
+        {
+            if self.match_token(&Token::As) {
+                // as const — parse and discard (no-op at runtime)
+                if self.match_token(&Token::Const) {
+                    continue;
+                }
+                let target_type = self.type_annotation()?;
+                expr = Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        target_type.span.end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::TypeAssertion {
+                        expr: Box::new(expr),
+                        target_type,
+                    },
+                };
+            } else {
+                // satisfies Type
+                self.advance(); // consume 'satisfies' identifier
+                let target_type = self.type_annotation()?;
+                expr = Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        target_type.span.end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::Satisfies {
+                        expr: Box::new(expr),
+                        target_type,
+                    },
+                };
+            }
+        }
 
         if self.match_token(&Token::Assign) {
             let value = self.assignment()?;

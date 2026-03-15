@@ -148,11 +148,11 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 195 tests passing, 44 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 199 tests passing, 40 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**195 passing** / **44 not yet implemented** — 82% of test suite
+**199 passing** / **40 not yet implemented** — 83% of test suite
 
 ### Literals & Primitives
 
@@ -377,17 +377,17 @@ Early stage. 195 tests passing, 44 pending. The goal is drop-in compatibility wi
 | Generics | :x: | `function identity<T>(x: T): T` |
 | Generic constraints | :x: | `<T extends { length: number }>` |
 | Tuple types | :x: | `[number, string]` |
-| Type assertions | :x: | `x as string` |
+| Type assertions | :white_check_mark: | `x as string` |
 | Type narrowing | :x: | `if (typeof val === "string")` |
 | String literal types | :x: | `type Dir = "up" \| "down"` |
 | Intersection types | :x: | `Named & Aged` |
-| `readonly` | :x: | `readonly host: string` |
+| `readonly` | :white_check_mark: | `readonly host: string` |
 | `keyof` | :x: | `keyof Point` |
 | Conditional types | :x: | `T extends number ? "yes" : "no"` |
 | Mapped types | :x: | `{ [P in keyof T]: T[P] }` |
-| `typeof` in type position | :x: | `let y: typeof x` |
-| `satisfies` | :x: | `"red" satisfies Colors` |
-| `as const` | :x: | `[1, 2, 3] as const` |
+| `typeof` in type position | :white_check_mark: | `let y: typeof x` |
+| `satisfies` | :white_check_mark: | `"red" satisfies Colors` |
+| `as const` | :white_check_mark: | `[1, 2, 3] as const` |
 
 ### Error Handling & Async
 

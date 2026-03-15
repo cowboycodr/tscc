@@ -90,6 +90,10 @@ pub enum StmtKind {
         initializer: Expr,
         is_const: bool,
     },
+    TypeAlias {
+        name: String,
+        type_ann: TypeAnnotation,
+    },
     Break,
     Continue,
     Empty,
@@ -160,6 +164,8 @@ pub enum TypeAnnKind {
     },
     /// A named type reference (e.g., a class or interface name)
     Named(String),
+    /// typeof x — resolved by looking up the variable's type
+    Typeof(String),
     /// Function type: (params) => return_type
     FunctionType {
         params: Vec<TypeAnnotation>,
@@ -266,6 +272,16 @@ pub enum ExprKind {
     PrefixUpdate {
         name: String,
         op: UpdateOp,
+    },
+    /// Type assertion: expr as Type (erased at codegen)
+    TypeAssertion {
+        expr: Box<Expr>,
+        target_type: TypeAnnotation,
+    },
+    /// Satisfies operator: expr satisfies Type (erased at codegen)
+    Satisfies {
+        expr: Box<Expr>,
+        target_type: TypeAnnotation,
     },
 }
 

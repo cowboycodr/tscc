@@ -1705,7 +1705,7 @@ console.log(format("hi"))
     }
 
     #[test]
-    #[ignore = "type aliases not implemented"]
+    #[ignore = "test requires union type parsing"]
     fn type_alias() {
         let src = r#"
 type ID = string | number
@@ -1780,7 +1780,6 @@ console.log(pair[0], pair[1])
     }
 
     #[test]
-    #[ignore = "type assertions not implemented"]
     fn type_assertion() {
         let src = r#"
 let x: any = "hello"
@@ -2071,7 +2070,6 @@ console.log(p.name, p.age)
     }
 
     #[test]
-    #[ignore = "readonly not implemented"]
     fn readonly_property() {
         let src = r#"
 interface Config {
@@ -2122,7 +2120,6 @@ type Readonly<T> = {
     }
 
     #[test]
-    #[ignore = "typeof in type position not implemented"]
     fn typeof_type_operator() {
         let src = r#"
 let x = 42
@@ -2133,7 +2130,7 @@ console.log(y)
     }
 
     #[test]
-    #[ignore = "satisfies operator not implemented"]
+    #[ignore = "test requires union types and string literal types"]
     fn satisfies_operator() {
         let src = r#"
 type Colors = "red" | "green" | "blue"
@@ -2144,7 +2141,6 @@ console.log(c)
     }
 
     #[test]
-    #[ignore = "as const not implemented"]
     fn as_const() {
         let src = r#"
 let x = [1, 2, 3] as const

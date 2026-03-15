@@ -28,6 +28,8 @@ pub struct TypeChecker {
     class_types: HashMap<String, Type>,
     /// Registered interface types by name
     interface_types: HashMap<String, Type>,
+    /// Registered type aliases by name
+    type_aliases: HashMap<String, TypeAnnotation>,
 }
 
 impl TypeChecker {
@@ -40,6 +42,7 @@ impl TypeChecker {
             current_this_type: None,
             class_types: HashMap::new(),
             interface_types: HashMap::new(),
+            type_aliases: HashMap::new(),
         };
         checker.push_scope();
         checker.register_builtins();
@@ -341,6 +344,15 @@ impl TypeChecker {
                     .insert(name.clone(), iface_type.clone());
                 // Also define as a type in scope so it can be referenced
                 self.define(name.clone(), iface_type, true);
+                Ok(())
+            }
+
+            StmtKind::TypeAlias { name, type_ann } => {
+                // Register the alias for use in resolve_type_annotation
+                self.type_aliases.insert(name.clone(), type_ann.clone());
+                // Also resolve and register so Named(alias_name) can find it
+                let resolved = self.resolve_type_annotation(type_ann);
+                self.interface_types.insert(name.clone(), resolved);
                 Ok(())
             }
 
@@ -1139,6 +1151,33 @@ impl TypeChecker {
                 }
                 Ok(Type::Number)
             }
+
+            ExprKind::TypeAssertion {
+                expr: inner,
+                target_type,
+            } => {
+                // Type-check the inner expression (for side effects / error detection)
+                self.check_expr(inner)?;
+                // Return the asserted type — trust the programmer
+                Ok(self.resolve_type_annotation(target_type))
+            }
+
+            ExprKind::Satisfies {
+                expr: inner,
+                target_type,
+            } => {
+                // Check inner expression and verify it's assignable to target
+                let inner_type = self.check_expr(inner)?;
+                let target = self.resolve_type_annotation(target_type);
+                if !self.is_assignable(&inner_type, &target) {
+                    return Err(CompileError::error(
+                        format!("Type '{}' does not satisfy '{}'", inner_type, target),
+                        expr.span.clone(),
+                    ));
+                }
+                // satisfies returns the original (narrower) type, not the target
+                Ok(inner_type)
+            }
         }
     }
 
@@ -1518,7 +1557,7 @@ impl TypeChecker {
                     .collect(),
             },
             TypeAnnKind::Named(name) => {
-                // Look up interface or class type
+                // Look up type alias, interface, or class type
                 if let Some(ty) = self.interface_types.get(name) {
                     return ty.clone();
                 }
@@ -1526,6 +1565,10 @@ impl TypeChecker {
                     return ty.clone();
                 }
                 Type::Unknown
+            }
+            TypeAnnKind::Typeof(name) => {
+                // Look up the variable's type in scope
+                self.lookup(name).unwrap_or(Type::Unknown)
             }
             TypeAnnKind::FunctionType {
                 params,
