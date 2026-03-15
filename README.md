@@ -142,17 +142,17 @@ TypeScript source
     Native binary
 ```
 
-Written in Rust. Single crate. ~8,200 lines of Rust + ~285 lines of C runtime.
+Written in Rust. Single crate. ~9,000 lines of Rust + ~285 lines of C runtime.
 
 The C runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It's compiled and linked into every binary.
 
 ## Status
 
-Early stage. 184 tests passing, 55 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 190 tests passing, 49 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**184 passing** / **55 not yet implemented** — 77% of test suite
+**190 passing** / **49 not yet implemented** — 80% of test suite
 
 ### Literals & Primitives
 
@@ -225,7 +225,7 @@ Early stage. 184 tests passing, 55 pending. The goal is drop-in compatibility wi
 | Complex logical | :white_check_mark: | `true && !false \|\| false` |
 | Numeric `&&` / `\|\|` | :white_check_mark: | `1 && 1`, `0 \|\| 1` |
 | Nullish coalescing `??` | :white_check_mark: | `null ?? 42` |
-| Optional chaining `?.` | :x: | `obj?.a` |
+| Optional chaining `?.` | :white_check_mark: | `obj?.a` |
 
 ### Strings
 
@@ -268,7 +268,7 @@ Early stage. 184 tests passing, 55 pending. The goal is drop-in compatibility wi
 | Ternary `? :` | :white_check_mark: | `true ? 1 : 2` |
 | `do...while` | :white_check_mark: | `do { i++ } while (i < 5)` |
 | `switch`/`case` | :white_check_mark: | `switch (x) { case 1: ... }` |
-| `for...of` | :x: | `for (let x of arr)` |
+| `for...of` | :white_check_mark: | `for (let x of arr)` |
 | `for...in` | :x: | `for (let key in obj)` |
 | Labeled statements | :x: | `outer: for (...)` |
 
@@ -290,8 +290,8 @@ Early stage. 184 tests passing, 55 pending. The goal is drop-in compatibility wi
 | Function hoisting | :x: | calling before declaration |
 | Closures | :white_check_mark: | capturing outer variables |
 | Default parameters | :white_check_mark: | `function f(x = 10)` |
-| Rest parameters | :x: | `function f(...args)` |
-| Spread syntax | :x: | `f(...arr)` |
+| Rest parameters | :white_check_mark: | `function f(...args: number[])` |
+| Spread syntax | :white_check_mark: | `[...arr, 4, 5]` |
 | Function expressions | :x: | `let f = function() {}` |
 
 ### Arrays
@@ -361,8 +361,8 @@ Early stage. 184 tests passing, 55 pending. The goal is drop-in compatibility wi
 | Class methods | :white_check_mark: | `p.toString()` |
 | Class inheritance | :white_check_mark: | `class Dog extends Animal` |
 | Interfaces | :white_check_mark: | `interface Point { x: number }` |
-| Array destructuring | :x: | `let [a, b] = [1, 2]` |
-| Object destructuring | :x: | `let { x, y } = { x: 1, y: 2 }` |
+| Array destructuring | :white_check_mark: | `let [a, b] = [1, 2]` |
+| Object destructuring | :white_check_mark: | `let { x, y } = { x: 1, y: 2 }` |
 
 ### Type System
 
