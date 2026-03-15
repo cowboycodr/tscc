@@ -55,6 +55,8 @@ pub enum StmtKind {
         specifiers: Vec<ImportSpecifier>,
         source: String,
     },
+    Break,
+    Continue,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +103,13 @@ pub enum ExprKind {
     NullLiteral,
     UndefinedLiteral,
     Identifier(String),
+    ArrayLiteral {
+        elements: Vec<Expr>,
+    },
+    IndexAccess {
+        object: Box<Expr>,
+        index: Box<Expr>,
+    },
     Binary {
         left: Box<Expr>,
         op: BinOp,
@@ -129,6 +138,11 @@ pub enum ExprKind {
         params: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: ArrowBody,
+    },
+    Conditional {
+        condition: Box<Expr>,
+        consequent: Box<Expr>,
+        alternate: Box<Expr>,
     },
     Grouping {
         expr: Box<Expr>,
@@ -166,6 +180,7 @@ pub enum BinOp {
     GreaterEqual,
     And,
     Or,
+    Power,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

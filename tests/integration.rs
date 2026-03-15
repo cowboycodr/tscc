@@ -1330,37 +1330,31 @@ mod not_yet_implemented {
     // --- Operators ---
 
     #[test]
-    #[ignore = "compound assignment operators not implemented"]
     fn plus_equals() {
         assert_eq!(run_ts("let x = 5\nx += 3\nconsole.log(x)"), "8\n");
     }
 
     #[test]
-    #[ignore = "compound assignment operators not implemented"]
     fn minus_equals() {
         assert_eq!(run_ts("let x = 10\nx -= 3\nconsole.log(x)"), "7\n");
     }
 
     #[test]
-    #[ignore = "compound assignment operators not implemented"]
     fn star_equals() {
         assert_eq!(run_ts("let x = 4\nx *= 3\nconsole.log(x)"), "12\n");
     }
 
     #[test]
-    #[ignore = "compound assignment operators not implemented"]
     fn slash_equals() {
         assert_eq!(run_ts("let x = 10\nx /= 2\nconsole.log(x)"), "5\n");
     }
 
     #[test]
-    #[ignore = "exponentiation operator not implemented"]
     fn exponentiation() {
         assert_eq!(run_ts("console.log(2 ** 10)"), "1024\n");
     }
 
     #[test]
-    #[ignore = "ternary operator not implemented"]
     fn ternary_operator() {
         assert_eq!(run_ts("console.log(true ? 1 : 2)"), "1\n");
     }
@@ -1400,7 +1394,6 @@ switch (x) {
     }
 
     #[test]
-    #[ignore = "break not implemented"]
     fn break_in_loop() {
         let src = r#"
 for (let i = 0; i < 10; i++) {
@@ -1414,7 +1407,6 @@ for (let i = 0; i < 10; i++) {
     }
 
     #[test]
-    #[ignore = "continue not implemented"]
     fn continue_in_loop() {
         let src = r#"
 for (let i = 0; i < 5; i++) {
@@ -1483,7 +1475,6 @@ outer: for (let i = 0; i < 3; i++) {
     // --- Strings ---
 
     #[test]
-    #[ignore = "template literals not implemented"]
     fn template_literal() {
         assert_eq!(
             run_ts("let x = 42\nconsole.log(`value is ${x}`)"),
@@ -1536,7 +1527,6 @@ outer: for (let i = 0; i < 3; i++) {
     // --- Arrays ---
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_literal() {
         assert_eq!(
             run_ts("let arr = [1, 2, 3]\nconsole.log(arr)"),
@@ -1545,7 +1535,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_index_access() {
         assert_eq!(
             run_ts("let arr = [10, 20, 30]\nconsole.log(arr[1])"),
@@ -1554,7 +1543,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_push() {
         assert_eq!(
             run_ts("let arr = [1, 2]\narr.push(3)\nconsole.log(arr.length)"),
@@ -1563,7 +1551,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_pop() {
         assert_eq!(
             run_ts("let arr = [1, 2, 3]\nlet x = arr.pop()\nconsole.log(x)"),
@@ -1572,7 +1559,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_length() {
         assert_eq!(
             run_ts("let arr = [1, 2, 3, 4]\nconsole.log(arr.length)"),
@@ -1832,7 +1818,6 @@ console.log(len)
     // --- Functions ---
 
     #[test]
-    #[ignore = "arrow functions as values not implemented"]
     fn arrow_function_expression() {
         let src = r#"
 let add = (a: number, b: number): number => a + b
@@ -1842,7 +1827,6 @@ console.log(add(3, 4))
     }
 
     #[test]
-    #[ignore = "arrow functions as values not implemented"]
     fn arrow_function_block() {
         let src = r#"
 let greet = (name: string): string => {

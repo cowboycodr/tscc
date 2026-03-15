@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use inkwell::attributes::{Attribute, AttributeLoc};
+use inkwell::basic_block::BasicBlock;
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
@@ -25,12 +26,17 @@ pub struct Codegen<'ctx> {
     variables: Vec<HashMap<String, (PointerValue<'ctx>, VarType)>>,
     functions: HashMap<String, FunctionValue<'ctx>>,
     string_type: StructType<'ctx>,
+    array_type: StructType<'ctx>,
     /// If true, don't generate a main() — this is a library module
     pub is_library: bool,
     /// Functions whose number params/returns are compiled as i64
     integer_functions: HashSet<String>,
     /// Current number compilation mode (Number=f64, Integer=i64)
     number_mode: VarType,
+    /// Stack of loop contexts for break/continue
+    loop_stack: Vec<LoopContext<'ctx>>,
+    /// Counter for generating unique arrow function names
+    arrow_counter: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +45,13 @@ enum VarType {
     Integer,
     String,
     Boolean,
+    Array,
+    FunctionPtr { fn_name: String },
+}
+
+struct LoopContext<'ctx> {
+    exit_bb: BasicBlock<'ctx>,
+    continue_bb: BasicBlock<'ctx>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -54,6 +67,16 @@ impl<'ctx> Codegen<'ctx> {
             false,
         );
 
+        // Array type: { double*, i64 length, i64 capacity }
+        let array_type = context.struct_type(
+            &[
+                context.ptr_type(AddressSpace::default()).into(),
+                context.i64_type().into(),
+                context.i64_type().into(),
+            ],
+            false,
+        );
+
         let mut codegen = Self {
             context,
             module,
@@ -61,9 +84,12 @@ impl<'ctx> Codegen<'ctx> {
             variables: Vec::new(),
             functions: HashMap::new(),
             string_type,
+            array_type,
             is_library: false,
             integer_functions: HashSet::new(),
             number_mode: VarType::Number,
+            loop_stack: Vec::new(),
+            arrow_counter: 0,
         };
 
         codegen.declare_runtime_functions();
@@ -238,6 +264,24 @@ impl<'ctx> Codegen<'ctx> {
         }
         self.module.add_function("mango_math_random", math_0, None);
 
+        // --- Array functions ---
+        // mango_array_push(MgArray* arr, double value) → modifies in place
+        self.module.add_function(
+            "mango_array_push",
+            void_type.fn_type(&[ptr_type.into(), f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_print_array",
+            void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "mango_eprint_array",
+            void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+
         // --- Global functions ---
         self.module.add_function(
             "mango_parseInt",
@@ -320,7 +364,10 @@ impl<'ctx> Codegen<'ctx> {
             StmtKind::Block { statements } => statements
                 .iter()
                 .all(|s| Self::is_stmt_integer_safe(s, fn_name, known)),
-            StmtKind::FunctionDecl { .. } | StmtKind::Import { .. } => true,
+            StmtKind::FunctionDecl { .. }
+            | StmtKind::Import { .. }
+            | StmtKind::Break
+            | StmtKind::Continue => true,
         }
     }
 
@@ -332,13 +379,23 @@ impl<'ctx> Codegen<'ctx> {
             | ExprKind::UndefinedLiteral
             | ExprKind::Identifier(_) => true,
             ExprKind::Binary { left, op, right } => {
-                // Division can produce floats
-                if matches!(op, BinOp::Divide) {
+                // Division and exponentiation can produce floats
+                if matches!(op, BinOp::Divide | BinOp::Power) {
                     return false;
                 }
                 Self::is_expr_integer_safe(left, fn_name, known)
                     && Self::is_expr_integer_safe(right, fn_name, known)
             }
+            ExprKind::Conditional {
+                condition,
+                consequent,
+                alternate,
+            } => {
+                Self::is_expr_integer_safe(condition, fn_name, known)
+                    && Self::is_expr_integer_safe(consequent, fn_name, known)
+                    && Self::is_expr_integer_safe(alternate, fn_name, known)
+            }
+            ExprKind::ArrayLiteral { .. } | ExprKind::IndexAccess { .. } => false,
             ExprKind::Unary { operand, .. } => Self::is_expr_integer_safe(operand, fn_name, known),
             ExprKind::Call { callee, args } => match &callee.kind {
                 // Self-recursive or known integer function
@@ -431,6 +488,12 @@ impl<'ctx> Codegen<'ctx> {
             } => {
                 let (alloca, var_type) = if let Some(init) = initializer {
                     let (val, vt) = self.compile_expr(init, function)?;
+                    // Register arrow function under the variable name
+                    if let VarType::FunctionPtr { ref fn_name } = vt {
+                        if let Some(func) = self.functions.get(fn_name).copied() {
+                            self.functions.insert(name.clone(), func);
+                        }
+                    }
                     let alloca = self.create_alloca(function, &vt, name);
                     self.builder.build_store(alloca, val).unwrap();
                     (alloca, vt)
@@ -522,9 +585,14 @@ impl<'ctx> Codegen<'ctx> {
 
                 self.builder.position_at_end(body_bb);
                 self.push_scope();
+                self.loop_stack.push(LoopContext {
+                    exit_bb,
+                    continue_bb: cond_bb,
+                });
                 for s in body {
                     self.compile_statement(s, function)?;
                 }
+                self.loop_stack.pop();
                 self.pop_scope();
                 if self
                     .builder
@@ -570,9 +638,14 @@ impl<'ctx> Codegen<'ctx> {
                 }
 
                 self.builder.position_at_end(body_bb);
+                self.loop_stack.push(LoopContext {
+                    exit_bb,
+                    continue_bb: update_bb,
+                });
                 for s in body {
                     self.compile_statement(s, function)?;
                 }
+                self.loop_stack.pop();
                 if self
                     .builder
                     .get_insert_block()
@@ -619,6 +692,40 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             StmtKind::Import { .. } => Ok(()),
+
+            StmtKind::Break => {
+                if let Some(ctx) = self.loop_stack.last() {
+                    let exit_bb = ctx.exit_bb;
+                    self.builder.build_unconditional_branch(exit_bb).unwrap();
+                    // Create dead block for any unreachable code after break
+                    let dead_bb = self.context.append_basic_block(function, "break.dead");
+                    self.builder.position_at_end(dead_bb);
+                } else {
+                    return Err(CompileError::error(
+                        "'break' can only be used inside a loop",
+                        stmt.span.clone(),
+                    ));
+                }
+                Ok(())
+            }
+
+            StmtKind::Continue => {
+                if let Some(ctx) = self.loop_stack.last() {
+                    let continue_bb = ctx.continue_bb;
+                    self.builder
+                        .build_unconditional_branch(continue_bb)
+                        .unwrap();
+                    // Create dead block for any unreachable code after continue
+                    let dead_bb = self.context.append_basic_block(function, "continue.dead");
+                    self.builder.position_at_end(dead_bb);
+                } else {
+                    return Err(CompileError::error(
+                        "'continue' can only be used inside a loop",
+                        stmt.span.clone(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -750,6 +857,126 @@ impl<'ctx> Codegen<'ctx> {
                 VarType::Number,
             )),
 
+            ExprKind::ArrayLiteral { elements } => {
+                let count = elements.len() as u64;
+                let f64_type = self.context.f64_type();
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+                // Allocate memory: malloc(count * sizeof(double))
+                let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+                    self.module.add_function(
+                        "malloc",
+                        ptr_type.fn_type(&[self.context.i64_type().into()], false),
+                        None,
+                    )
+                });
+                let capacity = if count > 0 { count } else { 4 };
+                let alloc_size = self.context.i64_type().const_int(capacity * 8, false); // 8 bytes per f64
+                let data_ptr = self
+                    .builder
+                    .build_call(malloc_fn, &[alloc_size.into()], "arr_data")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                // Store each element
+                for (i, elem) in elements.iter().enumerate() {
+                    let (val, vt) = self.compile_expr(elem, function)?;
+                    let float_val = match vt {
+                        VarType::Integer => self
+                            .builder
+                            .build_signed_int_to_float(val.into_int_value(), f64_type, "i2f")
+                            .unwrap()
+                            .into(),
+                        _ => val,
+                    };
+                    let idx = self.context.i64_type().const_int(i as u64, false);
+                    let elem_ptr = unsafe {
+                        self.builder
+                            .build_gep(f64_type, data_ptr, &[idx], "elem_ptr")
+                            .unwrap()
+                    };
+                    self.builder.build_store(elem_ptr, float_val).unwrap();
+                }
+
+                // Build array struct { data_ptr, length, capacity }
+                let arr = self.array_type.const_zero();
+                let arr = self
+                    .builder
+                    .build_insert_value(arr, data_ptr, 0, "arr.data")
+                    .unwrap();
+                let arr = self
+                    .builder
+                    .build_insert_value(
+                        arr.into_struct_value(),
+                        self.context.i64_type().const_int(count, false),
+                        1,
+                        "arr.len",
+                    )
+                    .unwrap();
+                let arr = self
+                    .builder
+                    .build_insert_value(
+                        arr.into_struct_value(),
+                        self.context.i64_type().const_int(capacity, false),
+                        2,
+                        "arr.cap",
+                    )
+                    .unwrap();
+
+                Ok((arr.into_struct_value().into(), VarType::Array))
+            }
+
+            ExprKind::IndexAccess { object, index } => {
+                let (obj_val, obj_vt) = self.compile_expr(object, function)?;
+                let (idx_val, idx_vt) = self.compile_expr(index, function)?;
+
+                if matches!(obj_vt, VarType::Array) {
+                    let data_ptr = self
+                        .builder
+                        .build_extract_value(obj_val.into_struct_value(), 0, "data")
+                        .unwrap()
+                        .into_pointer_value();
+
+                    // Convert index to i64
+                    let idx_i64 = match idx_vt {
+                        VarType::Integer => idx_val.into_int_value(),
+                        VarType::Number => self
+                            .builder
+                            .build_float_to_signed_int(
+                                idx_val.into_float_value(),
+                                self.context.i64_type(),
+                                "idx",
+                            )
+                            .unwrap(),
+                        _ => {
+                            return Err(CompileError::error(
+                                "Array index must be a number",
+                                expr.span.clone(),
+                            ));
+                        }
+                    };
+
+                    let elem_ptr = unsafe {
+                        self.builder
+                            .build_gep(self.context.f64_type(), data_ptr, &[idx_i64], "elem_ptr")
+                            .unwrap()
+                    };
+                    let val = self
+                        .builder
+                        .build_load(self.context.f64_type(), elem_ptr, "elem")
+                        .unwrap();
+                    Ok((val, VarType::Number))
+                } else {
+                    Err(CompileError::error(
+                        "Index access only supported on arrays",
+                        expr.span.clone(),
+                    ))
+                }
+            }
+
             ExprKind::Identifier(name) => {
                 let (ptr, vt) = self.get_variable(name).ok_or_else(|| {
                     CompileError::error(format!("Undefined variable '{}'", name), expr.span.clone())
@@ -809,6 +1036,43 @@ impl<'ctx> Codegen<'ctx> {
                 Ok((val, val_type))
             }
 
+            ExprKind::Conditional {
+                condition,
+                consequent,
+                alternate,
+            } => {
+                let (cond_val, _) = self.compile_expr(condition, function)?;
+                let cond_bool = self.to_bool(cond_val)?;
+
+                let then_bb = self.context.append_basic_block(function, "ternary.then");
+                let else_bb = self.context.append_basic_block(function, "ternary.else");
+                let merge_bb = self.context.append_basic_block(function, "ternary.merge");
+
+                self.builder
+                    .build_conditional_branch(cond_bool.into_int_value(), then_bb, else_bb)
+                    .unwrap();
+
+                // Then branch
+                self.builder.position_at_end(then_bb);
+                let (then_val, then_vt) = self.compile_expr(consequent, function)?;
+                let then_bb_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+                // Else branch
+                self.builder.position_at_end(else_bb);
+                let (else_val, _else_vt) = self.compile_expr(alternate, function)?;
+                let else_bb_end = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+                // Merge with phi
+                self.builder.position_at_end(merge_bb);
+                let phi_type = self.var_type_to_llvm(&then_vt);
+                let phi = self.builder.build_phi(phi_type, "ternary").unwrap();
+                phi.add_incoming(&[(&then_val, then_bb_end), (&else_val, else_bb_end)]);
+
+                Ok((phi.as_basic_value(), then_vt))
+            }
+
             ExprKind::Grouping { expr } => self.compile_expr(expr, function),
 
             ExprKind::PostfixUpdate { name, op } | ExprKind::PrefixUpdate { name, op } => {
@@ -855,10 +1119,36 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
 
-            ExprKind::ArrowFunction { .. } => Err(CompileError::error(
-                "Arrow functions as expressions not yet supported in codegen",
-                expr.span.clone(),
-            )),
+            ExprKind::ArrowFunction {
+                params,
+                return_type,
+                body,
+            } => {
+                // Generate unique function name
+                let fn_name = format!("__arrow_{}", self.arrow_counter);
+                self.arrow_counter += 1;
+
+                // Convert arrow body to statement list
+                let body_stmts = match body {
+                    ArrowBody::Expr(e) => {
+                        vec![Statement {
+                            kind: StmtKind::Return {
+                                value: Some(*e.clone()),
+                            },
+                            span: e.span.clone(),
+                        }]
+                    }
+                    ArrowBody::Block(stmts) => stmts.clone(),
+                };
+
+                self.compile_function_decl(&fn_name, params, return_type, &body_stmts)?;
+
+                // Get the compiled function as a pointer value
+                let func = self.functions.get(&fn_name).copied().unwrap();
+                let fn_ptr = func.as_global_value().as_pointer_value();
+
+                Ok((fn_ptr.into(), VarType::FunctionPtr { fn_name }))
+            }
         }
     }
 
@@ -872,6 +1162,8 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Number | VarType::Integer => "number",
             VarType::String => "string",
             VarType::Boolean => "boolean",
+            VarType::Array => "object",
+            VarType::FunctionPtr { .. } => "function",
         };
         Ok((self.create_string_literal(type_str), VarType::String))
     }
@@ -906,8 +1198,23 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
-        // String .length
+        // Object member access
         let (obj_val, obj_vt) = self.compile_expr(object, function)?;
+
+        // Array .length
+        if matches!(obj_vt, VarType::Array) && property == "length" {
+            let len = self
+                .builder
+                .build_extract_value(obj_val.into_struct_value(), 1, "arrlen")
+                .unwrap();
+            let len_f64 = self
+                .builder
+                .build_signed_int_to_float(len.into_int_value(), self.context.f64_type(), "lenf")
+                .unwrap();
+            return Ok((len_f64.into(), VarType::Number));
+        }
+
+        // String .length
         if matches!(obj_vt, VarType::String) && property == "length" {
             let len = self
                 .builder
@@ -1053,12 +1360,42 @@ impl<'ctx> Codegen<'ctx> {
                         .unwrap()
                         .into()
                 }
+                BinOp::Power => {
+                    // Convert i64 → f64, call pow, convert back
+                    let lf = self
+                        .builder
+                        .build_signed_int_to_float(li, self.context.f64_type(), "l2f")
+                        .unwrap();
+                    let rf = self
+                        .builder
+                        .build_signed_int_to_float(ri, self.context.f64_type(), "r2f")
+                        .unwrap();
+                    let pow_fn = self.module.get_function("mango_math_pow").unwrap();
+                    let result = self
+                        .builder
+                        .build_call(pow_fn, &[lf.into(), rf.into()], "pow")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap();
+                    self.builder
+                        .build_float_to_signed_int(
+                            result.into_float_value(),
+                            self.context.i64_type(),
+                            "f2i",
+                        )
+                        .unwrap()
+                        .into()
+                }
             };
 
             let result_type = match op {
-                BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
-                    VarType::Integer
-                }
+                BinOp::Add
+                | BinOp::Subtract
+                | BinOp::Multiply
+                | BinOp::Divide
+                | BinOp::Modulo
+                | BinOp::Power => VarType::Integer,
                 _ => VarType::Boolean,
             };
             return Ok((result, result_type));
@@ -1147,12 +1484,24 @@ impl<'ctx> Codegen<'ctx> {
                         .unwrap();
                     self.builder.build_or(lb, rb, "or").unwrap().into()
                 }
+                BinOp::Power => {
+                    let pow_fn = self.module.get_function("mango_math_pow").unwrap();
+                    self.builder
+                        .build_call(pow_fn, &[lf.into(), rf.into()], "pow")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                }
             };
 
             let result_type = match op {
-                BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
-                    VarType::Number
-                }
+                BinOp::Add
+                | BinOp::Subtract
+                | BinOp::Multiply
+                | BinOp::Divide
+                | BinOp::Modulo
+                | BinOp::Power => VarType::Number,
                 _ => VarType::Boolean,
             };
             return Ok((result, result_type));
@@ -1217,6 +1566,11 @@ impl<'ctx> Codegen<'ctx> {
             let (obj_val, obj_vt) = self.compile_expr(object, function)?;
             if matches!(obj_vt, VarType::String) {
                 return self.compile_string_method(obj_val, property, args, function, span);
+            }
+
+            // Array methods: object.method(args)
+            if matches!(obj_vt, VarType::Array) {
+                return self.compile_array_method(object, obj_val, property, args, function, span);
             }
         }
 
@@ -1385,6 +1739,41 @@ impl<'ctx> Codegen<'ctx> {
                     let f = self.module.get_function(print_bool).unwrap();
                     self.builder.build_call(f, &[val.into()], "").unwrap();
                 }
+                VarType::Array => {
+                    let data_ptr = self
+                        .builder
+                        .build_extract_value(val.into_struct_value(), 0, "arr_data")
+                        .unwrap();
+                    let length = self
+                        .builder
+                        .build_extract_value(val.into_struct_value(), 1, "arr_len")
+                        .unwrap();
+                    let print_arr_name = if is_stderr {
+                        "mango_eprint_array"
+                    } else {
+                        "mango_print_array"
+                    };
+                    let f = self.module.get_function(print_arr_name).unwrap();
+                    self.builder
+                        .build_call(f, &[data_ptr.into(), length.into()], "")
+                        .unwrap();
+                }
+                VarType::FunctionPtr { .. } => {
+                    // Print [Function] for function values
+                    let s = self.create_string_literal("[Function]");
+                    let ptr = self
+                        .builder
+                        .build_extract_value(s.into_struct_value(), 0, "p")
+                        .unwrap();
+                    let len = self
+                        .builder
+                        .build_extract_value(s.into_struct_value(), 1, "l")
+                        .unwrap();
+                    let f = self.module.get_function(print_str).unwrap();
+                    self.builder
+                        .build_call(f, &[ptr.into(), len.into()], "")
+                        .unwrap();
+                }
             }
         }
 
@@ -1552,6 +1941,132 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    fn compile_array_method(
+        &mut self,
+        object_expr: &Expr,
+        obj_val: BasicValueEnum<'ctx>,
+        method: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        match method {
+            "push" => {
+                let (arg_val, arg_vt) = self.compile_expr(&args[0], function)?;
+                // Convert to f64 if integer
+                let float_val: BasicValueEnum = match arg_vt {
+                    VarType::Integer => self
+                        .builder
+                        .build_signed_int_to_float(
+                            arg_val.into_int_value(),
+                            self.context.f64_type(),
+                            "i2f",
+                        )
+                        .unwrap()
+                        .into(),
+                    _ => arg_val,
+                };
+
+                // Get the alloca pointer for the array variable
+                let arr_ptr = if let ExprKind::Identifier(name) = &object_expr.kind {
+                    self.get_variable(name).map(|(ptr, _)| ptr)
+                } else {
+                    None
+                };
+
+                let arr_ptr = arr_ptr.ok_or_else(|| {
+                    CompileError::error("push requires a variable target", span.clone())
+                })?;
+
+                // Call mango_array_push(arr_ptr, value) — modifies in place
+                let push_fn = self.module.get_function("mango_array_push").unwrap();
+                self.builder
+                    .build_call(push_fn, &[arr_ptr.into(), float_val.into()], "")
+                    .unwrap();
+
+                // Reload the array to get updated length
+                let updated = self
+                    .builder
+                    .build_load(self.array_type, arr_ptr, "arr_updated")
+                    .unwrap();
+                let new_len = self
+                    .builder
+                    .build_extract_value(updated.into_struct_value(), 1, "new_len")
+                    .unwrap();
+                let len_f64 = self
+                    .builder
+                    .build_signed_int_to_float(
+                        new_len.into_int_value(),
+                        self.context.f64_type(),
+                        "lenf",
+                    )
+                    .unwrap();
+                Ok((len_f64.into(), VarType::Number))
+            }
+            "pop" => {
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 0, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let length = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 1, "len")
+                    .unwrap()
+                    .into_int_value();
+
+                // new_length = length - 1
+                let one = self.context.i64_type().const_int(1, false);
+                let new_len = self.builder.build_int_sub(length, one, "new_len").unwrap();
+
+                // Load the last element: data[new_length]
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_gep(self.context.f64_type(), data_ptr, &[new_len], "pop_ptr")
+                        .unwrap()
+                };
+                let popped = self
+                    .builder
+                    .build_load(self.context.f64_type(), elem_ptr, "popped")
+                    .unwrap();
+
+                // Update array struct with new length
+                let capacity = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 2, "cap")
+                    .unwrap();
+                let new_arr = self.array_type.const_zero();
+                let new_arr = self
+                    .builder
+                    .build_insert_value(new_arr, data_ptr, 0, "arr.data")
+                    .unwrap();
+                let new_arr = self
+                    .builder
+                    .build_insert_value(new_arr.into_struct_value(), new_len, 1, "arr.len")
+                    .unwrap();
+                let new_arr = self
+                    .builder
+                    .build_insert_value(new_arr.into_struct_value(), capacity, 2, "arr.cap")
+                    .unwrap();
+
+                // Store updated array back
+                if let ExprKind::Identifier(name) = &object_expr.kind {
+                    if let Some((ptr, _)) = self.get_variable(name) {
+                        self.builder
+                            .build_store(ptr, new_arr.into_struct_value())
+                            .unwrap();
+                    }
+                }
+
+                Ok((popped, VarType::Number))
+            }
+            _ => Err(CompileError::error(
+                format!("Unknown array method '{}'", method),
+                span.clone(),
+            )),
+        }
+    }
+
     fn compile_global_func(
         &mut self,
         name: &str,
@@ -1649,6 +2164,11 @@ impl<'ctx> Codegen<'ctx> {
                     .left()
                     .unwrap())
             }
+            VarType::Array => {
+                // Arrays don't have a to_string yet; return "[object Array]"
+                Ok(self.create_string_literal("[object Array]"))
+            }
+            VarType::FunctionPtr { .. } => Ok(self.create_string_literal("[Function]")),
         }
     }
 
@@ -1723,6 +2243,8 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Integer => self.context.i64_type().into(),
             VarType::String => self.string_type.into(),
             VarType::Boolean => self.context.bool_type().into(),
+            VarType::Array => self.array_type.into(),
+            VarType::FunctionPtr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
         }
     }
 
@@ -1741,6 +2263,12 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Integer => self.context.i64_type().const_int(0, false).into(),
             VarType::String => self.create_string_literal(""),
             VarType::Boolean => self.context.bool_type().const_int(0, false).into(),
+            VarType::Array => self.array_type.const_zero().into(),
+            VarType::FunctionPtr { .. } => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
         }
     }
 

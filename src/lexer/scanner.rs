@@ -51,8 +51,23 @@ impl Scanner {
             ':' => self.add_token(Token::Colon),
             ';' => self.add_token(Token::Semicolon),
             ',' => self.add_token(Token::Comma),
-            '%' => self.add_token(Token::Percent),
-            '*' => self.add_token(Token::Star),
+            '%' => {
+                if self.match_char('=') {
+                    self.add_token(Token::PercentEqual);
+                } else {
+                    self.add_token(Token::Percent);
+                }
+            }
+            '*' => {
+                if self.match_char('*') {
+                    self.add_token(Token::StarStar);
+                } else if self.match_char('=') {
+                    self.add_token(Token::StarEqual);
+                } else {
+                    self.add_token(Token::Star);
+                }
+            }
+            '?' => self.add_token(Token::Question),
 
             '.' => {
                 if self.check('.') && self.check_next('.') {
@@ -67,6 +82,8 @@ impl Scanner {
             '+' => {
                 if self.match_char('+') {
                     self.add_token(Token::PlusPlus);
+                } else if self.match_char('=') {
+                    self.add_token(Token::PlusEqual);
                 } else {
                     self.add_token(Token::Plus);
                 }
@@ -75,6 +92,8 @@ impl Scanner {
             '-' => {
                 if self.match_char('-') {
                     self.add_token(Token::MinusMinus);
+                } else if self.match_char('=') {
+                    self.add_token(Token::MinusEqual);
                 } else {
                     self.add_token(Token::Minus);
                 }
@@ -145,6 +164,8 @@ impl Scanner {
                     }
                 } else if self.match_char('*') {
                     self.block_comment()?;
+                } else if self.match_char('=') {
+                    self.add_token(Token::SlashEqual);
                 } else {
                     self.add_token(Token::Slash);
                 }
@@ -159,9 +180,7 @@ impl Scanner {
 
             '"' => self.string('"')?,
             '\'' => self.string('\'')?,
-            '`' => {
-                return Err(self.error("Template literals are not yet supported"));
-            }
+            '`' => self.template_literal()?,
 
             c if c.is_ascii_digit() => self.number()?,
 
@@ -250,6 +269,8 @@ impl Scanner {
             "while" => Token::While,
             "for" => Token::For,
             "of" => Token::Of,
+            "break" => Token::Break,
+            "continue" => Token::Continue,
             "true" => Token::True,
             "false" => Token::False,
             "null" => Token::Null,
@@ -267,6 +288,178 @@ impl Scanner {
             _ => Token::Identifier(text),
         };
         self.add_token(token);
+    }
+
+    fn template_literal(&mut self) -> Result<(), CompileError> {
+        // Opening backtick already consumed by scan_token
+        let template_span = Span::new(self.start, self.current, self.line, self.start_column);
+
+        // Collect parts: (is_text, content)
+        let mut parts: Vec<(bool, String)> = Vec::new();
+        let mut current_text = String::new();
+
+        while !self.is_at_end() && self.peek() != '`' {
+            if self.peek() == '\\' {
+                self.advance();
+                match self.peek() {
+                    'n' => current_text.push('\n'),
+                    't' => current_text.push('\t'),
+                    'r' => current_text.push('\r'),
+                    '\\' => current_text.push('\\'),
+                    '`' => current_text.push('`'),
+                    '$' => current_text.push('$'),
+                    '0' => current_text.push('\0'),
+                    c => {
+                        current_text.push('\\');
+                        current_text.push(c);
+                    }
+                }
+                self.advance();
+            } else if self.peek() == '$' && self.peek_next() == '{' {
+                // Save current text part
+                parts.push((true, current_text.clone()));
+                current_text.clear();
+
+                self.advance(); // skip $
+                self.advance(); // skip {
+
+                // Collect expression source until matching }
+                let expr_start = self.current;
+                let mut depth = 1;
+                while !self.is_at_end() && depth > 0 {
+                    let c = self.peek();
+                    match c {
+                        '{' => {
+                            depth += 1;
+                            self.advance();
+                        }
+                        '}' => {
+                            depth -= 1;
+                            if depth > 0 {
+                                self.advance();
+                            }
+                        }
+                        '\'' | '"' => {
+                            let quote = c;
+                            self.advance();
+                            while !self.is_at_end() && self.peek() != quote {
+                                if self.peek() == '\\' {
+                                    self.advance();
+                                }
+                                if !self.is_at_end() {
+                                    self.advance();
+                                }
+                            }
+                            if !self.is_at_end() {
+                                self.advance(); // skip closing quote
+                            }
+                        }
+                        '\n' => {
+                            self.line += 1;
+                            self.column = 1;
+                            self.advance();
+                        }
+                        _ => {
+                            self.advance();
+                        }
+                    }
+                }
+
+                if depth > 0 {
+                    return Err(self.error("Unterminated template expression"));
+                }
+
+                let expr_source: String = self.source[expr_start..self.current].iter().collect();
+                self.advance(); // skip closing }
+
+                parts.push((false, expr_source));
+            } else {
+                if self.peek() == '\n' {
+                    self.line += 1;
+                    self.column = 1;
+                }
+                current_text.push(self.peek());
+                self.advance();
+            }
+        }
+
+        if self.is_at_end() {
+            return Err(self.error("Unterminated template literal"));
+        }
+        self.advance(); // skip closing `
+
+        // Don't forget remaining text
+        if !current_text.is_empty() {
+            parts.push((true, current_text));
+        }
+
+        // Check if there are any expressions
+        let has_expr = parts.iter().any(|(is_text, _)| !is_text);
+
+        if !has_expr {
+            // No expressions — just concat all text parts and emit as string
+            let combined: String = parts.iter().map(|(_, s)| s.as_str()).collect();
+            self.tokens
+                .push(SpannedToken::new(Token::String(combined), template_span));
+            return Ok(());
+        }
+
+        // Has expressions — desugar to string concatenation: ("" + text + (expr) + ...)
+        let span = template_span;
+
+        // Check if we need a "" prefix to ensure string context
+        let need_prefix = !parts
+            .iter()
+            .any(|(is_text, content)| *is_text && !content.is_empty());
+
+        self.tokens
+            .push(SpannedToken::new(Token::LeftParen, span.clone()));
+
+        if need_prefix {
+            self.tokens.push(SpannedToken::new(
+                Token::String(String::new()),
+                span.clone(),
+            ));
+        }
+
+        let mut emitted = need_prefix;
+
+        for (is_text, content) in &parts {
+            if *is_text && content.is_empty() {
+                continue; // skip empty text parts
+            }
+
+            if emitted {
+                self.tokens
+                    .push(SpannedToken::new(Token::Plus, span.clone()));
+            }
+
+            if *is_text {
+                self.tokens.push(SpannedToken::new(
+                    Token::String(content.clone()),
+                    span.clone(),
+                ));
+            } else {
+                // Wrap expression in parens to preserve evaluation order
+                self.tokens
+                    .push(SpannedToken::new(Token::LeftParen, span.clone()));
+                let sub_scanner = Scanner::new(content);
+                let sub_tokens = sub_scanner.scan_tokens()?;
+                for t in sub_tokens {
+                    if !matches!(t.token, Token::Eof) {
+                        self.tokens.push(SpannedToken::new(t.token, span.clone()));
+                    }
+                }
+                self.tokens
+                    .push(SpannedToken::new(Token::RightParen, span.clone()));
+            }
+
+            emitted = true;
+        }
+
+        self.tokens.push(SpannedToken::new(Token::RightParen, span));
+
+        Ok(())
     }
 
     fn block_comment(&mut self) -> Result<(), CompileError> {

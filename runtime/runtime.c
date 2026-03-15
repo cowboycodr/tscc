@@ -214,6 +214,43 @@ double mango_math_random(void) {
 }
 
 // ============================================================
+// Array functions
+// ============================================================
+typedef struct {
+    double* data;
+    long long length;
+    long long capacity;
+} MgArray;
+
+// Takes a pointer to the array struct and modifies it in place
+void mango_array_push(MgArray* arr, double value) {
+    if (arr->length >= arr->capacity) {
+        arr->capacity = arr->capacity < 4 ? 4 : arr->capacity * 2;
+        arr->data = (double*)realloc(arr->data, sizeof(double) * (size_t)arr->capacity);
+        if (!arr->data) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    }
+    arr->data[arr->length++] = value;
+}
+
+void mango_print_array(double* data, long long length) {
+    printf("[ ");
+    for (long long i = 0; i < length; i++) {
+        if (i > 0) printf(", ");
+        mango_print_number(data[i]);
+    }
+    printf(" ]");
+}
+
+void mango_eprint_array(double* data, long long length) {
+    fprintf(stderr, "[ ");
+    for (long long i = 0; i < length; i++) {
+        if (i > 0) fprintf(stderr, ", ");
+        mango_eprint_number(data[i]);
+    }
+    fprintf(stderr, " ]");
+}
+
+// ============================================================
 // Global functions
 // ============================================================
 double mango_parseInt(char* data, long long len) {

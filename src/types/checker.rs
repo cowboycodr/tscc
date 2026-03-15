@@ -271,6 +271,11 @@ impl TypeChecker {
                 // Import resolution is handled before type checking
                 Ok(())
             }
+
+            StmtKind::Break | StmtKind::Continue => {
+                // Validation that we're inside a loop could be added here
+                Ok(())
+            }
         }
     }
 
@@ -285,6 +290,29 @@ impl TypeChecker {
             ExprKind::Identifier(name) => self.lookup(name).ok_or_else(|| {
                 CompileError::error(format!("Cannot find name '{}'", name), expr.span.clone())
             }),
+
+            ExprKind::ArrayLiteral { elements } => {
+                let mut elem_type = Type::Unknown;
+                for elem in elements {
+                    let t = self.check_expr(elem)?;
+                    if elem_type == Type::Unknown {
+                        elem_type = t;
+                    }
+                }
+                if elem_type == Type::Unknown {
+                    elem_type = Type::Number; // default for empty arrays
+                }
+                Ok(Type::Array(Box::new(elem_type)))
+            }
+
+            ExprKind::IndexAccess { object, index } => {
+                let obj_type = self.check_expr(object)?;
+                self.check_expr(index)?;
+                match &obj_type {
+                    Type::Array(elem) => Ok(*elem.clone()),
+                    _ => Ok(Type::Unknown),
+                }
+            }
 
             ExprKind::Binary { left, op, right } => {
                 let left_type = self.check_expr(left)?;
@@ -334,6 +362,10 @@ impl TypeChecker {
                     let obj_type = self.check_expr(object)?;
                     if obj_type == Type::String {
                         return self.check_string_method_call(property, args, &expr.span);
+                    }
+                    // Array methods called on expressions
+                    if let Type::Array(ref elem_type) = obj_type {
+                        return self.check_array_method_call(property, args, elem_type, &expr.span);
                     }
                 }
 
@@ -405,6 +437,26 @@ impl TypeChecker {
                 }
 
                 let obj_type = self.check_expr(object)?;
+
+                // Array properties and methods
+                if let Type::Array(ref elem_type) = obj_type {
+                    match property.as_str() {
+                        "length" => return Ok(Type::Number),
+                        "push" => {
+                            return Ok(Type::Function {
+                                params: vec![*elem_type.clone()],
+                                return_type: Box::new(Type::Number),
+                            });
+                        }
+                        "pop" => {
+                            return Ok(Type::Function {
+                                params: vec![],
+                                return_type: Box::new(*elem_type.clone()),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
 
                 // String properties and methods
                 if obj_type == Type::String {
@@ -526,6 +578,26 @@ impl TypeChecker {
                     params: param_types,
                     return_type: Box::new(final_ret),
                 })
+            }
+
+            ExprKind::Conditional {
+                condition,
+                consequent,
+                alternate,
+            } => {
+                self.check_expr(condition)?;
+                let then_type = self.check_expr(consequent)?;
+                let else_type = self.check_expr(alternate)?;
+                if then_type == else_type {
+                    Ok(then_type)
+                } else if then_type == Type::Unknown {
+                    Ok(else_type)
+                } else if else_type == Type::Unknown {
+                    Ok(then_type)
+                } else {
+                    // Different types — return Unknown for now (union types later)
+                    Ok(Type::Unknown)
+                }
             }
 
             ExprKind::Grouping { expr } => self.check_expr(expr),
@@ -656,6 +728,37 @@ impl TypeChecker {
         }
     }
 
+    fn check_array_method_call(
+        &mut self,
+        method: &str,
+        args: &[Expr],
+        elem_type: &Type,
+        span: &Span,
+    ) -> Result<Type, CompileError> {
+        match method {
+            "push" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        format!("push expects 1 argument, got {}", args.len()),
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                Ok(Type::Number) // push returns new length
+            }
+            "pop" => {
+                if !args.is_empty() {
+                    return Err(CompileError::error("pop takes no arguments", span.clone()));
+                }
+                Ok(elem_type.clone())
+            }
+            _ => Err(CompileError::error(
+                format!("Property '{}' does not exist on type 'array'", method),
+                span.clone(),
+            )),
+        }
+    }
+
     fn check_binary_op(
         &self,
         left: &Type,
@@ -679,7 +782,7 @@ impl TypeChecker {
                     ))
                 }
             }
-            BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
+            BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo | BinOp::Power => {
                 if left == &Type::Number && right == &Type::Number {
                     Ok(Type::Number)
                 } else {

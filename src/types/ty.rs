@@ -10,6 +10,7 @@ pub enum Type {
         params: Vec<Type>,
         return_type: Box<Type>,
     },
+    Array(Box<Type>),
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -36,6 +37,7 @@ impl std::fmt::Display for Type {
                 }
                 write!(f, ") => {}", return_type)
             }
+            Type::Array(elem) => write!(f, "{}[]", elem),
             Type::Unknown => write!(f, "unknown"),
         }
     }

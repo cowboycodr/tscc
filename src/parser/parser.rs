@@ -30,6 +30,8 @@ impl Parser {
             Token::While => self.while_statement(),
             Token::For => self.for_statement(),
             Token::Return => self.return_statement(),
+            Token::Break => self.break_statement(),
+            Token::Continue => self.continue_statement(),
             Token::LeftBrace => self.block_statement(),
             Token::Import => self.import_declaration(),
             Token::Export => self.export_declaration(),
@@ -293,6 +295,26 @@ impl Parser {
         })
     }
 
+    fn break_statement(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'break'
+        self.consume_semicolon()?;
+        Ok(Statement {
+            kind: StmtKind::Break,
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn continue_statement(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'continue'
+        self.consume_semicolon()?;
+        Ok(Statement {
+            kind: StmtKind::Continue,
+            span: self.span_from(&start_span),
+        })
+    }
+
     fn block_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         self.advance();
@@ -368,7 +390,7 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Result<Expr, CompileError> {
-        let expr = self.logical_or()?;
+        let expr = self.ternary()?;
 
         if self.match_token(&Token::Assign) {
             let value = self.assignment()?;
@@ -387,6 +409,72 @@ impl Parser {
                 });
             }
             return Err(CompileError::error("Invalid assignment target", expr.span));
+        }
+
+        // Compound assignment: desugar x += y → x = x + y
+        let compound_op = match self.peek_token() {
+            Token::PlusEqual => Some(BinOp::Add),
+            Token::MinusEqual => Some(BinOp::Subtract),
+            Token::StarEqual => Some(BinOp::Multiply),
+            Token::SlashEqual => Some(BinOp::Divide),
+            Token::PercentEqual => Some(BinOp::Modulo),
+            _ => None,
+        };
+
+        if let Some(op) = compound_op {
+            self.advance();
+            let rhs = self.assignment()?;
+            if let ExprKind::Identifier(name) = &expr.kind {
+                let binary = Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        rhs.span.end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::Binary {
+                        left: Box::new(expr.clone()),
+                        op,
+                        right: Box::new(rhs),
+                    },
+                };
+                return Ok(Expr {
+                    span: binary.span.clone(),
+                    kind: ExprKind::Assignment {
+                        name: name.clone(),
+                        value: Box::new(binary),
+                    },
+                });
+            }
+            return Err(CompileError::error(
+                "Invalid compound assignment target",
+                expr.span,
+            ));
+        }
+
+        Ok(expr)
+    }
+
+    fn ternary(&mut self) -> Result<Expr, CompileError> {
+        let expr = self.logical_or()?;
+
+        if self.match_token(&Token::Question) {
+            let consequent = self.assignment()?;
+            self.expect(&Token::Colon, "Expected ':' in ternary expression")?;
+            let alternate = self.assignment()?;
+            return Ok(Expr {
+                span: Span::new(
+                    expr.span.start,
+                    alternate.span.end,
+                    expr.span.line,
+                    expr.span.column,
+                ),
+                kind: ExprKind::Conditional {
+                    condition: Box::new(expr),
+                    consequent: Box::new(consequent),
+                    alternate: Box::new(alternate),
+                },
+            });
         }
 
         Ok(expr)
@@ -520,7 +608,7 @@ impl Parser {
     }
 
     fn multiplicative(&mut self) -> Result<Expr, CompileError> {
-        let mut left = self.unary()?;
+        let mut left = self.exponentiation()?;
         loop {
             let op = match self.peek_token() {
                 Token::Star => BinOp::Multiply,
@@ -529,7 +617,7 @@ impl Parser {
                 _ => break,
             };
             self.advance();
-            let right = self.unary()?;
+            let right = self.exponentiation()?;
             left = Expr {
                 span: Span::new(
                     left.span.start,
@@ -545,6 +633,30 @@ impl Parser {
             };
         }
         Ok(left)
+    }
+
+    fn exponentiation(&mut self) -> Result<Expr, CompileError> {
+        let base = self.unary()?;
+
+        if self.match_token(&Token::StarStar) {
+            // Right-associative: 2 ** 3 ** 2 = 2 ** (3 ** 2)
+            let exp = self.exponentiation()?;
+            return Ok(Expr {
+                span: Span::new(
+                    base.span.start,
+                    exp.span.end,
+                    base.span.line,
+                    base.span.column,
+                ),
+                kind: ExprKind::Binary {
+                    left: Box::new(base),
+                    op: BinOp::Power,
+                    right: Box::new(exp),
+                },
+            });
+        }
+
+        Ok(base)
     }
 
     fn unary(&mut self) -> Result<Expr, CompileError> {
@@ -689,6 +801,21 @@ impl Parser {
                         property,
                     },
                 };
+            } else if self.match_token(&Token::LeftBracket) {
+                let index = self.expression()?;
+                self.expect(&Token::RightBracket, "Expected ']' after index")?;
+                expr = Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        self.previous_span().end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::IndexAccess {
+                        object: Box::new(expr.clone()),
+                        index: Box::new(index),
+                    },
+                };
             } else {
                 break;
             }
@@ -748,6 +875,23 @@ impl Parser {
                 let name = self.expect_identifier("")?;
                 Ok(Expr {
                     kind: ExprKind::Identifier(name),
+                    span: self.span_from(&span),
+                })
+            }
+            Token::LeftBracket => {
+                self.advance();
+                let mut elements = Vec::new();
+                if !self.check(&Token::RightBracket) {
+                    loop {
+                        elements.push(self.expression()?);
+                        if !self.match_token(&Token::Comma) {
+                            break;
+                        }
+                    }
+                }
+                self.expect(&Token::RightBracket, "Expected ']' after array elements")?;
+                Ok(Expr {
+                    kind: ExprKind::ArrayLiteral { elements },
                     span: self.span_from(&span),
                 })
             }
