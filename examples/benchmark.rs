@@ -6,6 +6,6 @@ fn fib(n: f64) -> f64 {
 }
 
 fn main() {
-    let result = fib(50.0);
+    let result = fib(40.0);
     println!("{}", result);
 }

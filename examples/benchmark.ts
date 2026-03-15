@@ -5,5 +5,5 @@ function fib(n: number): number {
     return fib(n - 1) + fib(n - 2);
 }
 
-let result: number = fib(50);
+let result: number = fib(40);
 console.log(result);
