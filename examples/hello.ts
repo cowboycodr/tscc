@@ -1,47 +1,27 @@
-// Mango example: compiled TypeScript
-
-function add(a: number, b: number): number {
-    return a + b;
-}
+// hello.ts — Your first Mango program
+// Compile: mango build examples/hello.ts
+// Run:     mango run examples/hello.ts
 
 function greet(name: string): string {
-    return "Hello, " + name + "!";
+    return `Hello, ${name}!`
 }
 
-// Arithmetic
-let result: number = add(3, 4);
-console.log(result);
+let message = greet("World")
+console.log(message)
 
-let product: number = result * 6;
-console.log(product);
-
-// String operations
-let message: string = greet("Mango");
-console.log(message);
+// Arrays
+let numbers = [10, 20, 30, 40, 50]
+console.log("Numbers:", numbers)
+console.log("Third element:", numbers[2])
+console.log("Length:", numbers.length)
 
 // Control flow
-if (result > 5) {
-    console.log("result is greater than 5");
-} else {
-    console.log("result is 5 or less");
+for (let i = 0; i < 5; i++) {
+    if (i % 2 === 0) {
+        console.log(i, "is even")
+    }
 }
 
-// While loop
-let count: number = 0;
-while (count < 5) {
-    console.log(count);
-    count = count + 1;
-}
-
-// For loop
-for (let i: number = 0; i < 3; i++) {
-    console.log("iteration: " + i);
-}
-
-// Boolean expressions
-let flag: boolean = true;
-console.log(flag);
-console.log(!flag);
-
-// Multiple args to console.log
-console.log("sum:", add(10, 20));
+// Arrow functions
+let double = (x: number): number => x * 2
+console.log("double(21) =", double(21))

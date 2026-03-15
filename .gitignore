@@ -1,1 +1,11 @@
 /target
+*.o
+*.out
+
+# Compiled binaries from examples
+/examples/*.out
+/benchmark
+/test
+/hello
+/stdlib
+/imports
