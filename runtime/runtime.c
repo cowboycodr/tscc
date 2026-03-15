@@ -16,7 +16,7 @@ typedef struct {
 // ============================================================
 // Print functions
 // ============================================================
-void mango_print_number(double n) {
+void tscc_print_number(double n) {
     if (n == (long long)n && !isinf(n) && fabs(n) < 1e15) {
         printf("%lld", (long long)n);
     } else {
@@ -24,28 +24,28 @@ void mango_print_number(double n) {
     }
 }
 
-void mango_print_string(char* data, long long len) {
+void tscc_print_string(char* data, long long len) {
     fwrite(data, 1, (size_t)len, stdout);
 }
 
-void mango_print_boolean(int b) {
+void tscc_print_boolean(int b) {
     printf(b ? "true" : "false");
 }
 
-void mango_print_null(void) {
+void tscc_print_null(void) {
     printf("null");
 }
 
-void mango_print_undefined(void) {
+void tscc_print_undefined(void) {
     printf("undefined");
 }
 
-void mango_print_newline(void) {
+void tscc_print_newline(void) {
     printf("\n");
 }
 
 // console.error / console.warn write to stderr
-void mango_eprint_number(double n) {
+void tscc_eprint_number(double n) {
     if (n == (long long)n && !isinf(n) && fabs(n) < 1e15) {
         fprintf(stderr, "%lld", (long long)n);
     } else {
@@ -53,25 +53,25 @@ void mango_eprint_number(double n) {
     }
 }
 
-void mango_eprint_string(char* data, long long len) {
+void tscc_eprint_string(char* data, long long len) {
     fwrite(data, 1, (size_t)len, stderr);
 }
 
-void mango_eprint_boolean(int b) {
+void tscc_eprint_boolean(int b) {
     fprintf(stderr, b ? "true" : "false");
 }
 
-void mango_eprint_newline(void) {
+void tscc_eprint_newline(void) {
     fprintf(stderr, "\n");
 }
 
 // ============================================================
 // String operations
 // ============================================================
-MgString mango_string_concat(char* a_data, long long a_len, char* b_data, long long b_len) {
+MgString tscc_string_concat(char* a_data, long long a_len, char* b_data, long long b_len) {
     long long new_len = a_len + b_len;
     char* new_data = (char*)malloc((size_t)(new_len + 1));
-    if (!new_data) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!new_data) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     memcpy(new_data, a_data, (size_t)a_len);
     memcpy(new_data + a_len, b_data, (size_t)b_len);
     new_data[new_len] = '\0';
@@ -79,7 +79,7 @@ MgString mango_string_concat(char* a_data, long long a_len, char* b_data, long l
     return result;
 }
 
-MgString mango_number_to_string(double n) {
+MgString tscc_number_to_string(double n) {
     char buf[64];
     int len;
     if (n == (long long)n && !isinf(n) && fabs(n) < 1e15) {
@@ -88,13 +88,13 @@ MgString mango_number_to_string(double n) {
         len = snprintf(buf, sizeof(buf), "%.15g", n);
     }
     char* data = (char*)malloc((size_t)(len + 1));
-    if (!data) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!data) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     memcpy(data, buf, (size_t)(len + 1));
     MgString result = { data, len };
     return result;
 }
 
-MgString mango_boolean_to_string(int b) {
+MgString tscc_boolean_to_string(int b) {
     if (b) {
         MgString r = { "true", 4 }; return r;
     } else {
@@ -105,34 +105,34 @@ MgString mango_boolean_to_string(int b) {
 // ============================================================
 // String methods
 // ============================================================
-MgString mango_string_toUpperCase(char* data, long long len) {
+MgString tscc_string_toUpperCase(char* data, long long len) {
     char* out = (char*)malloc((size_t)(len + 1));
-    if (!out) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     for (long long i = 0; i < len; i++) out[i] = (char)toupper((unsigned char)data[i]);
     out[len] = '\0';
     MgString r = { out, len }; return r;
 }
 
-MgString mango_string_toLowerCase(char* data, long long len) {
+MgString tscc_string_toLowerCase(char* data, long long len) {
     char* out = (char*)malloc((size_t)(len + 1));
-    if (!out) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     for (long long i = 0; i < len; i++) out[i] = (char)tolower((unsigned char)data[i]);
     out[len] = '\0';
     MgString r = { out, len }; return r;
 }
 
-MgString mango_string_charAt(char* data, long long len, double index) {
+MgString tscc_string_charAt(char* data, long long len, double index) {
     long long idx = (long long)index;
     if (idx < 0 || idx >= len) {
         MgString r = { "", 0 }; return r;
     }
     char* out = (char*)malloc(2);
-    if (!out) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     out[0] = data[idx]; out[1] = '\0';
     MgString r = { out, 1 }; return r;
 }
 
-double mango_string_indexOf(char* haystack, long long hay_len, char* needle, long long needle_len) {
+double tscc_string_indexOf(char* haystack, long long hay_len, char* needle, long long needle_len) {
     if (needle_len == 0) return 0;
     if (needle_len > hay_len) return -1;
     for (long long i = 0; i <= hay_len - needle_len; i++) {
@@ -141,11 +141,11 @@ double mango_string_indexOf(char* haystack, long long hay_len, char* needle, lon
     return -1;
 }
 
-int mango_string_includes(char* haystack, long long hay_len, char* needle, long long needle_len) {
-    return mango_string_indexOf(haystack, hay_len, needle, needle_len) >= 0 ? 1 : 0;
+int tscc_string_includes(char* haystack, long long hay_len, char* needle, long long needle_len) {
+    return tscc_string_indexOf(haystack, hay_len, needle, needle_len) >= 0 ? 1 : 0;
 }
 
-MgString mango_string_substring(char* data, long long len, double start_d, double end_d) {
+MgString tscc_string_substring(char* data, long long len, double start_d, double end_d) {
     long long start = (long long)start_d;
     long long end = (long long)end_d;
     if (start < 0) start = 0;
@@ -153,13 +153,13 @@ MgString mango_string_substring(char* data, long long len, double start_d, doubl
     if (start > end) { long long t = start; start = end; end = t; }
     long long sub_len = end - start;
     char* out = (char*)malloc((size_t)(sub_len + 1));
-    if (!out) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     memcpy(out, &data[start], (size_t)sub_len);
     out[sub_len] = '\0';
     MgString r = { out, sub_len }; return r;
 }
 
-MgString mango_string_slice(char* data, long long len, double start_d, double end_d) {
+MgString tscc_string_slice(char* data, long long len, double start_d, double end_d) {
     long long start = (long long)start_d;
     long long end = (long long)end_d;
     if (start < 0) { start = len + start; if (start < 0) start = 0; }
@@ -168,19 +168,19 @@ MgString mango_string_slice(char* data, long long len, double start_d, double en
     if (start >= end) { MgString r = { "", 0 }; return r; }
     long long sub_len = end - start;
     char* out = (char*)malloc((size_t)(sub_len + 1));
-    if (!out) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     memcpy(out, &data[start], (size_t)sub_len);
     out[sub_len] = '\0';
     MgString r = { out, sub_len }; return r;
 }
 
-MgString mango_string_trim(char* data, long long len) {
+MgString tscc_string_trim(char* data, long long len) {
     long long start = 0, end = len;
     while (start < len && isspace((unsigned char)data[start])) start++;
     while (end > start && isspace((unsigned char)data[end - 1])) end--;
     long long new_len = end - start;
     char* out = (char*)malloc((size_t)(new_len + 1));
-    if (!out) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+    if (!out) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     memcpy(out, &data[start], (size_t)new_len);
     out[new_len] = '\0';
     MgString r = { out, new_len }; return r;
@@ -189,26 +189,26 @@ MgString mango_string_trim(char* data, long long len) {
 // ============================================================
 // Math functions
 // ============================================================
-static int _mango_rng_seeded = 0;
+static int _tscc_rng_seeded = 0;
 
-double mango_math_floor(double x) { return floor(x); }
-double mango_math_ceil(double x) { return ceil(x); }
-double mango_math_round(double x) { return round(x); }
-double mango_math_abs(double x) { return fabs(x); }
-double mango_math_sqrt(double x) { return sqrt(x); }
-double mango_math_pow(double x, double y) { return pow(x, y); }
-double mango_math_min(double a, double b) { return a < b ? a : b; }
-double mango_math_max(double a, double b) { return a > b ? a : b; }
-double mango_math_sin(double x) { return sin(x); }
-double mango_math_cos(double x) { return cos(x); }
-double mango_math_tan(double x) { return tan(x); }
-double mango_math_log(double x) { return log(x); }
-double mango_math_exp(double x) { return exp(x); }
+double tscc_math_floor(double x) { return floor(x); }
+double tscc_math_ceil(double x) { return ceil(x); }
+double tscc_math_round(double x) { return round(x); }
+double tscc_math_abs(double x) { return fabs(x); }
+double tscc_math_sqrt(double x) { return sqrt(x); }
+double tscc_math_pow(double x, double y) { return pow(x, y); }
+double tscc_math_min(double a, double b) { return a < b ? a : b; }
+double tscc_math_max(double a, double b) { return a > b ? a : b; }
+double tscc_math_sin(double x) { return sin(x); }
+double tscc_math_cos(double x) { return cos(x); }
+double tscc_math_tan(double x) { return tan(x); }
+double tscc_math_log(double x) { return log(x); }
+double tscc_math_exp(double x) { return exp(x); }
 
-double mango_math_random(void) {
-    if (!_mango_rng_seeded) {
+double tscc_math_random(void) {
+    if (!_tscc_rng_seeded) {
         srand((unsigned int)time(NULL));
-        _mango_rng_seeded = 1;
+        _tscc_rng_seeded = 1;
     }
     return (double)rand() / (double)RAND_MAX;
 }
@@ -223,29 +223,29 @@ typedef struct {
 } MgArray;
 
 // Takes a pointer to the array struct and modifies it in place
-void mango_array_push(MgArray* arr, double value) {
+void tscc_array_push(MgArray* arr, double value) {
     if (arr->length >= arr->capacity) {
         arr->capacity = arr->capacity < 4 ? 4 : arr->capacity * 2;
         arr->data = (double*)realloc(arr->data, sizeof(double) * (size_t)arr->capacity);
-        if (!arr->data) { fprintf(stderr, "mango: out of memory\n"); exit(1); }
+        if (!arr->data) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
     }
     arr->data[arr->length++] = value;
 }
 
-void mango_print_array(double* data, long long length) {
+void tscc_print_array(double* data, long long length) {
     printf("[ ");
     for (long long i = 0; i < length; i++) {
         if (i > 0) printf(", ");
-        mango_print_number(data[i]);
+        tscc_print_number(data[i]);
     }
     printf(" ]");
 }
 
-void mango_eprint_array(double* data, long long length) {
+void tscc_eprint_array(double* data, long long length) {
     fprintf(stderr, "[ ");
     for (long long i = 0; i < length; i++) {
         if (i > 0) fprintf(stderr, ", ");
-        mango_eprint_number(data[i]);
+        tscc_eprint_number(data[i]);
     }
     fprintf(stderr, " ]");
 }
@@ -253,7 +253,7 @@ void mango_eprint_array(double* data, long long length) {
 // ============================================================
 // Global functions
 // ============================================================
-double mango_parseInt(char* data, long long len) {
+double tscc_parseInt(char* data, long long len) {
     if (len == 0) return NAN;
     char buf[128];
     long long copy_len = len < 127 ? len : 127;
@@ -269,7 +269,7 @@ double mango_parseInt(char* data, long long len) {
     return (double)val;
 }
 
-double mango_parseFloat(char* data, long long len) {
+double tscc_parseFloat(char* data, long long len) {
     if (len == 0) return NAN;
     char buf[128];
     long long copy_len = len < 127 ? len : 127;

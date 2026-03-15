@@ -1,7 +1,7 @@
 // benchmark.ts — Recursive Fibonacci
-// Mango compiles this with integer narrowing, matching native Rust performance.
-// Compile: mango build examples/benchmark.ts
-// Run:     mango run examples/benchmark.ts --benchmark
+// tscc compiles this with integer narrowing, matching native Rust performance.
+// Compile: tscc build examples/benchmark.ts
+// Run:     tscc run examples/benchmark.ts --benchmark
 
 function fib(n: number): number {
     if (n <= 1) {

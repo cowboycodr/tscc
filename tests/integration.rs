@@ -1,4 +1,4 @@
-//! Mango Integration Tests
+//! tscc Integration Tests
 //!
 //! End-to-end tests that compile TypeScript source through the full pipeline
 //! (lexer -> parser -> type checker -> codegen -> link -> execute) and verify output.
@@ -19,12 +19,12 @@ static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn run_ts(source: &str) -> String {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let tid = std::thread::current().id();
-    let dir = std::env::temp_dir().join(format!("mango_test_{:?}_{}", tid, id));
+    let dir = std::env::temp_dir().join(format!("tscc_test_{:?}_{}", tid, id));
     std::fs::create_dir_all(&dir).unwrap();
     let output = dir.join("test_binary");
     let output_str = output.to_str().unwrap();
 
-    let result = mango::compile_source(source, output_str, false);
+    let result = tscc::compile_source(source, output_str, false);
     if let Err(e) = &result {
         let _ = std::fs::remove_dir_all(&dir);
         panic!("Compilation failed:\n{}\n\nSource:\n{}", e, source);
@@ -50,12 +50,12 @@ fn run_ts(source: &str) -> String {
 fn run_ts_full(source: &str) -> (String, String) {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let tid = std::thread::current().id();
-    let dir = std::env::temp_dir().join(format!("mango_test_{:?}_{}", tid, id));
+    let dir = std::env::temp_dir().join(format!("tscc_test_{:?}_{}", tid, id));
     std::fs::create_dir_all(&dir).unwrap();
     let output = dir.join("test_binary");
     let output_str = output.to_str().unwrap();
 
-    mango::compile_source(source, output_str, false)
+    tscc::compile_source(source, output_str, false)
         .unwrap_or_else(|e| panic!("Compilation failed:\n{}\n\nSource:\n{}", e, source));
 
     let run = Command::new(&output)
@@ -74,12 +74,12 @@ fn run_ts_full(source: &str) -> (String, String) {
 fn assert_compile_fails(source: &str) {
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let tid = std::thread::current().id();
-    let dir = std::env::temp_dir().join(format!("mango_test_{:?}_{}", tid, id));
+    let dir = std::env::temp_dir().join(format!("tscc_test_{:?}_{}", tid, id));
     std::fs::create_dir_all(&dir).unwrap();
     let output = dir.join("test_binary");
     let output_str = output.to_str().unwrap();
 
-    let result = mango::compile_source(source, output_str, false);
+    let result = tscc::compile_source(source, output_str, false);
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
@@ -1120,7 +1120,7 @@ mod modules {
     fn run_ts_multi(files: &[(&str, &str)]) -> String {
         let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let tid = std::thread::current().id();
-        let dir = std::env::temp_dir().join(format!("mango_test_{:?}_{}", tid, id));
+        let dir = std::env::temp_dir().join(format!("tscc_test_{:?}_{}", tid, id));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Write all files
@@ -1138,7 +1138,7 @@ mod modules {
         let entry_path = dir.join(entry_name);
         let output = dir.join("test_binary");
 
-        mango::compile_file(
+        tscc::compile_file(
             entry_path.to_str().unwrap(),
             output.to_str().unwrap(),
             false,
@@ -1298,7 +1298,7 @@ console.log(n, s, b)
 // ============================================================
 // 14. NOT YET IMPLEMENTED — TypeScript Coverage Gap
 //
-// Each #[ignore] test represents a TypeScript feature that Mango
+// Each #[ignore] test represents a TypeScript feature that tscc
 // does not yet support. The total ignored count = coverage gap.
 // ============================================================
 mod not_yet_implemented {

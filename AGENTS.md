@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Instructions for AI coding agents working on the Mango compiler.
+Instructions for AI coding agents working on the tscc compiler.
 
 ## Build & Test
 
@@ -24,14 +24,14 @@ No linter/formatter config exists. Standard `rustfmt` and `clippy` conventions a
 
 ## Architecture
 
-Mango compiles TypeScript (`.ts` files) to native binaries via LLVM 18. Not a transpiler.
+tscc compiles TypeScript (`.ts` files) to native binaries via LLVM 18. Not a transpiler.
 
 **Pipeline:** Source → Lexer → Parser → Type Checker → LLVM Codegen → Linker → Native binary
 
 ```
 src/
 ├── lib.rs              # Public API: compile_source(), compile_file()
-├── main.rs             # CLI (clap): mango build/run
+├── main.rs             # CLI (clap): tscc build/run
 ├── diagnostics.rs      # CompileError, Severity, report_error()
 ├── modules.rs          # Multi-file import resolution, topological sort
 ├── lexer/
@@ -124,7 +124,7 @@ Second pass: compile top-level code (main function).
 
 **Runtime C functions** — Must be declared in both `runtime.c` AND `declare_runtime_functions()`
 in llvm.rs with matching signatures. Struct returns >16 bytes on aarch64 use sret convention;
-prefer passing pointers to structs instead (see `mango_array_push`).
+prefer passing pointers to structs instead (see `tscc_array_push`).
 
 ## Testing Conventions
 
@@ -147,7 +147,7 @@ fn feature_name() {
 
 ## Important Gotchas
 
-- **Semicolons are optional** in Mango (lenient parsing, like TypeScript)
+- **Semicolons are optional** in tscc (lenient parsing, like TypeScript)
 - **Function hoisting is NOT supported** — type checker doesn't pre-scan declarations
 - **Import aliasing (`as`) is broken in codegen** — alias maps in checker but codegen uses original name
 - `inkwell` `AggregateValueEnum` doesn't impl `Into<BasicValueEnum>` — call `.into_struct_value().into()`

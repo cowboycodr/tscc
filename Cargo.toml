@@ -1,5 +1,5 @@
 [package]
-name = "mango"
+name = "tscc"
 version = "0.1.0"
 edition = "2021"
 description = "A compiler that compiles TypeScript to native machine code"

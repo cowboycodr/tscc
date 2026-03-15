@@ -4,8 +4,8 @@ use std::process::Command;
 use clap::{Parser as ClapParser, Subcommand};
 
 #[derive(ClapParser)]
-#[command(name = "mango")]
-#[command(about = "Mango - TypeScript compiled to native machine code")]
+#[command(name = "tscc")]
+#[command(about = "tscc - TypeScript compiled to native machine code")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -69,7 +69,7 @@ fn main() {
                     .to_string()
             });
             let optimize = !debug;
-            if let Err(e) = mango::compile_file(&file, &output_name, emit_ir, optimize) {
+            if let Err(e) = tscc::compile_file(&file, &output_name, emit_ir, optimize) {
                 eprintln!("\x1b[1;31merror\x1b[0m: {}", e);
                 std::process::exit(1);
             }
@@ -89,7 +89,7 @@ fn main() {
                 format!("./{}", stem)
             });
             let optimize = !debug;
-            if let Err(e) = mango::compile_file(&file, &output_name, false, optimize) {
+            if let Err(e) = tscc::compile_file(&file, &output_name, false, optimize) {
                 eprintln!("\x1b[1;31merror\x1b[0m: {}", e);
                 std::process::exit(1);
             }

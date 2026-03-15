@@ -105,49 +105,49 @@ impl<'ctx> Codegen<'ctx> {
 
         // --- Print functions ---
         self.module.add_function(
-            "mango_print_number",
+            "tscc_print_number",
             void_type.fn_type(&[f64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_print_string",
+            "tscc_print_string",
             void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_print_boolean",
+            "tscc_print_boolean",
             void_type.fn_type(&[i1_type.into()], false),
             None,
         );
         self.module
-            .add_function("mango_print_null", void_type.fn_type(&[], false), None);
+            .add_function("tscc_print_null", void_type.fn_type(&[], false), None);
         self.module
-            .add_function("mango_print_undefined", void_type.fn_type(&[], false), None);
+            .add_function("tscc_print_undefined", void_type.fn_type(&[], false), None);
         self.module
-            .add_function("mango_print_newline", void_type.fn_type(&[], false), None);
+            .add_function("tscc_print_newline", void_type.fn_type(&[], false), None);
 
         // --- Stderr print (console.error / console.warn) ---
         self.module.add_function(
-            "mango_eprint_number",
+            "tscc_eprint_number",
             void_type.fn_type(&[f64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_eprint_string",
+            "tscc_eprint_string",
             void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_eprint_boolean",
+            "tscc_eprint_boolean",
             void_type.fn_type(&[i1_type.into()], false),
             None,
         );
         self.module
-            .add_function("mango_eprint_newline", void_type.fn_type(&[], false), None);
+            .add_function("tscc_eprint_newline", void_type.fn_type(&[], false), None);
 
         // --- String operations ---
         self.module.add_function(
-            "mango_string_concat",
+            "tscc_string_concat",
             self.string_type.fn_type(
                 &[
                     ptr_type.into(),
@@ -160,37 +160,37 @@ impl<'ctx> Codegen<'ctx> {
             None,
         );
         self.module.add_function(
-            "mango_number_to_string",
+            "tscc_number_to_string",
             self.string_type.fn_type(&[f64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_boolean_to_string",
+            "tscc_boolean_to_string",
             self.string_type.fn_type(&[i1_type.into()], false),
             None,
         );
 
         // --- String methods ---
         self.module.add_function(
-            "mango_string_toUpperCase",
+            "tscc_string_toUpperCase",
             self.string_type
                 .fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_string_toLowerCase",
+            "tscc_string_toLowerCase",
             self.string_type
                 .fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_string_charAt",
+            "tscc_string_charAt",
             self.string_type
                 .fn_type(&[ptr_type.into(), i64_type.into(), f64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_string_indexOf",
+            "tscc_string_indexOf",
             f64_type.fn_type(
                 &[
                     ptr_type.into(),
@@ -203,7 +203,7 @@ impl<'ctx> Codegen<'ctx> {
             None,
         );
         self.module.add_function(
-            "mango_string_includes",
+            "tscc_string_includes",
             i1_type.fn_type(
                 &[
                     ptr_type.into(),
@@ -216,7 +216,7 @@ impl<'ctx> Codegen<'ctx> {
             None,
         );
         self.module.add_function(
-            "mango_string_substring",
+            "tscc_string_substring",
             self.string_type.fn_type(
                 &[
                     ptr_type.into(),
@@ -229,7 +229,7 @@ impl<'ctx> Codegen<'ctx> {
             None,
         );
         self.module.add_function(
-            "mango_string_slice",
+            "tscc_string_slice",
             self.string_type.fn_type(
                 &[
                     ptr_type.into(),
@@ -242,7 +242,7 @@ impl<'ctx> Codegen<'ctx> {
             None,
         );
         self.module.add_function(
-            "mango_string_trim",
+            "tscc_string_trim",
             self.string_type
                 .fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
@@ -256,40 +256,40 @@ impl<'ctx> Codegen<'ctx> {
             "floor", "ceil", "round", "abs", "sqrt", "sin", "cos", "tan", "log", "exp",
         ] {
             self.module
-                .add_function(&format!("mango_math_{}", name), math_1, None);
+                .add_function(&format!("tscc_math_{}", name), math_1, None);
         }
         for name in &["pow", "min", "max"] {
             self.module
-                .add_function(&format!("mango_math_{}", name), math_2, None);
+                .add_function(&format!("tscc_math_{}", name), math_2, None);
         }
-        self.module.add_function("mango_math_random", math_0, None);
+        self.module.add_function("tscc_math_random", math_0, None);
 
         // --- Array functions ---
-        // mango_array_push(MgArray* arr, double value) → modifies in place
+        // tscc_array_push(MgArray* arr, double value) → modifies in place
         self.module.add_function(
-            "mango_array_push",
+            "tscc_array_push",
             void_type.fn_type(&[ptr_type.into(), f64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_print_array",
+            "tscc_print_array",
             void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_eprint_array",
+            "tscc_eprint_array",
             void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
 
         // --- Global functions ---
         self.module.add_function(
-            "mango_parseInt",
+            "tscc_parseInt",
             f64_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
         self.module.add_function(
-            "mango_parseFloat",
+            "tscc_parseFloat",
             f64_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
@@ -1253,7 +1253,7 @@ impl<'ctx> Codegen<'ctx> {
             let left_str = self.to_string(left_val, &left_vt)?;
             let right_str = self.to_string(right_val, &right_vt)?;
 
-            let concat_fn = self.module.get_function("mango_string_concat").unwrap();
+            let concat_fn = self.module.get_function("tscc_string_concat").unwrap();
             let lp = self
                 .builder
                 .build_extract_value(left_str.into_struct_value(), 0, "lptr")
@@ -1370,7 +1370,7 @@ impl<'ctx> Codegen<'ctx> {
                         .builder
                         .build_signed_int_to_float(ri, self.context.f64_type(), "r2f")
                         .unwrap();
-                    let pow_fn = self.module.get_function("mango_math_pow").unwrap();
+                    let pow_fn = self.module.get_function("tscc_math_pow").unwrap();
                     let result = self
                         .builder
                         .build_call(pow_fn, &[lf.into(), rf.into()], "pow")
@@ -1485,7 +1485,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.build_or(lb, rb, "or").unwrap().into()
                 }
                 BinOp::Power => {
-                    let pow_fn = self.module.get_function("mango_math_pow").unwrap();
+                    let pow_fn = self.module.get_function("tscc_math_pow").unwrap();
                     self.builder
                         .build_call(pow_fn, &[lf.into(), rf.into()], "pow")
                         .unwrap()
@@ -1671,17 +1671,17 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
         let (print_num, print_str, print_bool, print_nl) = if is_stderr {
             (
-                "mango_eprint_number",
-                "mango_eprint_string",
-                "mango_eprint_boolean",
-                "mango_eprint_newline",
+                "tscc_eprint_number",
+                "tscc_eprint_string",
+                "tscc_eprint_boolean",
+                "tscc_eprint_newline",
             )
         } else {
             (
-                "mango_print_number",
-                "mango_print_string",
-                "mango_print_boolean",
-                "mango_print_newline",
+                "tscc_print_number",
+                "tscc_print_string",
+                "tscc_print_boolean",
+                "tscc_print_newline",
             )
         };
 
@@ -1749,9 +1749,9 @@ impl<'ctx> Codegen<'ctx> {
                         .build_extract_value(val.into_struct_value(), 1, "arr_len")
                         .unwrap();
                     let print_arr_name = if is_stderr {
-                        "mango_eprint_array"
+                        "tscc_eprint_array"
                     } else {
-                        "mango_print_array"
+                        "tscc_print_array"
                     };
                     let f = self.module.get_function(print_arr_name).unwrap();
                     self.builder
@@ -1792,7 +1792,7 @@ impl<'ctx> Codegen<'ctx> {
         function: FunctionValue<'ctx>,
         span: &Span,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
-        let func_name = format!("mango_math_{}", method);
+        let func_name = format!("tscc_math_{}", method);
         let func = self.module.get_function(&func_name).ok_or_else(|| {
             CompileError::error(format!("Unknown Math method '{}'", method), span.clone())
         })?;
@@ -1832,7 +1832,7 @@ impl<'ctx> Codegen<'ctx> {
 
         match method {
             "toUpperCase" | "toLowerCase" | "trim" => {
-                let func_name = format!("mango_string_{}", method);
+                let func_name = format!("tscc_string_{}", method);
                 let func = self.module.get_function(&func_name).unwrap();
                 let result = self
                     .builder
@@ -1845,7 +1845,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             "charAt" => {
                 let (idx, _) = self.compile_expr(&args[0], function)?;
-                let func = self.module.get_function("mango_string_charAt").unwrap();
+                let func = self.module.get_function("tscc_string_charAt").unwrap();
                 let result = self
                     .builder
                     .build_call(func, &[ptr.into(), len.into(), idx.into()], "charAt")
@@ -1865,7 +1865,7 @@ impl<'ctx> Codegen<'ctx> {
                     .builder
                     .build_extract_value(needle.into_struct_value(), 1, "nl")
                     .unwrap();
-                let func = self.module.get_function("mango_string_indexOf").unwrap();
+                let func = self.module.get_function("tscc_string_indexOf").unwrap();
                 let result = self
                     .builder
                     .build_call(
@@ -1889,7 +1889,7 @@ impl<'ctx> Codegen<'ctx> {
                     .builder
                     .build_extract_value(needle.into_struct_value(), 1, "nl")
                     .unwrap();
-                let func = self.module.get_function("mango_string_includes").unwrap();
+                let func = self.module.get_function("tscc_string_includes").unwrap();
                 let result = self
                     .builder
                     .build_call(
@@ -1919,7 +1919,7 @@ impl<'ctx> Codegen<'ctx> {
                         .unwrap();
                     len_f64.into()
                 };
-                let func_name = format!("mango_string_{}", method);
+                let func_name = format!("tscc_string_{}", method);
                 let func = self.module.get_function(&func_name).unwrap();
                 let result = self
                     .builder
@@ -1978,8 +1978,8 @@ impl<'ctx> Codegen<'ctx> {
                     CompileError::error("push requires a variable target", span.clone())
                 })?;
 
-                // Call mango_array_push(arr_ptr, value) — modifies in place
-                let push_fn = self.module.get_function("mango_array_push").unwrap();
+                // Call tscc_array_push(arr_ptr, value) — modifies in place
+                let push_fn = self.module.get_function("tscc_array_push").unwrap();
                 self.builder
                     .build_call(push_fn, &[arr_ptr.into(), float_val.into()], "")
                     .unwrap();
@@ -2090,7 +2090,7 @@ impl<'ctx> Codegen<'ctx> {
             .build_extract_value(arg_val.into_struct_value(), 1, "l")
             .unwrap();
 
-        let func_name = format!("mango_{}", name);
+        let func_name = format!("tscc_{}", name);
         let func = self.module.get_function(&func_name).unwrap();
         let result = self
             .builder
@@ -2130,7 +2130,7 @@ impl<'ctx> Codegen<'ctx> {
         match vt {
             VarType::String => Ok(val),
             VarType::Number => {
-                let f = self.module.get_function("mango_number_to_string").unwrap();
+                let f = self.module.get_function("tscc_number_to_string").unwrap();
                 Ok(self
                     .builder
                     .build_call(f, &[val.into()], "numstr")
@@ -2145,7 +2145,7 @@ impl<'ctx> Codegen<'ctx> {
                     .builder
                     .build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "i2f")
                     .unwrap();
-                let f = self.module.get_function("mango_number_to_string").unwrap();
+                let f = self.module.get_function("tscc_number_to_string").unwrap();
                 Ok(self
                     .builder
                     .build_call(f, &[float_val.into()], "numstr")
@@ -2155,7 +2155,7 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap())
             }
             VarType::Boolean => {
-                let f = self.module.get_function("mango_boolean_to_string").unwrap();
+                let f = self.module.get_function("tscc_boolean_to_string").unwrap();
                 Ok(self
                     .builder
                     .build_call(f, &[val.into()], "boolstr")

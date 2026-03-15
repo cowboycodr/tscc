@@ -1,6 +1,6 @@
-// hello.ts — Your first Mango program
-// Compile: mango build examples/hello.ts
-// Run:     mango run examples/hello.ts
+// hello.ts — Your first tscc program
+// Compile: tscc build examples/hello.ts
+// Run:     tscc run examples/hello.ts
 
 function greet(name: string): string {
     return `Hello, ${name}!`

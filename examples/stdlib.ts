@@ -1,5 +1,5 @@
 // stdlib.ts — Standard library showcase
-// Compile: mango run examples/stdlib.ts
+// Compile: tscc run examples/stdlib.ts
 
 // Math
 console.log("sqrt(144) =", Math.sqrt(144))
@@ -16,7 +16,7 @@ console.log("indexOf('World'):", s.indexOf("World"))
 console.log("trim:", "  spaces  ".trim())
 
 // Template literals
-let name = "Mango"
+let name = "tscc"
 let version = 0.5
 console.log(`${name} v${version} is fast!`)
 

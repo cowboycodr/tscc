@@ -1,28 +1,53 @@
-# Mango
+# tscc
 
 A compiler that takes TypeScript syntax and compiles it to native machine code via LLVM.
 
-Not a transpiler. Not a runtime. Mango produces standalone native binaries from `.ts` files.
+Not a transpiler. Not a runtime. tscc produces standalone native binaries from `.ts` files.
 
 ```
-mango run examples/hello.ts
+tscc run examples/hello.ts
 ```
 
-## Benchmarks
+## Performance
 
-Recursive Fibonacci (`fib(40)`) on Apple Silicon (M3):
+All benchmarks on Apple Silicon M3. Best of 3 runs.
 
-| Runtime | Time | vs Mango |
+### Recursive Fibonacci — `fib(40)`
+
+| Runtime | Time | Relative | Memory |
+|---|---|---|---|
+| **tscc** | **0.28s** | **1.0x** | **1.2 MB** |
+| C (`cc -O3`) | 0.28s | 1.0x | 1.2 MB |
+| Rust (`rustc -O`, i64) | 0.28s | 1.0x | 1.4 MB |
+| Rust (`rustc -O`, f64) | 0.41s | 1.5x slower | 1.4 MB |
+| Bun 1.3 | 0.48s | 1.7x slower | 27 MB |
+| Node 25 | 0.79s | 2.8x slower | 49 MB |
+
+### Loop Sum — `sum(0..1_000_000_000)`
+
+| Runtime | Time | Relative |
 |---|---|---|
-| **Mango** | **0.28s** | 1.0x |
-| Rust (`rustc -O`, i64) | 0.29s | 1.0x |
-| Rust (`rustc -O`, f64) | 0.43s | 1.5x slower |
-| Bun 1.3 | 0.51s | 1.8x slower |
-| Node 23 | 0.79s | 2.8x slower |
+| **tscc** | **< 0.01s** | **--** |
+| Rust (`rustc -O`) | < 0.01s | -- |
+| Bun 1.3 | 0.88s | -- |
+| Node 25 | 1.47s | -- |
 
-Mango matches native Rust performance through integer narrowing — an analysis pass that detects when `number` values can safely compile as `i64` instead of `f64`, enabling LLVM to apply integer-specific optimizations.
+Both tscc and Rust produce effectively instant results — LLVM optimizes the entire loop into a closed-form computation at compile time.
 
-Compilation takes ~100ms with O3 optimization, ~30ms in debug mode.
+### Why is tscc fast?
+
+- **LLVM O3** — Full optimization pipeline (loop vectorization, SLP vectorization, function inlining, dead code elimination)
+- **Native CPU targeting** — Generates code tuned for the exact CPU (`-mcpu=native`)
+- **Integer narrowing** — Analysis pass detects when `number` values can compile as `i64` instead of `f64`, enabling LLVM's integer-specific optimizations (accumulator transformation, strength reduction)
+- **No runtime overhead** — No JIT warmup, no garbage collector, no event loop. Just a native binary
+- **Tiny binaries** — `fib(40)` compiles to a 37 KB binary (vs 441 KB for Rust)
+
+### Compilation Speed
+
+| Mode | Time |
+|---|---|
+| Optimized (O3) | ~90ms |
+| Debug (no optimization) | ~80ms |
 
 ## Install
 
@@ -36,7 +61,7 @@ brew install llvm@18
 export LLVM_SYS_180_PREFIX=/opt/homebrew/opt/llvm@18
 export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
 
-# Build Mango
+# Build tscc
 cargo install --path .
 ```
 
@@ -44,16 +69,16 @@ cargo install --path .
 
 ```sh
 # Compile and run
-mango run file.ts
+tscc run file.ts
 
 # Compile to binary
-mango build file.ts            # outputs ./file
-mango build file.ts -o output  # custom output path
+tscc build file.ts            # outputs ./file
+tscc build file.ts -o output  # custom output path
 
 # Flags
-mango run file.ts --benchmark  # time execution
-mango build file.ts --debug    # skip optimization (faster compile)
-mango build file.ts --emit-ir  # print LLVM IR
+tscc run file.ts --benchmark  # time execution
+tscc build file.ts --debug    # skip optimization (faster compile)
+tscc build file.ts --emit-ir  # print LLVM IR
 ```
 
 ## Examples
@@ -74,7 +99,7 @@ console.log(double(21))  // 42
 ```
 
 ```sh
-$ mango run examples/hello.ts
+$ tscc run examples/hello.ts
 Hello, World!
 Second: 20
 42
@@ -82,48 +107,295 @@ Second: 20
 
 See [`examples/`](examples/) for more.
 
-## What works
-
-**Types & variables** — `let`, `const`, type annotations, type inference
-
-**Functions** — declarations, arrow functions, recursion, multi-file `import`/`export`
-
-**Control flow** — `if`/`else`, `while`, `for`, `break`, `continue`, ternary (`? :`)
-
-**Operators** — arithmetic, comparison, logical, `++`/`--`, `+=`/`-=`/`*=`/`/=`, `**`, `typeof`
-
-**Strings** — literals, template literals, concatenation, `.length`, `.toUpperCase()`, `.toLowerCase()`, `.charAt()`, `.indexOf()`, `.includes()`, `.substring()`, `.slice()`, `.trim()`
-
-**Arrays** — literals, index access, `.length`, `.push()`, `.pop()`
-
-**Math** — `Math.floor`, `ceil`, `round`, `abs`, `sqrt`, `pow`, `min`, `max`, `sin`, `cos`, `tan`, `log`, `exp`, `random`, `PI`, `E`
-
-**Globals** — `console.log`, `console.error`, `console.warn`, `parseInt`, `parseFloat`
-
 ## Architecture
 
 ```
 TypeScript source
-    │
-    ├─ Lexer ──────── Hand-written scanner
-    ├─ Parser ─────── Recursive descent + Pratt precedence
-    ├─ Type Checker ── Structural typing, inference
-    ├─ Codegen ────── LLVM IR via inkwell
-    ├─ Optimizer ──── LLVM O3 + native CPU targeting
-    └─ Linker ─────── Clang (links with C runtime)
-        │
+    |
+    +- Lexer -------- Hand-written scanner
+    +- Parser ------- Recursive descent + Pratt precedence
+    +- Type Checker -- Structural typing, inference
+    +- Codegen ------ LLVM IR via inkwell
+    +- Optimizer ---- LLVM O3 + native CPU targeting
+    +- Linker ------- Clang (links with C runtime)
+    |
     Native binary
 ```
 
-Written in Rust. Single crate. ~4,000 lines.
+Written in Rust. Single crate. ~4,000 lines of Rust + ~285 lines of C runtime.
 
 The C runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It's compiled and linked into every binary.
 
 ## Status
 
-Early stage. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 167 tests passing, 72 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
-Not yet implemented: closures, objects, classes, interfaces, generics, union types, enums, `async`/`await`, and many other TypeScript features. See the test suite for exact coverage.
+## TypeScript Feature Coverage
+
+**167 passing** / **72 not yet implemented** — 70% of test suite
+
+### Literals & Primitives
+
+| Feature | Status | Test |
+|---|---|---|
+| Integer literals | :white_check_mark: | `console.log(42)` |
+| Float literals | :white_check_mark: | `console.log(3.14)` |
+| Negative numbers | :white_check_mark: | `console.log(-7)` |
+| Zero | :white_check_mark: | `console.log(0)` |
+| Large integers | :white_check_mark: | `console.log(1000000)` |
+| String (double quotes) | :white_check_mark: | `console.log("hello")` |
+| String (single quotes) | :white_check_mark: | `console.log('world')` |
+| Empty string | :white_check_mark: | `console.log("")` |
+| Boolean `true` | :white_check_mark: | `console.log(true)` |
+| Boolean `false` | :white_check_mark: | `console.log(false)` |
+| `null` | :white_check_mark: | `console.log(null)` |
+| `undefined` | :white_check_mark: | `console.log(undefined)` |
+| BigInt literals | :x: | `9007199254740993n` |
+
+### Variables
+
+| Feature | Status | Test |
+|---|---|---|
+| `let` with number | :white_check_mark: | `let x = 10` |
+| `let` with string | :white_check_mark: | `let s = "hi"` |
+| `let` with boolean | :white_check_mark: | `let b = true` |
+| `const` | :white_check_mark: | `const x = 99` |
+| Type annotations | :white_check_mark: | `let x: number = 5` |
+| String type annotation | :white_check_mark: | `let s: string = "typed"` |
+| Boolean type annotation | :white_check_mark: | `let b: boolean = false` |
+| Reassignment | :white_check_mark: | `x = 2` |
+| Multiple variables | :white_check_mark: | `let a = 1; let b = 2` |
+| Uninitialized `let` | :white_check_mark: | `let x: number` (defaults to 0) |
+| Optional semicolons | :white_check_mark: | `let x = 42` |
+| `var` declarations | :x: | `var x = 42` |
+| Array destructuring | :x: | `let [a, b] = [1, 2]` |
+| Object destructuring | :x: | `let { x, y } = { x: 1, y: 2 }` |
+
+### Arithmetic Operators
+
+| Feature | Status | Test |
+|---|---|---|
+| Addition `+` | :white_check_mark: | `2 + 3` |
+| Subtraction `-` | :white_check_mark: | `10 - 4` |
+| Multiplication `*` | :white_check_mark: | `3 * 7` |
+| Division `/` | :white_check_mark: | `10 / 4` |
+| Modulo `%` | :white_check_mark: | `10 % 3` |
+| Exponentiation `**` | :white_check_mark: | `2 ** 10` |
+| Operator precedence | :white_check_mark: | `2 + 3 * 4` = 14 |
+| Parenthesized expressions | :white_check_mark: | `(2 + 3) * 4` = 20 |
+| Postfix `++` / `--` | :white_check_mark: | `x++`, `x--` |
+| Prefix `++` / `--` | :white_check_mark: | `++x`, `--x` |
+| Unary negate | :white_check_mark: | `-x` |
+| `+=` `-=` `*=` `/=` | :white_check_mark: | `x += 3` |
+
+### Comparison Operators
+
+| Feature | Status | Test |
+|---|---|---|
+| `<` `>` `<=` `>=` | :white_check_mark: | `1 < 2`, `5 > 3` |
+| `==` `!=` | :white_check_mark: | `5 == 5`, `5 != 6` |
+| `===` `!==` | :white_check_mark: | `5 === 5`, `5 !== 5` |
+| Boolean equality | :white_check_mark: | `true == true` |
+
+### Logical Operators
+
+| Feature | Status | Test |
+|---|---|---|
+| `&&` | :white_check_mark: | `true && true` |
+| `\|\|` | :white_check_mark: | `false \|\| true` |
+| `!` | :white_check_mark: | `!true` |
+| Complex logical | :white_check_mark: | `true && !false \|\| false` |
+| Numeric `&&` / `\|\|` | :white_check_mark: | `1 && 1`, `0 \|\| 1` |
+| Nullish coalescing `??` | :x: | `null ?? 42` |
+| Optional chaining `?.` | :x: | `obj?.a` |
+
+### Strings
+
+| Feature | Status | Test |
+|---|---|---|
+| Concatenation `+` | :white_check_mark: | `"hello" + " world"` |
+| String + number | :white_check_mark: | `"value: " + 42` |
+| String + boolean | :white_check_mark: | `"it is " + true` |
+| `.length` | :white_check_mark: | `"hello".length` |
+| `.toUpperCase()` | :white_check_mark: | `"hello".toUpperCase()` |
+| `.toLowerCase()` | :white_check_mark: | `"HELLO".toLowerCase()` |
+| `.charAt()` | :white_check_mark: | `"hello".charAt(1)` |
+| `.indexOf()` | :white_check_mark: | `"hello world".indexOf("world")` |
+| `.includes()` | :white_check_mark: | `"hello world".includes("world")` |
+| `.substring()` | :white_check_mark: | `"hello world".substring(0, 5)` |
+| `.slice()` | :white_check_mark: | `"hello world".slice(-5)` |
+| `.trim()` | :white_check_mark: | `"  hello  ".trim()` |
+| Template literals | :white_check_mark: | `` `value is ${x}` `` |
+| Chained methods | :white_check_mark: | `"  Hello  ".trim().toUpperCase()` |
+| `.startsWith()` | :x: | `"hello".startsWith("he")` |
+| `.endsWith()` | :x: | `"hello".endsWith("lo")` |
+| `.repeat()` | :x: | `"ab".repeat(3)` |
+| `.split()` | :x: | `"a,b,c".split(",")` |
+| `.replace()` | :x: | `"hello".replace("l", "r")` |
+| `.padStart()` | :x: | `"5".padStart(3, "0")` |
+
+### Control Flow
+
+| Feature | Status | Test |
+|---|---|---|
+| `if` | :white_check_mark: | `if (true) { ... }` |
+| `if`/`else` | :white_check_mark: | `if (x) { ... } else { ... }` |
+| `if`/`else if`/`else` | :white_check_mark: | chained conditions |
+| `while` | :white_check_mark: | `while (i < 5) { ... }` |
+| `for` | :white_check_mark: | `for (let i = 0; i < n; i++)` |
+| Nested loops | :white_check_mark: | `for { for { ... } }` |
+| Block scoping | :white_check_mark: | `{ let y = 2 }` |
+| `break` | :white_check_mark: | `if (i == 5) break` |
+| `continue` | :white_check_mark: | `if (i == 2) continue` |
+| Ternary `? :` | :white_check_mark: | `true ? 1 : 2` |
+| `do...while` | :x: | `do { i++ } while (i < 5)` |
+| `switch`/`case` | :x: | `switch (x) { case 1: ... }` |
+| `for...of` | :x: | `for (let x of arr)` |
+| `for...in` | :x: | `for (let key in obj)` |
+| Labeled statements | :x: | `outer: for (...)` |
+
+### Functions
+
+| Feature | Status | Test |
+|---|---|---|
+| Declarations | :white_check_mark: | `function add(a, b) { return a + b }` |
+| Return values | :white_check_mark: | `return a + b` |
+| Multiple params | :white_check_mark: | `function f(a, b, c)` |
+| String params/returns | :white_check_mark: | `function hello(name: string): string` |
+| Boolean returns | :white_check_mark: | `function isPositive(n): boolean` |
+| Recursion | :white_check_mark: | `function fib(n) { ... fib(n-1) }` |
+| Mutual calls | :white_check_mark: | `double(double(x))` |
+| Local variables | :white_check_mark: | `let result = x * 2` |
+| Void functions | :white_check_mark: | `function sayHi(): void` |
+| Arrow (expression) | :white_check_mark: | `let add = (a, b) => a + b` |
+| Arrow (block body) | :white_check_mark: | `let f = (x) => { return x }` |
+| Function hoisting | :x: | calling before declaration |
+| Closures | :x: | capturing outer variables |
+| Default parameters | :x: | `function f(x = 10)` |
+| Rest parameters | :x: | `function f(...args)` |
+| Spread syntax | :x: | `f(...arr)` |
+| Function expressions | :x: | `let f = function() {}` |
+
+### Arrays
+
+| Feature | Status | Test |
+|---|---|---|
+| Literals | :white_check_mark: | `[1, 2, 3]` |
+| Index access | :white_check_mark: | `arr[1]` |
+| `.length` | :white_check_mark: | `arr.length` |
+| `.push()` | :white_check_mark: | `arr.push(4)` |
+| `.pop()` | :white_check_mark: | `arr.pop()` |
+| `.map()` | :x: | `arr.map(x => x * 2)` |
+| `.filter()` | :x: | `arr.filter(x => x > 2)` |
+| `.reduce()` | :x: | `arr.reduce((a, b) => a + b, 0)` |
+| `.forEach()` | :x: | `arr.forEach(x => console.log(x))` |
+
+### Math Standard Library
+
+| Feature | Status | Test |
+|---|---|---|
+| `Math.floor()` | :white_check_mark: | `Math.floor(3.7)` |
+| `Math.ceil()` | :white_check_mark: | `Math.ceil(3.2)` |
+| `Math.round()` | :white_check_mark: | `Math.round(3.5)` |
+| `Math.abs()` | :white_check_mark: | `Math.abs(-5)` |
+| `Math.sqrt()` | :white_check_mark: | `Math.sqrt(9)` |
+| `Math.pow()` | :white_check_mark: | `Math.pow(2, 10)` |
+| `Math.min()` / `Math.max()` | :white_check_mark: | `Math.min(3, 7)` |
+| `Math.sin()` / `Math.cos()` / `Math.tan()` | :white_check_mark: | trig functions |
+| `Math.log()` / `Math.exp()` | :white_check_mark: | `Math.log(Math.E)` |
+| `Math.random()` | :white_check_mark: | returns [0, 1) |
+| `Math.PI` / `Math.E` | :white_check_mark: | constants |
+
+### Console & Globals
+
+| Feature | Status | Test |
+|---|---|---|
+| `console.log()` | :white_check_mark: | single and multiple args |
+| `console.error()` | :white_check_mark: | writes to stderr |
+| `console.warn()` | :white_check_mark: | writes to stderr |
+| `typeof` | :white_check_mark: | `typeof 42` = "number" |
+| `parseInt()` | :white_check_mark: | `parseInt("42")` |
+| `parseFloat()` | :white_check_mark: | `parseFloat("3.14")` |
+
+### Modules
+
+| Feature | Status | Test |
+|---|---|---|
+| `export function` | :white_check_mark: | `export function square(x) {}` |
+| `import { name }` | :white_check_mark: | `import { square } from "./math"` |
+| Multiple imports | :white_check_mark: | `import { a, b } from "./utils"` |
+| Import aliasing `as` | :x: | `import { add as sum }` |
+| Default export | :x: | `export default 42` |
+| `import * as` | :x: | `import * as math from "./math"` |
+| Re-exports | :x: | `export { foo } from "./bar"` |
+
+### Objects & Classes
+
+| Feature | Status | Test |
+|---|---|---|
+| Object literals | :x: | `{ x: 1, y: 2 }` |
+| Property access | :x: | `obj.x` |
+| Bracket access | :x: | `obj["x"]` |
+| Object methods | :x: | `obj.getX()` |
+| Class declarations | :x: | `class Point { ... }` |
+| Class inheritance | :x: | `class Dog extends Animal` |
+| Interfaces | :x: | `interface Point { x: number }` |
+
+### Type System
+
+| Feature | Status | Test |
+|---|---|---|
+| Type annotations | :white_check_mark: | `let x: number`, `function f(): string` |
+| Type inference | :white_check_mark: | `let x = 42` (inferred as number) |
+| Union types | :x: | `string \| number` |
+| Type aliases | :x: | `type ID = string \| number` |
+| Enums (numeric) | :x: | `enum Color { Red, Green }` |
+| Enums (string) | :x: | `enum Direction { Up = "UP" }` |
+| Generics | :x: | `function identity<T>(x: T): T` |
+| Generic constraints | :x: | `<T extends { length: number }>` |
+| Tuple types | :x: | `[number, string]` |
+| Type assertions | :x: | `x as string` |
+| Type narrowing | :x: | `if (typeof val === "string")` |
+| String literal types | :x: | `type Dir = "up" \| "down"` |
+| Intersection types | :x: | `Named & Aged` |
+| `readonly` | :x: | `readonly host: string` |
+| `keyof` | :x: | `keyof Point` |
+| Conditional types | :x: | `T extends number ? "yes" : "no"` |
+| Mapped types | :x: | `{ [P in keyof T]: T[P] }` |
+| `typeof` in type position | :x: | `let y: typeof x` |
+| `satisfies` | :x: | `"red" satisfies Colors` |
+| `as const` | :x: | `[1, 2, 3] as const` |
+
+### Error Handling & Async
+
+| Feature | Status | Test |
+|---|---|---|
+| `try`/`catch` | :x: | `try { throw new Error() } catch (e) {}` |
+| `try`/`finally` | :x: | `try { ... } finally { ... }` |
+| `async`/`await` | :x: | `async function f() { await ... }` |
+| Promises | :x: | `Promise.resolve(42)` |
+
+### Built-in Objects
+
+| Feature | Status | Test |
+|---|---|---|
+| `JSON.stringify()` | :x: | `JSON.stringify({ a: 1 })` |
+| `Map` | :x: | `new Map()` |
+| `Set` | :x: | `new Set([1, 2, 3])` |
+| `RegExp` | :x: | `/hello/.test("hello world")` |
+| `Number.isInteger()` | :x: | `Number.isInteger(42)` |
+| `Number.isFinite()` | :x: | `Number.isFinite(42)` |
+| `Number.isNaN()` | :x: | `Number.isNaN(NaN)` |
+| `.toFixed()` | :x: | `(3.14).toFixed(2)` |
+
+### Advanced Features
+
+| Feature | Status | Test |
+|---|---|---|
+| Namespaces | :x: | `namespace Util { ... }` |
+| Decorators | :x: | `@log` |
+| Symbols | :x: | `Symbol("foo")` |
+| Generators | :x: | `function* range()` |
 
 ## License
 
