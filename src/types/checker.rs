@@ -1483,6 +1483,28 @@ impl TypeChecker {
         if from == &Type::Unknown || to == &Type::Unknown {
             return true;
         }
+        // Literal types are subtypes of their primitive types
+        if let Type::StringLiteral(_) = from {
+            if matches!(to, Type::String) {
+                return true;
+            }
+        }
+        if let Type::NumberLiteral(_) = from {
+            if matches!(to, Type::Number) {
+                return true;
+            }
+        }
+        // Primitives accept their literal types as targets too (for widening)
+        if matches!(from, Type::String) {
+            if matches!(to, Type::StringLiteral(_)) {
+                return true;
+            }
+        }
+        if matches!(from, Type::Number) {
+            if matches!(to, Type::NumberLiteral(_)) {
+                return true;
+            }
+        }
         // Object structural compatibility: from has all fields of to
         if let (
             Type::Object {
@@ -1570,6 +1592,8 @@ impl TypeChecker {
                 // Look up the variable's type in scope
                 self.lookup(name).unwrap_or(Type::Unknown)
             }
+            TypeAnnKind::StringLiteral(s) => Type::StringLiteral(s.clone()),
+            TypeAnnKind::NumberLiteral(n) => Type::NumberLiteral(n.to_string()),
             TypeAnnKind::FunctionType {
                 params,
                 return_type,

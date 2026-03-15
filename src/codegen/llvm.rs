@@ -4527,6 +4527,8 @@ impl<'ctx> Codegen<'ctx> {
                 // for uninitialized variables — fall back to number.
                 self.number_mode.clone()
             }
+            TypeAnnKind::StringLiteral(_) => VarType::String,
+            TypeAnnKind::NumberLiteral(_) => self.number_mode.clone(),
             TypeAnnKind::FunctionType {
                 params,
                 return_type,

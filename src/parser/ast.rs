@@ -166,6 +166,10 @@ pub enum TypeAnnKind {
     Named(String),
     /// typeof x — resolved by looking up the variable's type
     Typeof(String),
+    /// String literal type: "red", "blue", etc.
+    StringLiteral(String),
+    /// Number literal type: 0, 1, 42, etc.
+    NumberLiteral(f64),
     /// Function type: (params) => return_type
     FunctionType {
         params: Vec<TypeAnnotation>,

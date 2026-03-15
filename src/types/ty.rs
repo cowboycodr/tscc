@@ -20,6 +20,10 @@ pub enum Type {
         name: String,
         fields: Vec<(String, Type)>,
     },
+    /// A specific string value used as a type (e.g. "red" in `type Color = "red" | "blue"`)
+    StringLiteral(String),
+    /// A specific number value used as a type (e.g. 1 in `type Bit = 0 | 1`)
+    NumberLiteral(String),
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -58,6 +62,8 @@ impl std::fmt::Display for Type {
                 write!(f, " }}")
             }
             Type::Class { name, .. } => write!(f, "{}", name),
+            Type::StringLiteral(s) => write!(f, "\"{}\"", s),
+            Type::NumberLiteral(n) => write!(f, "{}", n),
             Type::Unknown => write!(f, "unknown"),
         }
     }

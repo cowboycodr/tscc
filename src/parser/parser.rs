@@ -774,6 +774,22 @@ impl Parser {
                     span: self.span_from(&span),
                 }
             }
+            Token::String(s) => {
+                let s = s.clone();
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::StringLiteral(s),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Number(n) => {
+                let n = n;
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::NumberLiteral(n),
+                    span: self.span_from(&span),
+                }
+            }
             Token::Identifier(name) => {
                 let name = name.clone();
                 self.advance();
