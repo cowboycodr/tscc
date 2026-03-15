@@ -1307,7 +1307,6 @@ mod not_yet_implemented {
     // --- Variable declarations ---
 
     #[test]
-    #[ignore = "var declarations not implemented"]
     fn var_declaration() {
         assert_eq!(run_ts("var x = 42\nconsole.log(x)"), "42\n");
     }
@@ -1360,7 +1359,6 @@ mod not_yet_implemented {
     }
 
     #[test]
-    #[ignore = "nullish coalescing not implemented"]
     fn nullish_coalescing() {
         assert_eq!(run_ts("console.log(null ?? 42)"), "42\n");
     }
@@ -1375,7 +1373,6 @@ mod not_yet_implemented {
     // --- Control flow ---
 
     #[test]
-    #[ignore = "switch/case not implemented"]
     fn switch_case() {
         let src = r#"
 let x = 2
@@ -1420,7 +1417,6 @@ for (let i = 0; i < 5; i++) {
     }
 
     #[test]
-    #[ignore = "do-while not implemented"]
     fn do_while() {
         let src = r#"
 let i = 0
@@ -1844,7 +1840,6 @@ console.log(counter())
     }
 
     #[test]
-    #[ignore = "default parameters not implemented"]
     fn default_parameters() {
         let src = r#"
 function greet(name: string = "World"): void {

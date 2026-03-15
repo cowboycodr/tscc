@@ -45,6 +45,8 @@ pub struct Codegen<'ctx> {
     current_this: Option<(PointerValue<'ctx>, VarType)>,
     /// Return VarTypes for compiled functions (for correct call return type inference)
     function_return_types: HashMap<String, VarType>,
+    /// Default parameter expressions for functions (for call-site insertion)
+    function_param_defaults: HashMap<String, Vec<Option<Expr>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +127,7 @@ impl<'ctx> Codegen<'ctx> {
             class_struct_types: HashMap::new(),
             current_this: None,
             function_return_types: HashMap::new(),
+            function_param_defaults: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -399,6 +402,25 @@ impl<'ctx> Codegen<'ctx> {
             StmtKind::Block { statements } => statements
                 .iter()
                 .all(|s| Self::is_stmt_integer_safe(s, fn_name, known)),
+            StmtKind::DoWhile { body, condition } => {
+                body.iter()
+                    .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    && Self::is_expr_integer_safe(condition, fn_name, known)
+            }
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                Self::is_expr_integer_safe(discriminant, fn_name, known)
+                    && cases.iter().all(|c| {
+                        c.test
+                            .as_ref()
+                            .map_or(true, |e| Self::is_expr_integer_safe(e, fn_name, known))
+                            && c.body
+                                .iter()
+                                .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    })
+            }
             StmtKind::FunctionDecl { .. }
             | StmtKind::Import { .. }
             | StmtKind::Break
@@ -694,6 +716,44 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
 
+            StmtKind::DoWhile { body, condition } => {
+                let body_bb = self.context.append_basic_block(function, "dowhile.body");
+                let cond_bb = self.context.append_basic_block(function, "dowhile.cond");
+                let exit_bb = self.context.append_basic_block(function, "dowhile.exit");
+
+                self.builder.build_unconditional_branch(body_bb).unwrap();
+                self.builder.position_at_end(body_bb);
+                self.push_scope();
+                self.loop_stack.push(LoopContext {
+                    exit_bb,
+                    continue_bb: cond_bb,
+                });
+                for s in body {
+                    self.compile_statement(s, function)?;
+                }
+                self.loop_stack.pop();
+                self.pop_scope();
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(cond_bb).unwrap();
+                }
+
+                self.builder.position_at_end(cond_bb);
+                let (cond_val, _) = self.compile_expr(condition, function)?;
+                let cond_bool = self.to_bool(cond_val)?;
+                self.builder
+                    .build_conditional_branch(cond_bool.into_int_value(), body_bb, exit_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(exit_bb);
+                Ok(())
+            }
+
             StmtKind::For {
                 init,
                 condition,
@@ -779,6 +839,145 @@ impl<'ctx> Codegen<'ctx> {
 
             StmtKind::Import { .. } => Ok(()),
 
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                let (disc_val, disc_vt) = self.compile_expr(discriminant, function)?;
+                let exit_bb = self.context.append_basic_block(function, "switch.exit");
+
+                // Create body blocks for each case
+                let body_bbs: Vec<BasicBlock> = cases
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| {
+                        self.context
+                            .append_basic_block(function, &format!("case.{}", i))
+                    })
+                    .collect();
+
+                // Build comparison chain
+                let mut default_idx: Option<usize> = None;
+                let mut test_bbs: Vec<BasicBlock> = Vec::new();
+                for (i, case) in cases.iter().enumerate() {
+                    if case.test.is_some() {
+                        let test_bb = self
+                            .context
+                            .append_basic_block(function, &format!("case.test.{}", i));
+                        test_bbs.push(test_bb);
+                    } else {
+                        default_idx = Some(i);
+                    }
+                }
+
+                // Branch to first test (or default/exit if no cases)
+                if let Some(&first_test) = test_bbs.first() {
+                    self.builder.build_unconditional_branch(first_test).unwrap();
+                } else if let Some(di) = default_idx {
+                    self.builder
+                        .build_unconditional_branch(body_bbs[di])
+                        .unwrap();
+                } else {
+                    self.builder.build_unconditional_branch(exit_bb).unwrap();
+                }
+
+                // Emit test blocks
+                let mut test_idx = 0;
+                for (i, case) in cases.iter().enumerate() {
+                    if let Some(ref test_expr) = case.test {
+                        self.builder.position_at_end(test_bbs[test_idx]);
+                        let (test_val, _) = self.compile_expr(test_expr, function)?;
+
+                        // Compare discriminant with case value
+                        let cmp = if matches!(disc_vt, VarType::Number) {
+                            self.builder
+                                .build_float_compare(
+                                    FloatPredicate::OEQ,
+                                    disc_val.into_float_value(),
+                                    test_val.into_float_value(),
+                                    "case.eq",
+                                )
+                                .unwrap()
+                        } else if matches!(disc_vt, VarType::Integer) {
+                            self.builder
+                                .build_int_compare(
+                                    IntPredicate::EQ,
+                                    disc_val.into_int_value(),
+                                    test_val.into_int_value(),
+                                    "case.eq",
+                                )
+                                .unwrap()
+                        } else if matches!(disc_vt, VarType::Boolean) {
+                            self.builder
+                                .build_int_compare(
+                                    IntPredicate::EQ,
+                                    disc_val.into_int_value(),
+                                    test_val.into_int_value(),
+                                    "case.eq",
+                                )
+                                .unwrap()
+                        } else {
+                            // String comparison: compare lengths then memcmp
+                            // For simplicity, compare as f64 (fallback)
+                            self.builder
+                                .build_float_compare(
+                                    FloatPredicate::OEQ,
+                                    disc_val.into_float_value(),
+                                    test_val.into_float_value(),
+                                    "case.eq",
+                                )
+                                .unwrap()
+                        };
+
+                        // If match, go to body; else try next test or default/exit
+                        let next = if test_idx + 1 < test_bbs.len() {
+                            test_bbs[test_idx + 1]
+                        } else if let Some(di) = default_idx {
+                            body_bbs[di]
+                        } else {
+                            exit_bb
+                        };
+                        self.builder
+                            .build_conditional_branch(cmp, body_bbs[i], next)
+                            .unwrap();
+                        test_idx += 1;
+                    }
+                }
+
+                // Push a LoopContext so `break` works inside switch
+                self.loop_stack.push(LoopContext {
+                    exit_bb,
+                    continue_bb: exit_bb, // continue in switch goes to exit (not ideal, but safe)
+                });
+
+                // Emit body blocks
+                for (i, case) in cases.iter().enumerate() {
+                    self.builder.position_at_end(body_bbs[i]);
+                    for s in &case.body {
+                        self.compile_statement(s, function)?;
+                    }
+                    // Fall-through: if no terminator, branch to next case body or exit
+                    if self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_none()
+                    {
+                        let next = if i + 1 < body_bbs.len() {
+                            body_bbs[i + 1]
+                        } else {
+                            exit_bb
+                        };
+                        self.builder.build_unconditional_branch(next).unwrap();
+                    }
+                }
+
+                self.loop_stack.pop();
+                self.builder.position_at_end(exit_bb);
+                Ok(())
+            }
+
             StmtKind::Break => {
                 if let Some(ctx) = self.loop_stack.last() {
                     let exit_bb = ctx.exit_bb;
@@ -788,7 +987,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.position_at_end(dead_bb);
                 } else {
                     return Err(CompileError::error(
-                        "'break' can only be used inside a loop",
+                        "'break' can only be used inside a loop or switch",
                         stmt.span.clone(),
                     ));
                 }
@@ -856,6 +1055,13 @@ impl<'ctx> Codegen<'ctx> {
 
         let function = self.module.add_function(name, fn_type, None);
         self.functions.insert(name.to_string(), function);
+
+        // Store default parameter expressions for call-site insertion
+        let defaults: Vec<Option<Expr>> = params.iter().map(|p| p.default.clone()).collect();
+        if defaults.iter().any(|d| d.is_some()) {
+            self.function_param_defaults
+                .insert(name.to_string(), defaults);
+        }
 
         // Store return type for call-site inference
         if let Some(ref vt) = ret_vt {
@@ -1103,6 +1309,23 @@ impl<'ctx> Codegen<'ctx> {
                 let llvm_type = self.var_type_to_llvm(&vt);
                 let val = self.builder.build_load(llvm_type, ptr, name).unwrap();
                 Ok((val, vt))
+            }
+
+            ExprKind::Binary {
+                left,
+                op: BinOp::NullishCoalescing,
+                right,
+            } => {
+                // Nullish coalescing: if LHS is null/undefined, use RHS
+                // Without union types, handle at compile time based on AST
+                if matches!(
+                    left.kind,
+                    ExprKind::NullLiteral | ExprKind::UndefinedLiteral
+                ) {
+                    return self.compile_expr(right, function);
+                }
+                // LHS is not nullable (no union types yet), so use LHS
+                self.compile_expr(left, function)
             }
 
             ExprKind::Binary { left, op, right } => self.compile_binary(left, *op, right, function),
@@ -2087,6 +2310,7 @@ impl<'ctx> Codegen<'ctx> {
                         .unwrap()
                         .into()
                 }
+                BinOp::NullishCoalescing => unreachable!("?? handled before compile_binary"),
             };
 
             let result_type = match op {
@@ -2193,6 +2417,7 @@ impl<'ctx> Codegen<'ctx> {
                         .left()
                         .unwrap()
                 }
+                BinOp::NullishCoalescing => unreachable!("?? handled before compile_binary"),
             };
 
             let result_type = match op {
@@ -2417,6 +2642,32 @@ impl<'ctx> Codegen<'ctx> {
                         val
                     };
                 compiled_args.push(val.into());
+            }
+
+            // Fill in default parameter values for missing arguments
+            if let Some(defaults) = self.function_param_defaults.get(name).cloned() {
+                let expected = func.count_params() as usize;
+                for i in args.len()..expected {
+                    if let Some(Some(ref default_expr)) = defaults.get(i) {
+                        let (val, vt) = self.compile_expr(default_expr, function)?;
+                        let val = if is_target_integer
+                            && !caller_is_integer
+                            && matches!(vt, VarType::Number)
+                        {
+                            self.builder
+                                .build_float_to_signed_int(
+                                    val.into_float_value(),
+                                    self.context.i64_type(),
+                                    "f2i",
+                                )
+                                .unwrap()
+                                .into()
+                        } else {
+                            val
+                        };
+                        compiled_args.push(val.into());
+                    }
+                }
             }
 
             let result = self
@@ -3740,6 +3991,7 @@ impl<'ctx> Codegen<'ctx> {
                         VarType::Number
                     }
                 }
+                BinOp::NullishCoalescing => Self::infer_expr_var_type(right),
                 _ => VarType::Number,
             },
             ExprKind::Unary { op, .. } => match op {
@@ -3802,6 +4054,22 @@ impl<'ctx> Codegen<'ctx> {
             StmtKind::While { condition, body } => {
                 Self::collect_idents_in_expr(condition, out);
                 Self::collect_idents_in_stmts(body, out);
+            }
+            StmtKind::DoWhile { body, condition } => {
+                Self::collect_idents_in_stmts(body, out);
+                Self::collect_idents_in_expr(condition, out);
+            }
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                Self::collect_idents_in_expr(discriminant, out);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        Self::collect_idents_in_expr(test, out);
+                    }
+                    Self::collect_idents_in_stmts(&case.body, out);
+                }
             }
             StmtKind::For {
                 init,

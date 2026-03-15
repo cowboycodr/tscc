@@ -65,17 +65,22 @@ pub enum Token {
     Bang,
     PlusPlus,
     MinusMinus,
-    PlusEqual,    // +=
-    MinusEqual,   // -=
-    StarEqual,    // *=
-    SlashEqual,   // /=
-    PercentEqual, // %=
-    StarStar,     // **
-    Question,     // ?
+    PlusEqual,        // +=
+    MinusEqual,       // -=
+    StarEqual,        // *=
+    SlashEqual,       // /=
+    PercentEqual,     // %=
+    StarStar,         // **
+    Question,         // ?
+    QuestionQuestion, // ??
 
     // Keywords (control flow)
     Break,
     Continue,
+    Do,
+    Switch,
+    Case,
+    Var,
 
     // Punctuation
     LeftParen,

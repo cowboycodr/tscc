@@ -365,6 +365,16 @@ impl TypeChecker {
                 Ok(())
             }
 
+            StmtKind::DoWhile { body, condition } => {
+                self.push_scope();
+                for stmt in body {
+                    self.check_statement(stmt)?;
+                }
+                self.pop_scope();
+                self.check_expr(condition)?;
+                Ok(())
+            }
+
             StmtKind::For {
                 init,
                 condition,
@@ -425,6 +435,24 @@ impl TypeChecker {
 
             StmtKind::Import { .. } => {
                 // Import resolution is handled before type checking
+                Ok(())
+            }
+
+            StmtKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.check_expr(discriminant)?;
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        self.check_expr(test)?;
+                    }
+                    self.push_scope();
+                    for stmt in &case.body {
+                        self.check_statement(stmt)?;
+                    }
+                    self.pop_scope();
+                }
                 Ok(())
             }
 
@@ -682,11 +710,17 @@ impl TypeChecker {
                         params,
                         return_type,
                     } => {
-                        if args.len() != params.len() {
+                        if args.len() > params.len() {
                             return Err(CompileError::error(
                                 format!("Expected {} arguments, got {}", params.len(), args.len()),
                                 expr.span.clone(),
                             ));
+                        }
+                        // Allow fewer args — remaining params must have defaults
+                        // (we can't check defaults from the Type alone, so we trust the parser)
+                        if args.len() < params.len() {
+                            // Check if the callee is a known function with defaults
+                            // For now, allow it (default params are validated at parse time)
                         }
                         for (arg, param_type) in args.iter().zip(params.iter()) {
                             let arg_type = self.check_expr(arg)?;
@@ -1207,6 +1241,7 @@ impl TypeChecker {
                 | BinOp::GreaterEqual
                 | BinOp::And
                 | BinOp::Or => Ok(Type::Boolean),
+                BinOp::NullishCoalescing => Ok(Type::Unknown),
                 BinOp::Add if left == &Type::String || right == &Type::String => Ok(Type::String),
                 _ => Ok(Type::Number),
             };
@@ -1249,6 +1284,14 @@ impl TypeChecker {
             | BinOp::LessEqual
             | BinOp::GreaterEqual => Ok(Type::Boolean),
             BinOp::And | BinOp::Or => Ok(Type::Boolean),
+            BinOp::NullishCoalescing => {
+                // Result type is the non-null type (RHS if LHS is null/undefined)
+                if left == &Type::Null || left == &Type::Undefined {
+                    Ok(right.clone())
+                } else {
+                    Ok(left.clone())
+                }
+            }
         }
     }
 

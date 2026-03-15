@@ -67,7 +67,13 @@ impl Scanner {
                     self.add_token(Token::Star);
                 }
             }
-            '?' => self.add_token(Token::Question),
+            '?' => {
+                if self.match_char('?') {
+                    self.add_token(Token::QuestionQuestion);
+                } else {
+                    self.add_token(Token::Question);
+                }
+            }
 
             '.' => {
                 if self.check('.') && self.check_next('.') {
@@ -271,6 +277,10 @@ impl Scanner {
             "of" => Token::Of,
             "break" => Token::Break,
             "continue" => Token::Continue,
+            "do" => Token::Do,
+            "switch" => Token::Switch,
+            "case" => Token::Case,
+            "var" => Token::Var,
             "true" => Token::True,
             "false" => Token::False,
             "null" => Token::Null,

@@ -142,17 +142,17 @@ TypeScript source
     Native binary
 ```
 
-Written in Rust. Single crate. ~7,700 lines of Rust + ~285 lines of C runtime.
+Written in Rust. Single crate. ~8,200 lines of Rust + ~285 lines of C runtime.
 
 The C runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It's compiled and linked into every binary.
 
 ## Status
 
-Early stage. 174 tests passing, 65 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 184 tests passing, 55 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**174 passing** / **65 not yet implemented** — 73% of test suite
+**184 passing** / **55 not yet implemented** — 77% of test suite
 
 ### Literals & Primitives
 
@@ -187,7 +187,7 @@ Early stage. 174 tests passing, 65 pending. The goal is drop-in compatibility wi
 | Multiple variables | :white_check_mark: | `let a = 1; let b = 2` |
 | Uninitialized `let` | :white_check_mark: | `let x: number` (defaults to 0) |
 | Optional semicolons | :white_check_mark: | `let x = 42` |
-| `var` declarations | :x: | `var x = 42` |
+| `var` declarations | :white_check_mark: | `var x = 42` |
 
 ### Arithmetic Operators
 
@@ -224,7 +224,7 @@ Early stage. 174 tests passing, 65 pending. The goal is drop-in compatibility wi
 | `!` | :white_check_mark: | `!true` |
 | Complex logical | :white_check_mark: | `true && !false \|\| false` |
 | Numeric `&&` / `\|\|` | :white_check_mark: | `1 && 1`, `0 \|\| 1` |
-| Nullish coalescing `??` | :x: | `null ?? 42` |
+| Nullish coalescing `??` | :white_check_mark: | `null ?? 42` |
 | Optional chaining `?.` | :x: | `obj?.a` |
 
 ### Strings
@@ -266,8 +266,8 @@ Early stage. 174 tests passing, 65 pending. The goal is drop-in compatibility wi
 | `break` | :white_check_mark: | `if (i == 5) break` |
 | `continue` | :white_check_mark: | `if (i == 2) continue` |
 | Ternary `? :` | :white_check_mark: | `true ? 1 : 2` |
-| `do...while` | :x: | `do { i++ } while (i < 5)` |
-| `switch`/`case` | :x: | `switch (x) { case 1: ... }` |
+| `do...while` | :white_check_mark: | `do { i++ } while (i < 5)` |
+| `switch`/`case` | :white_check_mark: | `switch (x) { case 1: ... }` |
 | `for...of` | :x: | `for (let x of arr)` |
 | `for...in` | :x: | `for (let key in obj)` |
 | Labeled statements | :x: | `outer: for (...)` |
@@ -288,8 +288,8 @@ Early stage. 174 tests passing, 65 pending. The goal is drop-in compatibility wi
 | Arrow (expression) | :white_check_mark: | `let add = (a, b) => a + b` |
 | Arrow (block body) | :white_check_mark: | `let f = (x) => { return x }` |
 | Function hoisting | :x: | calling before declaration |
-| Closures | :x: | capturing outer variables |
-| Default parameters | :x: | `function f(x = 10)` |
+| Closures | :white_check_mark: | capturing outer variables |
+| Default parameters | :white_check_mark: | `function f(x = 10)` |
 | Rest parameters | :x: | `function f(...args)` |
 | Spread syntax | :x: | `f(...arr)` |
 | Function expressions | :x: | `let f = function() {}` |
@@ -303,10 +303,10 @@ Early stage. 174 tests passing, 65 pending. The goal is drop-in compatibility wi
 | `.length` | :white_check_mark: | `arr.length` |
 | `.push()` | :white_check_mark: | `arr.push(4)` |
 | `.pop()` | :white_check_mark: | `arr.pop()` |
-| `.map()` | :x: | `arr.map(x => x * 2)` |
-| `.filter()` | :x: | `arr.filter(x => x > 2)` |
-| `.reduce()` | :x: | `arr.reduce((a, b) => a + b, 0)` |
-| `.forEach()` | :x: | `arr.forEach(x => console.log(x))` |
+| `.map()` | :white_check_mark: | `arr.map(x => x * 2)` |
+| `.filter()` | :white_check_mark: | `arr.filter(x => x > 2)` |
+| `.reduce()` | :white_check_mark: | `arr.reduce((a, b) => a + b, 0)` |
+| `.forEach()` | :white_check_mark: | `arr.forEach(x => console.log(x))` |
 
 ### Math Standard Library
 

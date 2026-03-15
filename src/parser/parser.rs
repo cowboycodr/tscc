@@ -32,13 +32,15 @@ impl Parser {
         }
 
         match self.peek_token() {
-            Token::Let | Token::Const => self.variable_declaration(false),
+            Token::Let | Token::Const | Token::Var => self.variable_declaration(false),
             Token::Function => self.function_declaration(false),
             Token::Class => self.class_declaration(),
             Token::Interface => self.interface_declaration(),
             Token::If => self.if_statement(),
             Token::While => self.while_statement(),
+            Token::Do => self.do_while_statement(),
             Token::For => self.for_statement(),
+            Token::Switch => self.switch_statement(),
             Token::Return => self.return_statement(),
             Token::Break => self.break_statement(),
             Token::Continue => self.continue_statement(),
@@ -285,7 +287,7 @@ impl Parser {
 
         match self.peek_token() {
             Token::Function => self.function_declaration(true),
-            Token::Let | Token::Const => self.variable_declaration(true),
+            Token::Let | Token::Const | Token::Var => self.variable_declaration(true),
             _ => Err(self.error("Expected function, let, or const after 'export'")),
         }
     }
@@ -301,9 +303,15 @@ impl Parser {
                 } else {
                     None
                 };
+                let default = if self.match_token(&Token::Assign) {
+                    Some(self.expression()?)
+                } else {
+                    None
+                };
                 params.push(Parameter {
                     name,
                     type_ann,
+                    default,
                     span: self.span_from(&param_span),
                 });
                 if !self.match_token(&Token::Comma) {
@@ -364,6 +372,25 @@ impl Parser {
         })
     }
 
+    fn do_while_statement(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'do'
+
+        self.expect(&Token::LeftBrace, "Expected '{' after 'do'")?;
+        let body = self.block_body()?;
+
+        self.expect(&Token::While, "Expected 'while' after do block")?;
+        self.expect(&Token::LeftParen, "Expected '(' after 'while'")?;
+        let condition = self.expression()?;
+        self.expect(&Token::RightParen, "Expected ')' after condition")?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::DoWhile { body, condition },
+            span: self.span_from(&start_span),
+        })
+    }
+
     fn for_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         self.advance();
@@ -407,6 +434,50 @@ impl Parser {
                 condition,
                 update,
                 body,
+            },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn switch_statement(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'switch'
+
+        self.expect(&Token::LeftParen, "Expected '(' after 'switch'")?;
+        let discriminant = self.expression()?;
+        self.expect(&Token::RightParen, "Expected ')' after switch expression")?;
+        self.expect(&Token::LeftBrace, "Expected '{' after switch expression")?;
+
+        let mut cases = Vec::new();
+        while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            let test = if self.match_token(&Token::Case) {
+                let expr = self.expression()?;
+                self.expect(&Token::Colon, "Expected ':' after case value")?;
+                Some(expr)
+            } else if self.match_token(&Token::Default) {
+                self.expect(&Token::Colon, "Expected ':' after 'default'")?;
+                None
+            } else {
+                return Err(self.error("Expected 'case' or 'default' in switch body"));
+            };
+
+            let mut body = Vec::new();
+            while !matches!(
+                self.peek_token(),
+                Token::Case | Token::Default | Token::RightBrace | Token::Eof
+            ) {
+                body.push(self.statement()?);
+            }
+            cases.push(SwitchCase { test, body });
+        }
+
+        self.expect(&Token::RightBrace, "Expected '}' after switch body")?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::Switch {
+                discriminant,
+                cases,
             },
             span: self.span_from(&start_span),
         })
@@ -681,6 +752,7 @@ impl Parser {
                         params: vec![Parameter {
                             name: param_name,
                             type_ann: None,
+                            default: None,
                             span: span.clone(),
                         }],
                         return_type: None,
@@ -798,9 +870,9 @@ impl Parser {
     }
 
     fn logical_or(&mut self) -> Result<Expr, CompileError> {
-        let mut left = self.logical_and()?;
+        let mut left = self.nullish_coalescing()?;
         while self.match_token(&Token::PipePipe) {
-            let right = self.logical_and()?;
+            let right = self.nullish_coalescing()?;
             left = Expr {
                 span: Span::new(
                     left.span.start,
@@ -811,6 +883,27 @@ impl Parser {
                 kind: ExprKind::Binary {
                     left: Box::new(left.clone()),
                     op: BinOp::Or,
+                    right: Box::new(right),
+                },
+            };
+        }
+        Ok(left)
+    }
+
+    fn nullish_coalescing(&mut self) -> Result<Expr, CompileError> {
+        let mut left = self.logical_and()?;
+        while self.match_token(&Token::QuestionQuestion) {
+            let right = self.logical_and()?;
+            left = Expr {
+                span: Span::new(
+                    left.span.start,
+                    right.span.end,
+                    left.span.line,
+                    left.span.column,
+                ),
+                kind: ExprKind::Binary {
+                    left: Box::new(left.clone()),
+                    op: BinOp::NullishCoalescing,
                     right: Box::new(right),
                 },
             };
@@ -1383,6 +1476,7 @@ impl Parser {
                 params.push(Parameter {
                     name,
                     type_ann,
+                    default: None,
                     span: self.span_from(&param_span),
                 });
                 if !self.match_token(&Token::Comma) {

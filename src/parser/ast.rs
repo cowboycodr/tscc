@@ -47,6 +47,10 @@ pub enum StmtKind {
         condition: Expr,
         body: Vec<Statement>,
     },
+    DoWhile {
+        body: Vec<Statement>,
+        condition: Expr,
+    },
     For {
         init: Option<Box<Statement>>,
         condition: Option<Expr>,
@@ -66,9 +70,19 @@ pub enum StmtKind {
         specifiers: Vec<ImportSpecifier>,
         source: String,
     },
+    Switch {
+        discriminant: Expr,
+        cases: Vec<SwitchCase>,
+    },
     Break,
     Continue,
     Empty,
+}
+
+#[derive(Debug, Clone)]
+pub struct SwitchCase {
+    pub test: Option<Expr>,
+    pub body: Vec<Statement>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +119,7 @@ pub struct ImportSpecifier {
 pub struct Parameter {
     pub name: String,
     pub type_ann: Option<TypeAnnotation>,
+    pub default: Option<Expr>,
     pub span: Span,
 }
 
@@ -253,6 +268,7 @@ pub enum BinOp {
     GreaterEqual,
     And,
     Or,
+    NullishCoalescing,
     Power,
 }
 
