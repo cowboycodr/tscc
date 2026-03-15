@@ -18,8 +18,10 @@ use crate::modules::ModuleGraph;
 use crate::parser::parser::Parser;
 use crate::types::checker::TypeChecker;
 
-/// The C runtime source, embedded at compile time.
-const RUNTIME_C_SOURCE: &str = include_str!("../runtime/runtime.c");
+/// The pre-compiled runtime static library, embedded at cargo build time by build.rs.
+/// build.rs compiles runtime/runtime.c once via the `cc` crate and writes the path
+/// of the resulting libtscc_runtime.a into the RUNTIME_LIB_PATH env var.
+const RUNTIME_LIB: &[u8] = include_bytes!(env!("RUNTIME_LIB_PATH"));
 
 /// Compile a source string directly (no file read needed).
 /// Used by tests and programmatic callers.
@@ -199,32 +201,17 @@ pub fn link_and_output(codegen: &Codegen, output: &str) -> Result<(), String> {
         .write_object_file(&obj_path)
         .map_err(|e| format!("Failed to write object file: {}", e))?;
 
-    // Write the embedded runtime source to a temp file next to the output
-    let runtime_c_path = PathBuf::from(format!("{}_runtime.c", output));
-    let runtime_obj = PathBuf::from(format!("{}_runtime.o", output));
-    std::fs::write(&runtime_c_path, RUNTIME_C_SOURCE)
-        .map_err(|e| format!("Failed to write runtime source: {}", e))?;
-
-    let cc_status = Command::new("cc")
-        .args([
-            "-c",
-            "-O2",
-            runtime_c_path.to_str().unwrap(),
-            "-o",
-            runtime_obj.to_str().unwrap(),
-        ])
-        .status()
-        .map_err(|e| format!("Failed to compile runtime: {}", e))?;
-
-    if !cc_status.success() {
-        let _ = std::fs::remove_file(&runtime_c_path);
-        return Err("Failed to compile runtime".to_string());
-    }
+    // Write the pre-compiled runtime static library to a temp path next to the output.
+    // The .a was compiled once at `cargo build` time by build.rs and embedded as bytes —
+    // no C toolchain is required on the user's machine at compile time.
+    let runtime_lib_path = PathBuf::from(format!("{}_runtime.a", output));
+    std::fs::write(&runtime_lib_path, RUNTIME_LIB)
+        .map_err(|e| format!("Failed to write runtime library: {}", e))?;
 
     let link_status = Command::new("cc")
         .args([
             obj_path.to_str().unwrap(),
-            runtime_obj.to_str().unwrap(),
+            runtime_lib_path.to_str().unwrap(),
             "-o",
             output,
             "-lm",
@@ -233,16 +220,12 @@ pub fn link_and_output(codegen: &Codegen, output: &str) -> Result<(), String> {
         .status()
         .map_err(|e| format!("Failed to link: {}", e))?;
 
+    let _ = std::fs::remove_file(&obj_path);
+    let _ = std::fs::remove_file(&runtime_lib_path);
+
     if !link_status.success() {
-        let _ = std::fs::remove_file(&obj_path);
-        let _ = std::fs::remove_file(&runtime_c_path);
-        let _ = std::fs::remove_file(&runtime_obj);
         return Err("Failed to link executable".to_string());
     }
-
-    let _ = std::fs::remove_file(&obj_path);
-    let _ = std::fs::remove_file(&runtime_c_path);
-    let _ = std::fs::remove_file(&runtime_obj);
 
     Ok(())
 }

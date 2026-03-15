@@ -92,6 +92,15 @@ These require substantial runtime infrastructure or are lower priority.
 
 ---
 
+## Post-1.0 — Self-Hosting
+
+These are long-term aspirations that require tscc to be substantially complete first.
+
+- [ ] **Self-hosting runtime** — Rewrite `runtime/runtime.c` in TypeScript, compiled by tscc itself. Requires tscc to support all language features used by the runtime (string ops, math, I/O via syscalls or libc FFI).
+- [ ] **Self-hosting compiler** — Rewrite tscc itself in TypeScript and compile it with tscc. The classic milestone for a mature language implementation.
+
+---
+
 ## Known Bugs
 
 - **Import aliasing codegen** — `import { add as sum }` maps alias in checker but codegen looks up original name. Fix: thread alias→original map into codegen.

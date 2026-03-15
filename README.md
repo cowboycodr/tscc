@@ -137,14 +137,14 @@ TypeScript source
     +- Type Checker -- Structural typing, inference
     +- Codegen ------ LLVM IR via inkwell
     +- Optimizer ---- LLVM O3 + native CPU targeting
-    +- Linker ------- Clang (links with C runtime)
+    +- Linker ------- Links with pre-compiled runtime
     |
     Native binary
 ```
 
 Written in Rust. Single crate. ~9,000 lines of Rust + ~285 lines of C runtime.
 
-The C runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It's compiled and linked into every binary.
+The runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It is compiled once at `cargo build` time and embedded directly into the `tscc` binary — no C toolchain is required on the user's machine to compile TypeScript files.
 
 ## Status
 

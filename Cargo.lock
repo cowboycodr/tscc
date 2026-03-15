@@ -478,6 +478,7 @@ dependencies = [
 name = "tscc"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "clap",
  "inkwell",
  "tempfile",
