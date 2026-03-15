@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::Module;
+use inkwell::passes::PassBuilderOptions;
 use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
@@ -25,11 +27,16 @@ pub struct Codegen<'ctx> {
     string_type: StructType<'ctx>,
     /// If true, don't generate a main() — this is a library module
     pub is_library: bool,
+    /// Functions whose number params/returns are compiled as i64
+    integer_functions: HashSet<String>,
+    /// Current number compilation mode (Number=f64, Integer=i64)
+    number_mode: VarType,
 }
 
 #[derive(Debug, Clone)]
 enum VarType {
     Number,
+    Integer,
     String,
     Boolean,
 }
@@ -55,6 +62,8 @@ impl<'ctx> Codegen<'ctx> {
             functions: HashMap::new(),
             string_type,
             is_library: false,
+            integer_functions: HashSet::new(),
+            number_mode: VarType::Number,
         };
 
         codegen.declare_runtime_functions();
@@ -242,7 +251,114 @@ impl<'ctx> Codegen<'ctx> {
         );
     }
 
+    // --- Integer narrowing analysis ---
+
+    fn analyze_integer_functions(program: &Program) -> HashSet<String> {
+        let mut result = HashSet::new();
+        for stmt in &program.statements {
+            if let StmtKind::FunctionDecl { name, body, .. } = &stmt.kind {
+                if Self::is_function_integer_safe(name, body, &result) {
+                    result.insert(name.clone());
+                }
+            }
+        }
+        result
+    }
+
+    fn is_function_integer_safe(name: &str, body: &[Statement], known: &HashSet<String>) -> bool {
+        body.iter()
+            .all(|s| Self::is_stmt_integer_safe(s, name, known))
+    }
+
+    fn is_stmt_integer_safe(stmt: &Statement, fn_name: &str, known: &HashSet<String>) -> bool {
+        match &stmt.kind {
+            StmtKind::VariableDecl { initializer, .. } => initializer
+                .as_ref()
+                .map_or(true, |e| Self::is_expr_integer_safe(e, fn_name, known)),
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                Self::is_expr_integer_safe(condition, fn_name, known)
+                    && then_branch
+                        .iter()
+                        .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    && else_branch.as_ref().map_or(true, |b| {
+                        b.iter()
+                            .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    })
+            }
+            StmtKind::While { condition, body } => {
+                Self::is_expr_integer_safe(condition, fn_name, known)
+                    && body
+                        .iter()
+                        .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+            }
+            StmtKind::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                init.as_ref()
+                    .map_or(true, |s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    && condition
+                        .as_ref()
+                        .map_or(true, |e| Self::is_expr_integer_safe(e, fn_name, known))
+                    && update
+                        .as_ref()
+                        .map_or(true, |e| Self::is_expr_integer_safe(e, fn_name, known))
+                    && body
+                        .iter()
+                        .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+            }
+            StmtKind::Return { value } => value
+                .as_ref()
+                .map_or(true, |e| Self::is_expr_integer_safe(e, fn_name, known)),
+            StmtKind::Expression { expr } => Self::is_expr_integer_safe(expr, fn_name, known),
+            StmtKind::Block { statements } => statements
+                .iter()
+                .all(|s| Self::is_stmt_integer_safe(s, fn_name, known)),
+            StmtKind::FunctionDecl { .. } | StmtKind::Import { .. } => true,
+        }
+    }
+
+    fn is_expr_integer_safe(expr: &Expr, fn_name: &str, known: &HashSet<String>) -> bool {
+        match &expr.kind {
+            ExprKind::NumberLiteral(n) => n.fract() == 0.0,
+            ExprKind::BooleanLiteral(_)
+            | ExprKind::NullLiteral
+            | ExprKind::UndefinedLiteral
+            | ExprKind::Identifier(_) => true,
+            ExprKind::Binary { left, op, right } => {
+                // Division can produce floats
+                if matches!(op, BinOp::Divide) {
+                    return false;
+                }
+                Self::is_expr_integer_safe(left, fn_name, known)
+                    && Self::is_expr_integer_safe(right, fn_name, known)
+            }
+            ExprKind::Unary { operand, .. } => Self::is_expr_integer_safe(operand, fn_name, known),
+            ExprKind::Call { callee, args } => match &callee.kind {
+                // Self-recursive or known integer function
+                ExprKind::Identifier(name) if name == fn_name || known.contains(name) => args
+                    .iter()
+                    .all(|a| Self::is_expr_integer_safe(a, fn_name, known)),
+                _ => false,
+            },
+            ExprKind::Assignment { value, .. } => Self::is_expr_integer_safe(value, fn_name, known),
+            ExprKind::Grouping { expr } => Self::is_expr_integer_safe(expr, fn_name, known),
+            ExprKind::PostfixUpdate { .. } | ExprKind::PrefixUpdate { .. } => true,
+            // String ops, member access, typeof, arrow fns → not integer-safe
+            _ => false,
+        }
+    }
+
     pub fn compile(&mut self, program: &Program) -> Result<(), CompileError> {
+        // Analysis pass: detect functions that can use i64 instead of f64
+        self.integer_functions = Self::analyze_integer_functions(program);
+
         // First pass: compile all function declarations
         for stmt in &program.statements {
             if let StmtKind::FunctionDecl {
@@ -267,6 +383,11 @@ impl<'ctx> Codegen<'ctx> {
         let i32_type = self.context.i32_type();
         let main_fn_type = i32_type.fn_type(&[], false);
         let main_fn = self.module.add_function("main", main_fn_type, None);
+        let nounwind_id = Attribute::get_named_enum_kind_id("nounwind");
+        main_fn.add_attribute(
+            AttributeLoc::Function,
+            self.context.create_enum_attribute(nounwind_id, 0),
+        );
         let entry = self.context.append_basic_block(main_fn, "entry");
         self.builder.position_at_end(entry);
 
@@ -508,13 +629,19 @@ impl<'ctx> Codegen<'ctx> {
         return_type: &Option<TypeAnnotation>,
         body: &[Statement],
     ) -> Result<(), CompileError> {
+        // Switch to integer mode if this function was analyzed as integer-safe
+        let saved_mode = self.number_mode.clone();
+        if self.integer_functions.contains(name) {
+            self.number_mode = VarType::Integer;
+        }
+
         let param_types: Vec<VarType> = params
             .iter()
             .map(|p| {
                 p.type_ann
                     .as_ref()
                     .map(|ann| self.type_ann_to_var_type(ann))
-                    .unwrap_or(VarType::Number)
+                    .unwrap_or_else(|| self.number_mode.clone())
             })
             .collect();
 
@@ -534,6 +661,13 @@ impl<'ctx> Codegen<'ctx> {
 
         let function = self.module.add_function(name, fn_type, None);
         self.functions.insert(name.to_string(), function);
+
+        // Mark function as nounwind (no exceptions) to enable better optimization
+        let nounwind_id = Attribute::get_named_enum_kind_id("nounwind");
+        function.add_attribute(
+            AttributeLoc::Function,
+            self.context.create_enum_attribute(nounwind_id, 0),
+        );
 
         let entry = self.context.append_basic_block(function, "entry");
         let current_bb = self.builder.get_insert_block();
@@ -571,6 +705,7 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         self.pop_scope();
+        self.number_mode = saved_mode;
 
         if let Some(bb) = current_bb {
             self.builder.position_at_end(bb);
@@ -585,10 +720,23 @@ impl<'ctx> Codegen<'ctx> {
         function: FunctionValue<'ctx>,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
         match &expr.kind {
-            ExprKind::NumberLiteral(n) => Ok((
-                self.context.f64_type().const_float(*n).into(),
-                VarType::Number,
-            )),
+            ExprKind::NumberLiteral(n) => {
+                if matches!(self.number_mode, VarType::Integer) && n.fract() == 0.0 {
+                    let val = *n as i64;
+                    Ok((
+                        self.context
+                            .i64_type()
+                            .const_int(val as u64, val < 0)
+                            .into(),
+                        VarType::Integer,
+                    ))
+                } else {
+                    Ok((
+                        self.context.f64_type().const_float(*n).into(),
+                        VarType::Number,
+                    ))
+                }
+            }
 
             ExprKind::StringLiteral(s) => Ok((self.create_string_literal(s), VarType::String)),
 
@@ -614,14 +762,22 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::Binary { left, op, right } => self.compile_binary(left, *op, right, function),
 
             ExprKind::Unary { op, operand } => {
-                let (val, _vt) = self.compile_expr(operand, function)?;
+                let (val, vt) = self.compile_expr(operand, function)?;
                 match op {
                     UnaryOp::Negate => {
-                        let result = self
-                            .builder
-                            .build_float_neg(val.into_float_value(), "neg")
-                            .unwrap();
-                        Ok((result.into(), VarType::Number))
+                        if matches!(vt, VarType::Integer) {
+                            let result = self
+                                .builder
+                                .build_int_neg(val.into_int_value(), "neg")
+                                .unwrap();
+                            Ok((result.into(), VarType::Integer))
+                        } else {
+                            let result = self
+                                .builder
+                                .build_float_neg(val.into_float_value(), "neg")
+                                .unwrap();
+                            Ok((result.into(), VarType::Number))
+                        }
                     }
                     UnaryOp::Not => {
                         let bool_val = self.to_bool(val)?;
@@ -660,28 +816,43 @@ impl<'ctx> Codegen<'ctx> {
                     CompileError::error(format!("Undefined variable '{}'", name), expr.span.clone())
                 })?;
                 let llvm_type = self.var_type_to_llvm(&vt);
-                let old_val = self
-                    .builder
-                    .build_load(llvm_type, ptr, name)
-                    .unwrap()
-                    .into_float_value();
+                let old_val = self.builder.build_load(llvm_type, ptr, name).unwrap();
 
-                let one = self.context.f64_type().const_float(1.0);
-                let new_val = match op {
-                    UpdateOp::Increment => {
-                        self.builder.build_float_add(old_val, one, "inc").unwrap()
-                    }
-                    UpdateOp::Decrement => {
-                        self.builder.build_float_sub(old_val, one, "dec").unwrap()
-                    }
-                };
-                self.builder.build_store(ptr, new_val).unwrap();
-
-                let result = match &expr.kind {
-                    ExprKind::PostfixUpdate { .. } => old_val,
-                    _ => new_val,
-                };
-                Ok((result.into(), VarType::Number))
+                if matches!(vt, VarType::Integer) {
+                    let old_int = old_val.into_int_value();
+                    let one = self.context.i64_type().const_int(1, false);
+                    let new_val = match op {
+                        UpdateOp::Increment => {
+                            self.builder.build_int_add(old_int, one, "inc").unwrap()
+                        }
+                        UpdateOp::Decrement => {
+                            self.builder.build_int_sub(old_int, one, "dec").unwrap()
+                        }
+                    };
+                    self.builder.build_store(ptr, new_val).unwrap();
+                    let result = match &expr.kind {
+                        ExprKind::PostfixUpdate { .. } => old_int,
+                        _ => new_val,
+                    };
+                    Ok((result.into(), VarType::Integer))
+                } else {
+                    let old_float = old_val.into_float_value();
+                    let one = self.context.f64_type().const_float(1.0);
+                    let new_val = match op {
+                        UpdateOp::Increment => {
+                            self.builder.build_float_add(old_float, one, "inc").unwrap()
+                        }
+                        UpdateOp::Decrement => {
+                            self.builder.build_float_sub(old_float, one, "dec").unwrap()
+                        }
+                    };
+                    self.builder.build_store(ptr, new_val).unwrap();
+                    let result = match &expr.kind {
+                        ExprKind::PostfixUpdate { .. } => old_float,
+                        _ => new_val,
+                    };
+                    Ok((result.into(), VarType::Number))
+                }
             }
 
             ExprKind::ArrowFunction { .. } => Err(CompileError::error(
@@ -698,7 +869,7 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
         let (_val, vt) = self.compile_expr(operand, function)?;
         let type_str = match vt {
-            VarType::Number => "number",
+            VarType::Number | VarType::Integer => "number",
             VarType::String => "string",
             VarType::Boolean => "boolean",
         };
@@ -807,7 +978,93 @@ impl<'ctx> Codegen<'ctx> {
             return Ok((result, VarType::String));
         }
 
-        // Numeric operations
+        // Integer operations (narrowed from f64 → i64)
+        if matches!(left_vt, VarType::Integer) && matches!(right_vt, VarType::Integer) {
+            let li = left_val.into_int_value();
+            let ri = right_val.into_int_value();
+
+            let result: BasicValueEnum = match op {
+                BinOp::Add => self.builder.build_int_add(li, ri, "add").unwrap().into(),
+                BinOp::Subtract => self.builder.build_int_sub(li, ri, "sub").unwrap().into(),
+                BinOp::Multiply => self.builder.build_int_mul(li, ri, "mul").unwrap().into(),
+                BinOp::Modulo => self
+                    .builder
+                    .build_int_signed_rem(li, ri, "rem")
+                    .unwrap()
+                    .into(),
+                BinOp::Less => self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, li, ri, "lt")
+                    .unwrap()
+                    .into(),
+                BinOp::Greater => self
+                    .builder
+                    .build_int_compare(IntPredicate::SGT, li, ri, "gt")
+                    .unwrap()
+                    .into(),
+                BinOp::LessEqual => self
+                    .builder
+                    .build_int_compare(IntPredicate::SLE, li, ri, "le")
+                    .unwrap()
+                    .into(),
+                BinOp::GreaterEqual => self
+                    .builder
+                    .build_int_compare(IntPredicate::SGE, li, ri, "ge")
+                    .unwrap()
+                    .into(),
+                BinOp::Equal | BinOp::StrictEqual => self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, li, ri, "eq")
+                    .unwrap()
+                    .into(),
+                BinOp::NotEqual | BinOp::StrictNotEqual => self
+                    .builder
+                    .build_int_compare(IntPredicate::NE, li, ri, "ne")
+                    .unwrap()
+                    .into(),
+                BinOp::And => {
+                    let zero = self.context.i64_type().const_int(0, false);
+                    let lb = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, li, zero, "lb")
+                        .unwrap();
+                    let rb = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, ri, zero, "rb")
+                        .unwrap();
+                    self.builder.build_and(lb, rb, "and").unwrap().into()
+                }
+                BinOp::Or => {
+                    let zero = self.context.i64_type().const_int(0, false);
+                    let lb = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, li, zero, "lb")
+                        .unwrap();
+                    let rb = self
+                        .builder
+                        .build_int_compare(IntPredicate::NE, ri, zero, "rb")
+                        .unwrap();
+                    self.builder.build_or(lb, rb, "or").unwrap().into()
+                }
+                BinOp::Divide => {
+                    // Should not reach here (analysis excludes division)
+                    self.builder
+                        .build_int_signed_div(li, ri, "div")
+                        .unwrap()
+                        .into()
+                }
+            };
+
+            let result_type = match op {
+                BinOp::Add | BinOp::Subtract | BinOp::Multiply | BinOp::Divide | BinOp::Modulo => {
+                    VarType::Integer
+                }
+                _ => VarType::Boolean,
+            };
+            return Ok((result, result_type));
+        }
+
+        // Numeric operations (f64)
         if matches!(left_vt, VarType::Number) && matches!(right_vt, VarType::Number) {
             let lf = left_val.into_float_value();
             let rf = right_val.into_float_value();
@@ -978,9 +1235,26 @@ impl<'ctx> Codegen<'ctx> {
                     CompileError::error(format!("Undefined function '{}'", name), span.clone())
                 })?;
 
+            let is_target_integer = self.integer_functions.contains(name.as_str());
+            let caller_is_integer = matches!(self.number_mode, VarType::Integer);
+
             let mut compiled_args: Vec<BasicMetadataValueEnum> = Vec::new();
             for arg in args {
-                let (val, _) = self.compile_expr(arg, function)?;
+                let (val, vt) = self.compile_expr(arg, function)?;
+                // Convert f64 → i64 when calling an integer function from float context
+                let val =
+                    if is_target_integer && !caller_is_integer && matches!(vt, VarType::Number) {
+                        self.builder
+                            .build_float_to_signed_int(
+                                val.into_float_value(),
+                                self.context.i64_type(),
+                                "f2i",
+                            )
+                            .unwrap()
+                            .into()
+                    } else {
+                        val
+                    };
                 compiled_args.push(val.into());
             }
 
@@ -994,13 +1268,32 @@ impl<'ctx> Codegen<'ctx> {
                     if ret_type.is_float_type() {
                         VarType::Number
                     } else if ret_type.is_int_type() {
-                        VarType::Boolean
+                        let bit_width = ret_type.into_int_type().get_bit_width();
+                        if bit_width == 1 {
+                            VarType::Boolean
+                        } else {
+                            VarType::Integer
+                        }
                     } else {
                         VarType::String
                     }
                 } else {
                     VarType::Number
                 };
+
+                // Convert i64 → f64 when returning from integer function to float context
+                if matches!(ret_vt, VarType::Integer) && !caller_is_integer {
+                    let float_val = self
+                        .builder
+                        .build_signed_int_to_float(
+                            val.into_int_value(),
+                            self.context.f64_type(),
+                            "i2f",
+                        )
+                        .unwrap();
+                    return Ok((float_val.into(), VarType::Number));
+                }
+
                 Ok((val, ret_vt))
             } else {
                 Ok((
@@ -1060,6 +1353,19 @@ impl<'ctx> Codegen<'ctx> {
                 VarType::Number => {
                     let f = self.module.get_function(print_num).unwrap();
                     self.builder.build_call(f, &[val.into()], "").unwrap();
+                }
+                VarType::Integer => {
+                    // Convert i64 → f64 for printing
+                    let float_val = self
+                        .builder
+                        .build_signed_int_to_float(
+                            val.into_int_value(),
+                            self.context.f64_type(),
+                            "i2f_print",
+                        )
+                        .unwrap();
+                    let f = self.module.get_function(print_num).unwrap();
+                    self.builder.build_call(f, &[float_val.into()], "").unwrap();
                 }
                 VarType::String => {
                     let ptr = self
@@ -1318,6 +1624,21 @@ impl<'ctx> Codegen<'ctx> {
                     .left()
                     .unwrap())
             }
+            VarType::Integer => {
+                // Convert i64 → f64, then use number_to_string
+                let float_val = self
+                    .builder
+                    .build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "i2f")
+                    .unwrap();
+                let f = self.module.get_function("mango_number_to_string").unwrap();
+                Ok(self
+                    .builder
+                    .build_call(f, &[float_val.into()], "numstr")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap())
+            }
             VarType::Boolean => {
                 let f = self.module.get_function("mango_boolean_to_string").unwrap();
                 Ok(self
@@ -1344,7 +1665,23 @@ impl<'ctx> Codegen<'ctx> {
                 .unwrap();
             Ok(result.into())
         } else if val.is_int_value() {
-            Ok(val)
+            let int_val = val.into_int_value();
+            if int_val.get_type().get_bit_width() == 1 {
+                // Already a boolean (i1)
+                Ok(val)
+            } else {
+                // i64 integer — compare to 0
+                let result = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        int_val,
+                        self.context.i64_type().const_int(0, false),
+                        "tobool",
+                    )
+                    .unwrap();
+                Ok(result.into())
+            }
         } else {
             let len = self
                 .builder
@@ -1383,6 +1720,7 @@ impl<'ctx> Codegen<'ctx> {
     fn var_type_to_llvm(&self, vt: &VarType) -> BasicTypeEnum<'ctx> {
         match vt {
             VarType::Number => self.context.f64_type().into(),
+            VarType::Integer => self.context.i64_type().into(),
             VarType::String => self.string_type.into(),
             VarType::Boolean => self.context.bool_type().into(),
         }
@@ -1390,16 +1728,17 @@ impl<'ctx> Codegen<'ctx> {
 
     fn type_ann_to_var_type(&self, ann: &TypeAnnotation) -> VarType {
         match &ann.kind {
-            TypeAnnKind::Number => VarType::Number,
+            TypeAnnKind::Number => self.number_mode.clone(),
             TypeAnnKind::String => VarType::String,
             TypeAnnKind::Boolean => VarType::Boolean,
-            _ => VarType::Number,
+            _ => self.number_mode.clone(),
         }
     }
 
     fn default_value(&self, vt: &VarType) -> BasicValueEnum<'ctx> {
         match vt {
             VarType::Number => self.context.f64_type().const_float(0.0).into(),
+            VarType::Integer => self.context.i64_type().const_int(0, false).into(),
             VarType::String => self.create_string_literal(""),
             VarType::Boolean => self.context.bool_type().const_int(0, false).into(),
         }
@@ -1427,24 +1766,45 @@ impl<'ctx> Codegen<'ctx> {
 
     // --- Output ---
 
+    /// Run LLVM optimization passes on the module.
+    pub fn optimize(&self) -> Result<(), String> {
+        let machine = self.create_target_machine(OptimizationLevel::Aggressive)?;
+
+        let options = PassBuilderOptions::create();
+        options.set_loop_vectorization(true);
+        options.set_loop_slp_vectorization(true);
+        options.set_loop_unrolling(true);
+        options.set_merge_functions(true);
+
+        self.module
+            .run_passes("default<O3>", &machine, options)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn write_object_file(&self, path: &Path) -> Result<(), String> {
-        Target::initialize_all(&InitializationConfig::default());
-        let triple = TargetMachine::get_default_triple();
-        let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
-        let machine = target
-            .create_target_machine(
-                &triple,
-                "generic",
-                "",
-                OptimizationLevel::Default,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .ok_or("Failed to create target machine")?;
+        let machine = self.create_target_machine(OptimizationLevel::Aggressive)?;
         machine
             .write_to_file(&self.module, FileType::Object, path)
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    fn create_target_machine(&self, opt_level: OptimizationLevel) -> Result<TargetMachine, String> {
+        Target::initialize_all(&InitializationConfig::default());
+        let triple = TargetMachine::get_default_triple();
+        let cpu = TargetMachine::get_host_cpu_name();
+        let features = TargetMachine::get_host_cpu_features();
+        let target = Target::from_triple(&triple).map_err(|e| e.to_string())?;
+        target
+            .create_target_machine(
+                &triple,
+                cpu.to_str().unwrap(),
+                features.to_str().unwrap(),
+                opt_level,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .ok_or_else(|| "Failed to create target machine".to_string())
     }
 
     pub fn print_ir(&self) -> String {

@@ -42,6 +42,10 @@ enum Commands {
         /// Print LLVM IR instead of compiling
         #[arg(long)]
         emit_ir: bool,
+
+        /// Skip LLVM optimizations (faster compile, slower binary)
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Compile and immediately run a TypeScript file
@@ -56,6 +60,10 @@ enum Commands {
         /// Time the execution (equivalent to prefixing with `time`)
         #[arg(long)]
         benchmark: bool,
+
+        /// Skip LLVM optimizations (faster compile, slower binary)
+        #[arg(long)]
+        debug: bool,
     },
 }
 
@@ -67,6 +75,7 @@ fn main() {
             file,
             output,
             emit_ir,
+            debug,
         } => {
             let output_name = output.unwrap_or_else(|| {
                 Path::new(&file)
@@ -75,7 +84,8 @@ fn main() {
                     .to_string_lossy()
                     .to_string()
             });
-            if let Err(e) = compile(&file, &output_name, emit_ir) {
+            let optimize = !debug;
+            if let Err(e) = compile(&file, &output_name, emit_ir, optimize) {
                 eprintln!("\x1b[1;31merror\x1b[0m: {}", e);
                 std::process::exit(1);
             }
@@ -84,6 +94,7 @@ fn main() {
             file,
             output,
             benchmark,
+            debug,
         } => {
             let output_name = output.unwrap_or_else(|| {
                 let stem = Path::new(&file)
@@ -93,7 +104,8 @@ fn main() {
                     .to_string();
                 format!("./{}", stem)
             });
-            if let Err(e) = compile(&file, &output_name, false) {
+            let optimize = !debug;
+            if let Err(e) = compile(&file, &output_name, false, optimize) {
                 eprintln!("\x1b[1;31merror\x1b[0m: {}", e);
                 std::process::exit(1);
             }
@@ -122,7 +134,7 @@ fn main() {
     }
 }
 
-fn compile(input: &str, output: &str, emit_ir: bool) -> Result<(), String> {
+fn compile(input: &str, output: &str, emit_ir: bool, release: bool) -> Result<(), String> {
     let input_path = Path::new(input);
 
     // Check if the file has imports (needs multi-file compilation)
@@ -132,9 +144,9 @@ fn compile(input: &str, output: &str, emit_ir: bool) -> Result<(), String> {
     let has_imports = source.contains("import ");
 
     if has_imports {
-        compile_multi_file(input_path, output, emit_ir)
+        compile_multi_file(input_path, output, emit_ir, release)
     } else {
-        compile_single_file(input, &source, output, emit_ir)
+        compile_single_file(input, &source, output, emit_ir, release)
     }
 }
 
@@ -143,6 +155,7 @@ fn compile_single_file(
     source: &str,
     output: &str,
     emit_ir: bool,
+    release: bool,
 ) -> Result<(), String> {
     // Lex
     let tokens = Scanner::new(source).scan_tokens().map_err(|e| {
@@ -173,14 +186,30 @@ fn compile_single_file(
     })?;
 
     if emit_ir {
+        if release {
+            codegen
+                .optimize()
+                .map_err(|e| format!("Optimization error: {}", e))?;
+        }
         println!("{}", codegen.print_ir());
         return Ok(());
+    }
+
+    if release {
+        codegen
+            .optimize()
+            .map_err(|e| format!("Optimization error: {}", e))?;
     }
 
     link_and_output(&codegen, output)
 }
 
-fn compile_multi_file(entry_path: &Path, output: &str, emit_ir: bool) -> Result<(), String> {
+fn compile_multi_file(
+    entry_path: &Path,
+    output: &str,
+    emit_ir: bool,
+    release: bool,
+) -> Result<(), String> {
     // Build the module graph
     let graph = ModuleGraph::build(entry_path)?;
 
@@ -255,8 +284,19 @@ fn compile_multi_file(entry_path: &Path, output: &str, emit_ir: bool) -> Result<
     })?;
 
     if emit_ir {
+        if release {
+            codegen
+                .optimize()
+                .map_err(|e| format!("Optimization error: {}", e))?;
+        }
         println!("{}", codegen.print_ir());
         return Ok(());
+    }
+
+    if release {
+        codegen
+            .optimize()
+            .map_err(|e| format!("Optimization error: {}", e))?;
     }
 
     link_and_output(&codegen, output)
