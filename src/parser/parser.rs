@@ -663,6 +663,34 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Result<Expr, CompileError> {
+        // Single-parameter arrow function without parentheses: x => expr
+        if let Token::Identifier(name) = self.peek_token() {
+            if self.peek_next_token() == Token::Arrow {
+                let span = self.current_span();
+                let param_name = name.clone();
+                self.advance(); // consume identifier
+                self.advance(); // consume =>
+                let body = if self.check(&Token::LeftBrace) {
+                    self.advance();
+                    ArrowBody::Block(self.block_body()?)
+                } else {
+                    ArrowBody::Expr(Box::new(self.assignment()?))
+                };
+                return Ok(Expr {
+                    kind: ExprKind::ArrowFunction {
+                        params: vec![Parameter {
+                            name: param_name,
+                            type_ann: None,
+                            span: span.clone(),
+                        }],
+                        return_type: None,
+                        body,
+                    },
+                    span: self.span_from(&span),
+                });
+            }
+        }
+
         let expr = self.ternary()?;
 
         if self.match_token(&Token::Assign) {
@@ -1373,6 +1401,13 @@ impl Parser {
     fn peek_token(&self) -> Token {
         self.tokens
             .get(self.current)
+            .map(|t| t.token.clone())
+            .unwrap_or(Token::Eof)
+    }
+
+    fn peek_next_token(&self) -> Token {
+        self.tokens
+            .get(self.current + 1)
             .map(|t| t.token.clone())
             .unwrap_or(Token::Eof)
     }

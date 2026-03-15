@@ -1135,6 +1135,51 @@ impl TypeChecker {
                 }
                 Ok(elem_type.clone())
             }
+            "map" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        format!("map expects 1 argument, got {}", args.len()),
+                        span.clone(),
+                    ));
+                }
+                let cb_type = self.check_expr(&args[0])?;
+                if let Type::Function { return_type, .. } = &cb_type {
+                    Ok(Type::Array(return_type.clone()))
+                } else {
+                    Ok(Type::Array(Box::new(elem_type.clone())))
+                }
+            }
+            "filter" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        format!("filter expects 1 argument, got {}", args.len()),
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                Ok(Type::Array(Box::new(elem_type.clone())))
+            }
+            "reduce" => {
+                if args.len() != 2 {
+                    return Err(CompileError::error(
+                        format!("reduce expects 2 arguments, got {}", args.len()),
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                let init_type = self.check_expr(&args[1])?;
+                Ok(init_type)
+            }
+            "forEach" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        format!("forEach expects 1 argument, got {}", args.len()),
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                Ok(Type::Void)
+            }
             _ => Err(CompileError::error(
                 format!("Property '{}' does not exist on type 'array'", method),
                 span.clone(),
@@ -1149,6 +1194,23 @@ impl TypeChecker {
         right: &Type,
         span: &Span,
     ) -> Result<Type, CompileError> {
+        // Unknown (any) is permissive — allow operations with it
+        if left == &Type::Unknown || right == &Type::Unknown {
+            return match op {
+                BinOp::Equal
+                | BinOp::StrictEqual
+                | BinOp::NotEqual
+                | BinOp::StrictNotEqual
+                | BinOp::Less
+                | BinOp::Greater
+                | BinOp::LessEqual
+                | BinOp::GreaterEqual
+                | BinOp::And
+                | BinOp::Or => Ok(Type::Boolean),
+                BinOp::Add if left == &Type::String || right == &Type::String => Ok(Type::String),
+                _ => Ok(Type::Number),
+            };
+        }
         match op {
             BinOp::Add => {
                 if left == &Type::Number && right == &Type::Number {
@@ -1229,6 +1291,28 @@ impl TypeChecker {
         // Same-name class types
         if let (Type::Class { name: n1, .. }, Type::Class { name: n2, .. }) = (from, to) {
             return n1 == n2;
+        }
+        // Function type compatibility: compare params and return types recursively
+        if let (
+            Type::Function {
+                params: from_params,
+                return_type: from_ret,
+            },
+            Type::Function {
+                params: to_params,
+                return_type: to_ret,
+            },
+        ) = (from, to)
+        {
+            if from_params.len() != to_params.len() {
+                return false;
+            }
+            let params_ok = from_params
+                .iter()
+                .zip(to_params.iter())
+                .all(|(f, t)| self.is_assignable(f, t));
+            let ret_ok = self.is_assignable(from_ret, to_ret);
+            return params_ok && ret_ok;
         }
         false
     }

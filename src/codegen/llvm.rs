@@ -27,6 +27,8 @@ pub struct Codegen<'ctx> {
     functions: HashMap<String, FunctionValue<'ctx>>,
     string_type: StructType<'ctx>,
     array_type: StructType<'ctx>,
+    /// Closure type: { fn_ptr: ptr, env_ptr: ptr }
+    closure_type: StructType<'ctx>,
     /// If true, don't generate a main() — this is a library module
     pub is_library: bool,
     /// Functions whose number params/returns are compiled as i64
@@ -41,6 +43,8 @@ pub struct Codegen<'ctx> {
     class_struct_types: HashMap<String, (StructType<'ctx>, Vec<(String, VarType)>, Option<String>)>,
     /// Current `this` pointer (set during method compilation)
     current_this: Option<(PointerValue<'ctx>, VarType)>,
+    /// Return VarTypes for compiled functions (for correct call return type inference)
+    function_return_types: HashMap<String, VarType>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +56,13 @@ enum VarType {
     Array,
     FunctionPtr {
         fn_name: String,
+    },
+    /// Closure: a function value with optional captured environment
+    /// Represented as { fn_ptr, env_ptr } struct in LLVM
+    Closure {
+        fn_name: String,
+        param_types: Vec<VarType>,
+        return_type: Box<VarType>,
     },
     /// Object/class instance with ordered fields
     Object {
@@ -88,6 +99,15 @@ impl<'ctx> Codegen<'ctx> {
             false,
         );
 
+        // Closure type: { fn_ptr: ptr, env_ptr: ptr }
+        let closure_type = context.struct_type(
+            &[
+                context.ptr_type(AddressSpace::default()).into(),
+                context.ptr_type(AddressSpace::default()).into(),
+            ],
+            false,
+        );
+
         let mut codegen = Self {
             context,
             module,
@@ -96,6 +116,7 @@ impl<'ctx> Codegen<'ctx> {
             functions: HashMap::new(),
             string_type,
             array_type,
+            closure_type,
             is_library: false,
             integer_functions: HashSet::new(),
             number_mode: VarType::Number,
@@ -103,6 +124,7 @@ impl<'ctx> Codegen<'ctx> {
             arrow_counter: 0,
             class_struct_types: HashMap::new(),
             current_this: None,
+            function_return_types: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -527,7 +549,7 @@ impl<'ctx> Codegen<'ctx> {
             } => {
                 let (alloca, var_type) = if let Some(init) = initializer {
                     let (val, vt) = self.compile_expr(init, function)?;
-                    // Register arrow function under the variable name
+                    // Register non-closure arrow function under the variable name
                     if let VarType::FunctionPtr { ref fn_name } = vt {
                         if let Some(func) = self.functions.get(fn_name).copied() {
                             self.functions.insert(name.clone(), func);
@@ -834,6 +856,12 @@ impl<'ctx> Codegen<'ctx> {
 
         let function = self.module.add_function(name, fn_type, None);
         self.functions.insert(name.to_string(), function);
+
+        // Store return type for call-site inference
+        if let Some(ref vt) = ret_vt {
+            self.function_return_types
+                .insert(name.to_string(), vt.clone());
+        }
 
         // Mark function as nounwind (no exceptions) to enable better optimization
         let nounwind_id = Attribute::get_named_enum_kind_id("nounwind");
@@ -1232,13 +1260,18 @@ impl<'ctx> Codegen<'ctx> {
                     ArrowBody::Block(stmts) => stmts.clone(),
                 };
 
-                self.compile_function_decl(&fn_name, params, return_type, &body_stmts)?;
+                // Find captured variables from outer scopes
+                let captures = self.find_captures(&body_stmts, params);
 
-                // Get the compiled function as a pointer value
-                let func = self.functions.get(&fn_name).copied().unwrap();
-                let fn_ptr = func.as_global_value().as_pointer_value();
-
-                Ok((fn_ptr.into(), VarType::FunctionPtr { fn_name }))
+                // Compile as a closure (all arrows use closure convention)
+                self.compile_closure(
+                    &fn_name,
+                    params,
+                    return_type,
+                    &body_stmts,
+                    captures,
+                    function,
+                )
             }
 
             ExprKind::ObjectLiteral { properties } => {
@@ -1809,7 +1842,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::String => "string",
             VarType::Boolean => "boolean",
             VarType::Array | VarType::Object { .. } => "object",
-            VarType::FunctionPtr { .. } => "function",
+            VarType::FunctionPtr { .. } | VarType::Closure { .. } => "function",
         };
         Ok((self.create_string_literal(type_str), VarType::String))
     }
@@ -2335,6 +2368,25 @@ impl<'ctx> Codegen<'ctx> {
                 return self.compile_global_func(name, args, function, span);
             }
 
+            // Check if it's a closure variable first
+            if let Some((var_ptr, var_vt)) = self.get_variable(name) {
+                if let VarType::Closure {
+                    ref param_types,
+                    ref return_type,
+                    ..
+                } = var_vt
+                {
+                    return self.compile_closure_call(
+                        var_ptr,
+                        param_types,
+                        return_type,
+                        args,
+                        function,
+                        span,
+                    );
+                }
+            }
+
             let func = self
                 .functions
                 .get(name)
@@ -2373,7 +2425,10 @@ impl<'ctx> Codegen<'ctx> {
                 .unwrap();
 
             if let Some(val) = result.try_as_basic_value().left() {
-                let ret_vt = if let Some(ret_type) = func.get_type().get_return_type() {
+                // Use stored return type if available (more accurate than LLVM type inference)
+                let ret_vt = if let Some(stored_vt) = self.function_return_types.get(name) {
+                    stored_vt.clone()
+                } else if let Some(ret_type) = func.get_type().get_return_type() {
                     if ret_type.is_float_type() {
                         VarType::Number
                     } else if ret_type.is_int_type() {
@@ -2513,7 +2568,7 @@ impl<'ctx> Codegen<'ctx> {
                         .build_call(f, &[data_ptr.into(), length.into()], "")
                         .unwrap();
                 }
-                VarType::FunctionPtr { .. } => {
+                VarType::FunctionPtr { .. } | VarType::Closure { .. } => {
                     // Print [Function] for function values
                     let s = self.create_string_literal("[Function]");
                     let ptr = self
@@ -2879,6 +2934,456 @@ impl<'ctx> Codegen<'ctx> {
 
                 Ok((popped, VarType::Number))
             }
+            "forEach" => {
+                // forEach(callback): call callback(element) for each element
+                let (cb_val, cb_vt) = self.compile_expr(&args[0], function)?;
+                let (cb_fn_ptr, cb_env_ptr) = self.extract_closure_parts(cb_val)?;
+
+                // Determine callback return type from its VarType
+                let cb_ret_vt = if let VarType::Closure {
+                    ref return_type, ..
+                } = cb_vt
+                {
+                    (**return_type).clone()
+                } else {
+                    VarType::Number
+                };
+
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 0, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let length = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 1, "len")
+                    .unwrap()
+                    .into_int_value();
+
+                let i64_type = self.context.i64_type();
+                let f64_type = self.context.f64_type();
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+                let header_bb = self.context.append_basic_block(function, "forEach.header");
+                let body_bb = self.context.append_basic_block(function, "forEach.body");
+                let exit_bb = self.context.append_basic_block(function, "forEach.exit");
+
+                let pre_bb = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+                self.builder.position_at_end(header_bb);
+
+                let i_phi = self.builder.build_phi(i64_type, "i").unwrap();
+                i_phi.add_incoming(&[(&i64_type.const_int(0, false), pre_bb)]);
+                let i = i_phi.as_basic_value().into_int_value();
+                let cmp = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, i, length, "cmp")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(cmp, body_bb, exit_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(body_bb);
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_gep(f64_type, data_ptr, &[i], "elem_ptr")
+                        .unwrap()
+                };
+                let elem = self.builder.build_load(f64_type, elem_ptr, "elem").unwrap();
+
+                // Call callback(env, elem) — use actual return type to match function signature
+                let cb_fn_type = match cb_ret_vt {
+                    VarType::Number => f64_type.fn_type(&[ptr_type.into(), f64_type.into()], false),
+                    VarType::Boolean => self
+                        .context
+                        .bool_type()
+                        .fn_type(&[ptr_type.into(), f64_type.into()], false),
+                    _ => self
+                        .context
+                        .void_type()
+                        .fn_type(&[ptr_type.into(), f64_type.into()], false),
+                };
+                self.builder
+                    .build_indirect_call(
+                        cb_fn_type,
+                        cb_fn_ptr,
+                        &[cb_env_ptr.into(), elem.into()],
+                        "",
+                    )
+                    .unwrap();
+
+                let i_next = self
+                    .builder
+                    .build_int_add(i, i64_type.const_int(1, false), "i_next")
+                    .unwrap();
+                i_phi.add_incoming(&[(&i_next, body_bb)]);
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+
+                self.builder.position_at_end(exit_bb);
+                Ok((f64_type.const_float(0.0).into(), VarType::Number))
+            }
+
+            "map" => {
+                // map(callback): create new array with callback(element) for each
+                let (cb_val, _cb_vt) = self.compile_expr(&args[0], function)?;
+                let (cb_fn_ptr, cb_env_ptr) = self.extract_closure_parts(cb_val)?;
+
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 0, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let length = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 1, "len")
+                    .unwrap()
+                    .into_int_value();
+
+                let i64_type = self.context.i64_type();
+                let f64_type = self.context.f64_type();
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+                // Allocate new array: malloc(length * 8)
+                let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+                    self.module.add_function(
+                        "malloc",
+                        ptr_type.fn_type(&[i64_type.into()], false),
+                        None,
+                    )
+                });
+                let alloc_size = self
+                    .builder
+                    .build_int_mul(length, i64_type.const_int(8, false), "alloc_size")
+                    .unwrap();
+                let new_data = self
+                    .builder
+                    .build_call(malloc_fn, &[alloc_size.into()], "map_data")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                let header_bb = self.context.append_basic_block(function, "map.header");
+                let body_bb = self.context.append_basic_block(function, "map.body");
+                let exit_bb = self.context.append_basic_block(function, "map.exit");
+
+                let pre_bb = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+                self.builder.position_at_end(header_bb);
+
+                let i_phi = self.builder.build_phi(i64_type, "i").unwrap();
+                i_phi.add_incoming(&[(&i64_type.const_int(0, false), pre_bb)]);
+                let i = i_phi.as_basic_value().into_int_value();
+                let cmp = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, i, length, "cmp")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(cmp, body_bb, exit_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(body_bb);
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_gep(f64_type, data_ptr, &[i], "elem_ptr")
+                        .unwrap()
+                };
+                let elem = self.builder.build_load(f64_type, elem_ptr, "elem").unwrap();
+
+                // Call callback(env, elem) -> f64
+                let cb_fn_type = f64_type.fn_type(&[ptr_type.into(), f64_type.into()], false);
+                let result = self
+                    .builder
+                    .build_indirect_call(
+                        cb_fn_type,
+                        cb_fn_ptr,
+                        &[cb_env_ptr.into(), elem.into()],
+                        "mapped",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+
+                // Store result in new array
+                let dst_ptr = unsafe {
+                    self.builder
+                        .build_gep(f64_type, new_data, &[i], "dst_ptr")
+                        .unwrap()
+                };
+                self.builder.build_store(dst_ptr, result).unwrap();
+
+                let i_next = self
+                    .builder
+                    .build_int_add(i, i64_type.const_int(1, false), "i_next")
+                    .unwrap();
+                i_phi.add_incoming(&[(&i_next, body_bb)]);
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+
+                self.builder.position_at_end(exit_bb);
+
+                // Build result array struct
+                let arr = self.array_type.const_zero();
+                let arr = self
+                    .builder
+                    .build_insert_value(arr, new_data, 0, "arr.data")
+                    .unwrap();
+                let arr = self
+                    .builder
+                    .build_insert_value(arr.into_struct_value(), length, 1, "arr.len")
+                    .unwrap();
+                let arr = self
+                    .builder
+                    .build_insert_value(arr.into_struct_value(), length, 2, "arr.cap")
+                    .unwrap();
+                Ok((arr.into_struct_value().into(), VarType::Array))
+            }
+
+            "filter" => {
+                // filter(callback): create new array with elements where callback returns true
+                let (cb_val, _cb_vt) = self.compile_expr(&args[0], function)?;
+                let (cb_fn_ptr, cb_env_ptr) = self.extract_closure_parts(cb_val)?;
+
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 0, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let length = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 1, "len")
+                    .unwrap()
+                    .into_int_value();
+
+                let i64_type = self.context.i64_type();
+                let f64_type = self.context.f64_type();
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+                // Allocate new array with same capacity as original
+                let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+                    self.module.add_function(
+                        "malloc",
+                        ptr_type.fn_type(&[i64_type.into()], false),
+                        None,
+                    )
+                });
+                let alloc_size = self
+                    .builder
+                    .build_int_mul(length, i64_type.const_int(8, false), "alloc_size")
+                    .unwrap();
+                let new_data = self
+                    .builder
+                    .build_call(malloc_fn, &[alloc_size.into()], "filter_data")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                let header_bb = self.context.append_basic_block(function, "filter.header");
+                let body_bb = self.context.append_basic_block(function, "filter.body");
+                let store_bb = self.context.append_basic_block(function, "filter.store");
+                let cont_bb = self.context.append_basic_block(function, "filter.cont");
+                let exit_bb = self.context.append_basic_block(function, "filter.exit");
+
+                let pre_bb = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+                self.builder.position_at_end(header_bb);
+
+                let i_phi = self.builder.build_phi(i64_type, "i").unwrap();
+                i_phi.add_incoming(&[(&i64_type.const_int(0, false), pre_bb)]);
+                let out_idx_phi = self.builder.build_phi(i64_type, "out_idx").unwrap();
+                out_idx_phi.add_incoming(&[(&i64_type.const_int(0, false), pre_bb)]);
+
+                let i = i_phi.as_basic_value().into_int_value();
+                let out_idx = out_idx_phi.as_basic_value().into_int_value();
+                let cmp = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, i, length, "cmp")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(cmp, body_bb, exit_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(body_bb);
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_gep(f64_type, data_ptr, &[i], "elem_ptr")
+                        .unwrap()
+                };
+                let elem = self.builder.build_load(f64_type, elem_ptr, "elem").unwrap();
+
+                // Call callback(env, elem) -> i1 (boolean)
+                let cb_fn_type = self
+                    .context
+                    .bool_type()
+                    .fn_type(&[ptr_type.into(), f64_type.into()], false);
+                let result = self
+                    .builder
+                    .build_indirect_call(
+                        cb_fn_type,
+                        cb_fn_ptr,
+                        &[cb_env_ptr.into(), elem.into()],
+                        "pred",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+
+                // The result is i1 (boolean) — branch directly
+                let is_true = result.into_int_value();
+                self.builder
+                    .build_conditional_branch(is_true, store_bb, cont_bb)
+                    .unwrap();
+
+                // Store element in output array
+                self.builder.position_at_end(store_bb);
+                let dst_ptr = unsafe {
+                    self.builder
+                        .build_gep(f64_type, new_data, &[out_idx], "dst_ptr")
+                        .unwrap()
+                };
+                self.builder.build_store(dst_ptr, elem).unwrap();
+                let out_next = self
+                    .builder
+                    .build_int_add(out_idx, i64_type.const_int(1, false), "out_next")
+                    .unwrap();
+                self.builder.build_unconditional_branch(cont_bb).unwrap();
+
+                // Continue to next iteration
+                self.builder.position_at_end(cont_bb);
+                let out_phi = self.builder.build_phi(i64_type, "out_merged").unwrap();
+                out_phi.add_incoming(&[(&out_next, store_bb), (&out_idx, body_bb)]);
+
+                let i_next = self
+                    .builder
+                    .build_int_add(i, i64_type.const_int(1, false), "i_next")
+                    .unwrap();
+                i_phi.add_incoming(&[(&i_next, cont_bb)]);
+                out_idx_phi.add_incoming(&[(&out_phi.as_basic_value(), cont_bb)]);
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+
+                self.builder.position_at_end(exit_bb);
+
+                // Build result array struct with actual count
+                let final_len = out_idx; // phi value at exit
+                let arr = self.array_type.const_zero();
+                let arr = self
+                    .builder
+                    .build_insert_value(arr, new_data, 0, "arr.data")
+                    .unwrap();
+                let arr = self
+                    .builder
+                    .build_insert_value(arr.into_struct_value(), final_len, 1, "arr.len")
+                    .unwrap();
+                let arr = self
+                    .builder
+                    .build_insert_value(arr.into_struct_value(), length, 2, "arr.cap")
+                    .unwrap();
+                Ok((arr.into_struct_value().into(), VarType::Array))
+            }
+
+            "reduce" => {
+                // reduce(callback, initial): fold array with callback(acc, elem)
+                if args.len() != 2 {
+                    return Err(CompileError::error(
+                        format!("reduce expects 2 arguments, got {}", args.len()),
+                        span.clone(),
+                    ));
+                }
+                let (cb_val, _cb_vt) = self.compile_expr(&args[0], function)?;
+                let (cb_fn_ptr, cb_env_ptr) = self.extract_closure_parts(cb_val)?;
+
+                let (init_val, init_vt) = self.compile_expr(&args[1], function)?;
+                let init_f64 = match init_vt {
+                    VarType::Integer => self
+                        .builder
+                        .build_signed_int_to_float(
+                            init_val.into_int_value(),
+                            self.context.f64_type(),
+                            "i2f",
+                        )
+                        .unwrap()
+                        .into(),
+                    _ => init_val,
+                };
+
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 0, "data")
+                    .unwrap()
+                    .into_pointer_value();
+                let length = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 1, "len")
+                    .unwrap()
+                    .into_int_value();
+
+                let i64_type = self.context.i64_type();
+                let f64_type = self.context.f64_type();
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+                let header_bb = self.context.append_basic_block(function, "reduce.header");
+                let body_bb = self.context.append_basic_block(function, "reduce.body");
+                let exit_bb = self.context.append_basic_block(function, "reduce.exit");
+
+                let pre_bb = self.builder.get_insert_block().unwrap();
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+                self.builder.position_at_end(header_bb);
+
+                let i_phi = self.builder.build_phi(i64_type, "i").unwrap();
+                i_phi.add_incoming(&[(&i64_type.const_int(0, false), pre_bb)]);
+                let acc_phi = self.builder.build_phi(f64_type, "acc").unwrap();
+                acc_phi.add_incoming(&[(&init_f64, pre_bb)]);
+
+                let i = i_phi.as_basic_value().into_int_value();
+                let acc = acc_phi.as_basic_value().into_float_value();
+                let cmp = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, i, length, "cmp")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(cmp, body_bb, exit_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(body_bb);
+                let elem_ptr = unsafe {
+                    self.builder
+                        .build_gep(f64_type, data_ptr, &[i], "elem_ptr")
+                        .unwrap()
+                };
+                let elem = self.builder.build_load(f64_type, elem_ptr, "elem").unwrap();
+
+                // Call callback(env, acc, elem) -> f64
+                let cb_fn_type =
+                    f64_type.fn_type(&[ptr_type.into(), f64_type.into(), f64_type.into()], false);
+                let new_acc = self
+                    .builder
+                    .build_indirect_call(
+                        cb_fn_type,
+                        cb_fn_ptr,
+                        &[cb_env_ptr.into(), acc.into(), elem.into()],
+                        "new_acc",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+
+                let i_next = self
+                    .builder
+                    .build_int_add(i, i64_type.const_int(1, false), "i_next")
+                    .unwrap();
+                i_phi.add_incoming(&[(&i_next, body_bb)]);
+                acc_phi.add_incoming(&[(&new_acc, body_bb)]);
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+
+                self.builder.position_at_end(exit_bb);
+                Ok((acc.into(), VarType::Number))
+            }
+
             _ => Err(CompileError::error(
                 format!("Unknown array method '{}'", method),
                 span.clone(),
@@ -3004,7 +3509,9 @@ impl<'ctx> Codegen<'ctx> {
                 // Arrays don't have a to_string yet; return "[object Array]"
                 Ok(self.create_string_literal("[object Array]"))
             }
-            VarType::FunctionPtr { .. } => Ok(self.create_string_literal("[Function]")),
+            VarType::FunctionPtr { .. } | VarType::Closure { .. } => {
+                Ok(self.create_string_literal("[Function]"))
+            }
             VarType::Object { .. } => Ok(self.create_string_literal("[object Object]")),
         }
     }
@@ -3082,6 +3589,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Boolean => self.context.bool_type().into(),
             VarType::Array => self.array_type.into(),
             VarType::FunctionPtr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
+            VarType::Closure { .. } => self.closure_type.into(),
             VarType::Object {
                 struct_type_name,
                 fields,
@@ -3132,10 +3640,19 @@ impl<'ctx> Codegen<'ctx> {
                     self.number_mode.clone()
                 }
             }
-            TypeAnnKind::FunctionType { .. } => {
-                // Function types are opaque pointers
-                VarType::FunctionPtr {
+            TypeAnnKind::FunctionType {
+                params,
+                return_type,
+            } => {
+                let param_types: Vec<VarType> = params
+                    .iter()
+                    .map(|p| self.type_ann_to_var_type(p))
+                    .collect();
+                let ret_vt = self.type_ann_to_var_type(return_type);
+                VarType::Closure {
                     fn_name: String::new(),
+                    param_types,
+                    return_type: Box::new(ret_vt),
                 }
             }
         }
@@ -3153,6 +3670,7 @@ impl<'ctx> Codegen<'ctx> {
                 .ptr_type(AddressSpace::default())
                 .const_null()
                 .into(),
+            VarType::Closure { .. } => self.closure_type.const_zero().into(),
             VarType::Object { fields, .. } => {
                 let llvm_type = self.var_type_to_llvm(vt);
                 let st = llvm_type.into_struct_type();
@@ -3188,6 +3706,523 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         None
+    }
+
+    // --- Closure support ---
+
+    /// Infer the VarType of an expression from its AST structure (without compiling).
+    /// Used to determine return types of unannotated arrow functions.
+    fn infer_expr_var_type(expr: &Expr) -> VarType {
+        match &expr.kind {
+            ExprKind::NumberLiteral(_) => VarType::Number,
+            ExprKind::StringLiteral(_) => VarType::String,
+            ExprKind::BooleanLiteral(_) => VarType::Boolean,
+            ExprKind::Binary {
+                op, left, right, ..
+            } => match op {
+                BinOp::Less
+                | BinOp::Greater
+                | BinOp::LessEqual
+                | BinOp::GreaterEqual
+                | BinOp::Equal
+                | BinOp::StrictEqual
+                | BinOp::NotEqual
+                | BinOp::StrictNotEqual
+                | BinOp::And
+                | BinOp::Or => VarType::Boolean,
+                BinOp::Add => {
+                    // If either side is a string, result is string
+                    let l = Self::infer_expr_var_type(left);
+                    let r = Self::infer_expr_var_type(right);
+                    if matches!(l, VarType::String) || matches!(r, VarType::String) {
+                        VarType::String
+                    } else {
+                        VarType::Number
+                    }
+                }
+                _ => VarType::Number,
+            },
+            ExprKind::Unary { op, .. } => match op {
+                UnaryOp::Not => VarType::Boolean,
+                UnaryOp::Negate => VarType::Number,
+            },
+            ExprKind::Conditional { consequent, .. } => Self::infer_expr_var_type(consequent),
+            ExprKind::Grouping { expr } => Self::infer_expr_var_type(expr),
+            // Default to number for identifiers, calls, etc.
+            _ => VarType::Number,
+        }
+    }
+
+    /// Extract fn_ptr and env_ptr from a closure value ({ ptr, ptr } struct).
+    fn extract_closure_parts(
+        &self,
+        closure_val: BasicValueEnum<'ctx>,
+    ) -> Result<(PointerValue<'ctx>, BasicValueEnum<'ctx>), CompileError> {
+        let sv = closure_val.into_struct_value();
+        let fn_ptr = self
+            .builder
+            .build_extract_value(sv, 0, "fn_ptr")
+            .unwrap()
+            .into_pointer_value();
+        let env_ptr = self.builder.build_extract_value(sv, 1, "env_ptr").unwrap();
+        Ok((fn_ptr, env_ptr))
+    }
+
+    /// Collect all identifier names referenced in a list of statements.
+    fn collect_idents_in_stmts(stmts: &[Statement], out: &mut HashSet<String>) {
+        for s in stmts {
+            Self::collect_idents_in_stmt(s, out);
+        }
+    }
+
+    fn collect_idents_in_stmt(stmt: &Statement, out: &mut HashSet<String>) {
+        match &stmt.kind {
+            StmtKind::VariableDecl { initializer, .. } => {
+                if let Some(e) = initializer {
+                    Self::collect_idents_in_expr(e, out);
+                }
+            }
+            StmtKind::Expression { expr } => Self::collect_idents_in_expr(expr, out),
+            StmtKind::Return { value } => {
+                if let Some(e) = value {
+                    Self::collect_idents_in_expr(e, out);
+                }
+            }
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                Self::collect_idents_in_expr(condition, out);
+                Self::collect_idents_in_stmts(then_branch, out);
+                if let Some(eb) = else_branch {
+                    Self::collect_idents_in_stmts(eb, out);
+                }
+            }
+            StmtKind::While { condition, body } => {
+                Self::collect_idents_in_expr(condition, out);
+                Self::collect_idents_in_stmts(body, out);
+            }
+            StmtKind::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                if let Some(i) = init {
+                    Self::collect_idents_in_stmt(i, out);
+                }
+                if let Some(c) = condition {
+                    Self::collect_idents_in_expr(c, out);
+                }
+                if let Some(u) = update {
+                    Self::collect_idents_in_expr(u, out);
+                }
+                Self::collect_idents_in_stmts(body, out);
+            }
+            StmtKind::Block { statements } => Self::collect_idents_in_stmts(statements, out),
+            _ => {}
+        }
+    }
+
+    fn collect_idents_in_expr(expr: &Expr, out: &mut HashSet<String>) {
+        match &expr.kind {
+            ExprKind::Identifier(name) => {
+                out.insert(name.clone());
+            }
+            ExprKind::Binary { left, right, .. } => {
+                Self::collect_idents_in_expr(left, out);
+                Self::collect_idents_in_expr(right, out);
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Typeof { operand } => {
+                Self::collect_idents_in_expr(operand, out);
+            }
+            ExprKind::Call { callee, args } => {
+                Self::collect_idents_in_expr(callee, out);
+                for a in args {
+                    Self::collect_idents_in_expr(a, out);
+                }
+            }
+            ExprKind::Member { object, .. } => {
+                Self::collect_idents_in_expr(object, out);
+            }
+            ExprKind::Assignment { name, value } => {
+                out.insert(name.clone());
+                Self::collect_idents_in_expr(value, out);
+            }
+            ExprKind::MemberAssignment { object, value, .. } => {
+                Self::collect_idents_in_expr(object, out);
+                Self::collect_idents_in_expr(value, out);
+            }
+            ExprKind::PostfixUpdate { name, .. } | ExprKind::PrefixUpdate { name, .. } => {
+                out.insert(name.clone());
+            }
+            ExprKind::Conditional {
+                condition,
+                consequent,
+                alternate,
+            } => {
+                Self::collect_idents_in_expr(condition, out);
+                Self::collect_idents_in_expr(consequent, out);
+                Self::collect_idents_in_expr(alternate, out);
+            }
+            ExprKind::ArrowFunction { body, .. } => match body {
+                ArrowBody::Expr(e) => Self::collect_idents_in_expr(e, out),
+                ArrowBody::Block(stmts) => Self::collect_idents_in_stmts(stmts, out),
+            },
+            ExprKind::ObjectLiteral { properties } => {
+                for prop in properties {
+                    Self::collect_idents_in_expr(&prop.value, out);
+                }
+            }
+            ExprKind::ArrayLiteral { elements } => {
+                for e in elements {
+                    Self::collect_idents_in_expr(e, out);
+                }
+            }
+            ExprKind::IndexAccess { object, index } => {
+                Self::collect_idents_in_expr(object, out);
+                Self::collect_idents_in_expr(index, out);
+            }
+            ExprKind::NewExpr { args, .. } => {
+                for a in args {
+                    Self::collect_idents_in_expr(a, out);
+                }
+            }
+            ExprKind::Grouping { expr } => Self::collect_idents_in_expr(expr, out),
+            // Literals and This don't contain variable identifiers
+            _ => {}
+        }
+    }
+
+    /// Find variables captured by an arrow function body.
+    /// Returns (name, pointer_in_outer_scope, var_type) for each capture.
+    fn find_captures(
+        &self,
+        body_stmts: &[Statement],
+        params: &[Parameter],
+    ) -> Vec<(String, PointerValue<'ctx>, VarType)> {
+        let param_names: HashSet<String> = params.iter().map(|p| p.name.clone()).collect();
+        let mut referenced = HashSet::new();
+        Self::collect_idents_in_stmts(body_stmts, &mut referenced);
+
+        let mut captures = Vec::new();
+        for name in &referenced {
+            if param_names.contains(name) {
+                continue;
+            }
+            // Check if it's a variable in scope (not a function name)
+            if let Some((ptr, vt)) = self.get_variable(name) {
+                // Don't capture function pointers that are in self.functions
+                // (they're globally accessible LLVM functions)
+                if matches!(vt, VarType::FunctionPtr { .. }) {
+                    continue;
+                }
+                captures.push((name.clone(), ptr, vt));
+            }
+        }
+        captures
+    }
+
+    /// Compile an arrow function as a closure with an environment struct.
+    /// All arrow functions use the closure convention: { fn_ptr, env_ptr } struct.
+    /// The LLVM function always takes ptr %env as its first parameter.
+    fn compile_closure(
+        &mut self,
+        fn_name: &str,
+        params: &[Parameter],
+        return_type: &Option<TypeAnnotation>,
+        body_stmts: &[Statement],
+        captures: Vec<(String, PointerValue<'ctx>, VarType)>,
+        _caller_function: FunctionValue<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // --- Determine parameter types ---
+        let param_vts: Vec<VarType> = params
+            .iter()
+            .map(|p| {
+                p.type_ann
+                    .as_ref()
+                    .map(|ann| self.type_ann_to_var_type(ann))
+                    .unwrap_or_else(|| self.number_mode.clone())
+            })
+            .collect();
+
+        // LLVM param types: [ptr (env)] + declared params
+        let mut llvm_param_types: Vec<BasicMetadataTypeEnum<'ctx>> = vec![ptr_type.into()];
+        for vt in &param_vts {
+            llvm_param_types.push(self.var_type_to_llvm(vt).into());
+        }
+
+        let mut ret_vt = return_type
+            .as_ref()
+            .map(|ann| self.type_ann_to_var_type(ann));
+
+        // Infer return type from body if not annotated
+        if ret_vt.is_none() {
+            if let Some(Statement {
+                kind:
+                    StmtKind::Return {
+                        value: Some(ret_expr),
+                    },
+                ..
+            }) = body_stmts.first()
+            {
+                ret_vt = Some(Self::infer_expr_var_type(ret_expr));
+            }
+        }
+
+        let fn_type = match &ret_vt {
+            Some(vt) => self.var_type_to_llvm(vt).fn_type(&llvm_param_types, false),
+            None => self.context.void_type().fn_type(&llvm_param_types, false),
+        };
+
+        let arrow_fn = self.module.add_function(fn_name, fn_type, None);
+        self.functions.insert(fn_name.to_string(), arrow_fn);
+
+        let nounwind_id = Attribute::get_named_enum_kind_id("nounwind");
+        arrow_fn.add_attribute(
+            AttributeLoc::Function,
+            self.context.create_enum_attribute(nounwind_id, 0),
+        );
+
+        let entry = self.context.append_basic_block(arrow_fn, "entry");
+        let saved_bb = self.builder.get_insert_block();
+
+        self.builder.position_at_end(entry);
+
+        // --- Save and isolate scope ---
+        let saved_scopes = std::mem::take(&mut self.variables);
+        self.push_scope();
+
+        // --- Set up captured variables from env struct ---
+        let env_ptr = arrow_fn.get_nth_param(0).unwrap().into_pointer_value();
+
+        if !captures.is_empty() {
+            // Build the env struct type from captured variable types
+            let env_field_types: Vec<BasicTypeEnum<'ctx>> = captures
+                .iter()
+                .map(|(_, _, vt)| self.var_type_to_llvm(vt))
+                .collect();
+            let env_struct_type = self.context.struct_type(&env_field_types, false);
+
+            // GEP into env struct for each captured variable
+            for (i, (name, _, vt)) in captures.iter().enumerate() {
+                let field_ptr = self
+                    .builder
+                    .build_struct_gep(env_struct_type, env_ptr, i as u32, &format!("env.{}", name))
+                    .unwrap();
+                self.set_variable(name.clone(), field_ptr, vt.clone());
+            }
+        }
+
+        // --- Set up declared parameters (index +1 because env is first) ---
+        for (i, (param, vt)) in params.iter().zip(param_vts.iter()).enumerate() {
+            let param_val = arrow_fn.get_nth_param((i + 1) as u32).unwrap();
+            let alloca = self.create_alloca(arrow_fn, vt, &param.name);
+            self.builder.build_store(alloca, param_val).unwrap();
+            self.set_variable(param.name.clone(), alloca, vt.clone());
+        }
+
+        // --- Compile body ---
+        for stmt in body_stmts {
+            self.compile_statement(stmt, arrow_fn)?;
+        }
+
+        // Add default return if needed
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            match &ret_vt {
+                Some(vt) => {
+                    let default_val = self.default_value(vt);
+                    self.builder.build_return(Some(&default_val)).unwrap();
+                }
+                None => {
+                    self.builder.build_return(None).unwrap();
+                }
+            }
+        }
+
+        // --- Restore scope ---
+        self.pop_scope();
+        self.variables = saved_scopes;
+
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        // --- Create environment struct (in the caller's context) ---
+        let env_alloc = if !captures.is_empty() {
+            let env_field_types: Vec<BasicTypeEnum<'ctx>> = captures
+                .iter()
+                .map(|(_, _, vt)| self.var_type_to_llvm(vt))
+                .collect();
+            let env_struct_type = self.context.struct_type(&env_field_types, false);
+
+            // malloc the environment
+            let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+                self.module.add_function(
+                    "malloc",
+                    ptr_type.fn_type(&[self.context.i64_type().into()], false),
+                    None,
+                )
+            });
+
+            let env_size = env_struct_type.size_of().unwrap();
+            let env_malloc = self
+                .builder
+                .build_call(malloc_fn, &[env_size.into()], "env_alloc")
+                .unwrap()
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+
+            // Copy captured variable values into the env struct
+            for (i, (_, src_ptr, vt)) in captures.iter().enumerate() {
+                let llvm_type = self.var_type_to_llvm(vt);
+                let val = self
+                    .builder
+                    .build_load(llvm_type, *src_ptr, "cap_val")
+                    .unwrap();
+                let dst_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        env_struct_type,
+                        env_malloc,
+                        i as u32,
+                        &format!("env.store.{}", i),
+                    )
+                    .unwrap();
+                self.builder.build_store(dst_ptr, val).unwrap();
+            }
+
+            env_malloc
+        } else {
+            // No captures: null env pointer
+            ptr_type.const_null()
+        };
+
+        // --- Build closure struct: { fn_ptr, env_ptr } ---
+        let fn_ptr = arrow_fn.as_global_value().as_pointer_value();
+        let closure_val = self.closure_type.const_zero();
+        let closure_val = self
+            .builder
+            .build_insert_value(closure_val, fn_ptr, 0, "closure.fn")
+            .unwrap()
+            .into_struct_value();
+        let closure_val = self
+            .builder
+            .build_insert_value(closure_val, env_alloc, 1, "closure.env")
+            .unwrap()
+            .into_struct_value();
+
+        let closure_vt = VarType::Closure {
+            fn_name: fn_name.to_string(),
+            param_types: param_vts,
+            return_type: Box::new(ret_vt.unwrap_or(VarType::Number)),
+        };
+
+        Ok((closure_val.into(), closure_vt))
+    }
+
+    /// Call a closure variable: extract fn_ptr + env_ptr, indirect call with env as first arg.
+    fn compile_closure_call(
+        &mut self,
+        closure_ptr: PointerValue<'ctx>,
+        param_types: &[VarType],
+        return_type: &VarType,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Load the closure struct { fn_ptr, env_ptr }
+        let closure_val = self
+            .builder
+            .build_load(self.closure_type, closure_ptr, "closure")
+            .unwrap();
+        let fn_ptr = self
+            .builder
+            .build_extract_value(closure_val.into_struct_value(), 0, "fn_ptr")
+            .unwrap()
+            .into_pointer_value();
+        let env_ptr = self
+            .builder
+            .build_extract_value(closure_val.into_struct_value(), 1, "env_ptr")
+            .unwrap();
+
+        // Build the function type for indirect call: (ptr env, ...params) -> ret
+        let mut llvm_param_types: Vec<BasicMetadataTypeEnum<'ctx>> = vec![ptr_type.into()];
+        for vt in param_types {
+            llvm_param_types.push(self.var_type_to_llvm(vt).into());
+        }
+
+        let fn_type = match return_type {
+            VarType::Number => self.context.f64_type().fn_type(&llvm_param_types, false),
+            VarType::Integer => self.context.i64_type().fn_type(&llvm_param_types, false),
+            VarType::String => self.string_type.fn_type(&llvm_param_types, false),
+            VarType::Boolean => self.context.bool_type().fn_type(&llvm_param_types, false),
+            VarType::Array => self.array_type.fn_type(&llvm_param_types, false),
+            VarType::Closure { .. } => self.closure_type.fn_type(&llvm_param_types, false),
+            _ => self.context.void_type().fn_type(&llvm_param_types, false),
+        };
+
+        // Compile arguments
+        let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> = vec![env_ptr.into()];
+        if args.len() != param_types.len() {
+            return Err(CompileError::error(
+                format!(
+                    "Expected {} arguments, got {}",
+                    param_types.len(),
+                    args.len()
+                ),
+                span.clone(),
+            ));
+        }
+        for (arg, expected_vt) in args.iter().zip(param_types.iter()) {
+            let (val, vt) = self.compile_expr(arg, function)?;
+            // Convert number types if needed
+            let val = if matches!(expected_vt, VarType::Number) && matches!(vt, VarType::Integer) {
+                self.builder
+                    .build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "i2f")
+                    .unwrap()
+                    .into()
+            } else if matches!(expected_vt, VarType::Integer) && matches!(vt, VarType::Number) {
+                self.builder
+                    .build_float_to_signed_int(
+                        val.into_float_value(),
+                        self.context.i64_type(),
+                        "f2i",
+                    )
+                    .unwrap()
+                    .into()
+            } else {
+                val
+            };
+            call_args.push(val.into());
+        }
+
+        let result = self
+            .builder
+            .build_indirect_call(fn_type, fn_ptr, &call_args, "closure_call")
+            .unwrap();
+
+        if let Some(val) = result.try_as_basic_value().left() {
+            Ok((val, return_type.clone()))
+        } else {
+            Ok((
+                self.context.f64_type().const_float(0.0).into(),
+                VarType::Number,
+            ))
+        }
     }
 
     // --- Output ---

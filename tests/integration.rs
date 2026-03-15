@@ -1567,7 +1567,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_map() {
         assert_eq!(
             run_ts("let arr = [1, 2, 3]\nconsole.log(arr.map(x => x * 2))"),
@@ -1576,7 +1575,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_filter() {
         assert_eq!(
             run_ts("let arr = [1, 2, 3, 4]\nconsole.log(arr.filter(x => x > 2))"),
@@ -1585,7 +1583,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_reduce() {
         assert_eq!(
             run_ts("let arr = [1, 2, 3, 4]\nconsole.log(arr.reduce((a, b) => a + b, 0))"),
@@ -1594,7 +1591,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "arrays not implemented"]
     fn array_forEach() {
         assert_eq!(
             run_ts("let arr = [1, 2, 3]\narr.forEach(x => console.log(x))"),
@@ -1831,7 +1827,6 @@ console.log(greet("World"))
     }
 
     #[test]
-    #[ignore = "closures not implemented"]
     fn closure() {
         let src = r#"
 function makeCounter(): () => number {
