@@ -1715,7 +1715,6 @@ console.log(id)
     }
 
     #[test]
-    #[ignore = "enums not implemented"]
     fn enum_basic() {
         let src = r#"
 enum Color {
@@ -1730,7 +1729,6 @@ console.log(Color.Green)
     }
 
     #[test]
-    #[ignore = "enums not implemented"]
     fn enum_string() {
         let src = r#"
 enum Direction {

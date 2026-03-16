@@ -347,6 +347,31 @@ impl TypeChecker {
                 Ok(())
             }
 
+            StmtKind::EnumDecl { name, members } => {
+                // Register enum as an object type with member fields
+                let mut field_types = Vec::new();
+                let mut next_index: f64 = 0.0;
+                for member in members {
+                    let member_type = match &member.value {
+                        Some(EnumValue::String(_)) => Type::String,
+                        Some(EnumValue::Number(_)) => Type::Number,
+                        None => {
+                            next_index += 1.0;
+                            Type::Number
+                        }
+                    };
+                    if let Some(EnumValue::Number(n)) = &member.value {
+                        next_index = n + 1.0;
+                    }
+                    field_types.push((member.name.clone(), member_type));
+                }
+                let enum_type = Type::Object {
+                    fields: field_types,
+                };
+                self.define(name.clone(), enum_type, true);
+                Ok(())
+            }
+
             StmtKind::TypeAlias { name, type_ann } => {
                 // Register the alias for use in resolve_type_annotation
                 self.type_aliases.insert(name.clone(), type_ann.clone());

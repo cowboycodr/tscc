@@ -500,7 +500,8 @@ impl<'ctx> Codegen<'ctx> {
             | StmtKind::Empty
             | StmtKind::ClassDecl { .. }
             | StmtKind::InterfaceDecl { .. }
-            | StmtKind::TypeAlias { .. } => true,
+            | StmtKind::TypeAlias { .. }
+            | StmtKind::EnumDecl { .. } => true,
         }
     }
 
@@ -701,6 +702,78 @@ impl<'ctx> Codegen<'ctx> {
 
             StmtKind::TypeAlias { .. } => {
                 // Type aliases are erased — no runtime code
+                Ok(())
+            }
+
+            StmtKind::EnumDecl { name, members } => {
+                // Compile enum as an object — each member is a field with a constant value.
+                // Numeric enums: auto-increment from 0. String enums: use specified values.
+                let mut field_names = Vec::new();
+                let mut field_values: Vec<(BasicValueEnum<'ctx>, VarType)> = Vec::new();
+                let mut next_index: i64 = 0;
+
+                for member in members {
+                    match &member.value {
+                        Some(EnumValue::String(s)) => {
+                            field_names.push(member.name.clone());
+                            field_values.push((self.create_string_literal(s), VarType::String));
+                        }
+                        Some(EnumValue::Number(n)) => {
+                            next_index = *n as i64;
+                            field_names.push(member.name.clone());
+                            field_values.push((
+                                self.context.f64_type().const_float(*n).into(),
+                                VarType::Number,
+                            ));
+                            next_index += 1;
+                        }
+                        None => {
+                            field_names.push(member.name.clone());
+                            field_values.push((
+                                self.context
+                                    .f64_type()
+                                    .const_float(next_index as f64)
+                                    .into(),
+                                VarType::Number,
+                            ));
+                            next_index += 1;
+                        }
+                    }
+                }
+
+                // Build the LLVM struct type from member types
+                let field_vts: Vec<(String, VarType)> = field_names
+                    .iter()
+                    .zip(field_values.iter())
+                    .map(|(n, (_, vt))| (n.clone(), vt.clone()))
+                    .collect();
+                let field_llvm_types: Vec<BasicTypeEnum> = field_values
+                    .iter()
+                    .map(|(_, vt)| self.var_type_to_llvm(vt))
+                    .collect();
+                let struct_type = self.context.struct_type(&field_llvm_types, false);
+
+                // Allocate and initialize
+                let alloca = self.builder.build_alloca(struct_type, name).unwrap();
+
+                for (i, (val, _)) in field_values.iter().enumerate() {
+                    let field_ptr = self
+                        .builder
+                        .build_struct_gep(struct_type, alloca, i as u32, &field_names[i])
+                        .unwrap();
+                    self.builder.build_store(field_ptr, *val).unwrap();
+                }
+
+                let var_type = VarType::Object {
+                    struct_type_name: name.clone(),
+                    fields: field_vts.clone(),
+                };
+                self.set_variable(name.clone(), alloca, var_type);
+
+                // Register in class_struct_types so member access resolution works
+                self.class_struct_types
+                    .insert(name.clone(), (struct_type, field_vts, None));
+
                 Ok(())
             }
 

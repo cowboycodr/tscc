@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 204 tests passing, 35 pending — 85% of test suite**
+**Current status: 206 tests passing, 33 pending — 86% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -44,8 +44,8 @@ These require only parser/checker changes — zero LLVM codegen.
 
 Each requires a new AST node and coordinated changes across parser → checker → codegen.
 
-- [ ] **Enums (numeric)** — `enum Color { Red, Green, Blue }`
-- [ ] **Enums (string)** — `enum Direction { Up = "UP", Down = "DOWN" }`
+- [x] **Enums (numeric)** — `enum Color { Red, Green, Blue }`
+- [x] **Enums (string)** — `enum Direction { Up = "UP", Down = "DOWN" }`
 - [x] **Union types** — `string | number` *(type checker; codegen uses widest type)*
 - [ ] **`try`/`catch`** — `try { ... } catch (e) { ... }` *(setjmp-based or LLVM landingpad)*
 - [ ] **`try`/`finally`** — `try { ... } finally { ... }`

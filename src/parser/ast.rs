@@ -94,6 +94,10 @@ pub enum StmtKind {
         name: String,
         type_ann: TypeAnnotation,
     },
+    EnumDecl {
+        name: String,
+        members: Vec<EnumMember>,
+    },
     Break,
     Continue,
     Empty,
@@ -126,6 +130,19 @@ pub struct ClassMethod {
     pub return_type: Option<TypeAnnotation>,
     pub body: Vec<Statement>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumMember {
+    pub name: String,
+    pub value: Option<EnumValue>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum EnumValue {
+    Number(f64),
+    String(String),
 }
 
 #[derive(Debug, Clone)]

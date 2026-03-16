@@ -36,6 +36,7 @@ impl Parser {
             Token::Function => self.function_declaration(false),
             Token::Class => self.class_declaration(),
             Token::Interface => self.interface_declaration(),
+            Token::Enum => self.enum_declaration(),
             Token::If => self.if_statement(),
             Token::While => self.while_statement(),
             Token::Do => self.do_while_statement(),
@@ -329,6 +330,57 @@ impl Parser {
 
         Ok(Statement {
             kind: StmtKind::TypeAlias { name, type_ann },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn enum_declaration(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'enum'
+
+        let name = self.expect_identifier("Expected enum name")?;
+        self.expect(&Token::LeftBrace, "Expected '{' before enum body")?;
+
+        let mut members = Vec::new();
+        while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            let member_span = self.current_span();
+            let member_name = self.expect_identifier("Expected enum member name")?;
+
+            let value = if self.match_token(&Token::Assign) {
+                match self.peek_token() {
+                    Token::String(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        Some(EnumValue::String(s))
+                    }
+                    Token::Number(n) => {
+                        let n = n;
+                        self.advance();
+                        Some(EnumValue::Number(n))
+                    }
+                    _ => {
+                        return Err(self.error("Expected string or number value for enum member"));
+                    }
+                }
+            } else {
+                None
+            };
+
+            members.push(EnumMember {
+                name: member_name,
+                value,
+                span: self.span_from(&member_span),
+            });
+
+            // Allow trailing comma
+            self.match_token(&Token::Comma);
+        }
+
+        self.expect(&Token::RightBrace, "Expected '}' after enum body")?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::EnumDecl { name, members },
             span: self.span_from(&start_span),
         })
     }

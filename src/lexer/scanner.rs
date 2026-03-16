@@ -303,6 +303,7 @@ impl Scanner {
             "extends" => Token::Extends,
             "super" => Token::Super,
             "interface" => Token::Interface,
+            "enum" => Token::Enum,
             "constructor" => Token::Constructor,
             _ => Token::Identifier(text),
         };

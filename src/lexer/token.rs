@@ -28,6 +28,7 @@ pub enum Token {
     Extends,
     Super,
     Interface,
+    Enum,
     Constructor,
 
     // Module keywords
