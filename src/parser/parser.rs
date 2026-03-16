@@ -278,8 +278,20 @@ impl Parser {
 
         let name = self.expect_identifier("Expected class name")?;
 
+        // Optional generic type parameters: class Foo<T, U extends Bar>
+        let type_params = if self.check(&Token::Less) {
+            self.parse_type_params()?
+        } else {
+            vec![]
+        };
+
         let parent = if self.match_token(&Token::Extends) {
-            Some(self.expect_identifier("Expected parent class name")?)
+            let parent_name = self.expect_identifier("Expected parent class name")?;
+            // Discard type args: class Child extends Parent<T>
+            if self.check(&Token::Less) {
+                self.parse_type_args()?;
+            }
+            Some(parent_name)
         } else {
             None
         };
@@ -358,6 +370,7 @@ impl Parser {
         Ok(Statement {
             kind: StmtKind::ClassDecl {
                 name,
+                type_params,
                 parent,
                 fields,
                 constructor,

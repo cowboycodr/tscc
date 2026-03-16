@@ -821,6 +821,7 @@ impl<'ctx> Codegen<'ctx> {
 
             StmtKind::ClassDecl {
                 name,
+                type_params: _,
                 parent,
                 fields,
                 constructor,

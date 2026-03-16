@@ -349,6 +349,7 @@ impl TypeChecker {
 
             StmtKind::ClassDecl {
                 name,
+                type_params: _,
                 parent,
                 fields,
                 constructor,

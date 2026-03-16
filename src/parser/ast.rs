@@ -30,6 +30,7 @@ pub enum StmtKind {
     },
     ClassDecl {
         name: String,
+        type_params: Vec<TypeParam>,
         parent: Option<String>,
         fields: Vec<ClassField>,
         constructor: Option<ClassConstructor>,
