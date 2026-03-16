@@ -373,14 +373,16 @@ impl Parser {
                 } else {
                     None
                 };
-                // Consume optional initializer (discarded for now — field init codegen TBD)
-                if self.match_token(&Token::Assign) {
-                    self.expression()?;
-                }
+                let initializer = if self.match_token(&Token::Assign) {
+                    Some(self.expression()?)
+                } else {
+                    None
+                };
                 self.consume_semicolon()?;
                 fields.push(ClassField {
                     name: member_name,
                     type_ann,
+                    initializer,
                     span: self.span_from(&member_span),
                 });
             }

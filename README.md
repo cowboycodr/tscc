@@ -148,11 +148,11 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 225 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 232 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**225 passing** / **16 not yet implemented** — 93% of test suite
+**232 passing** / **16 not yet implemented** — 93% of test suite
 
 ### Literals & Primitives
 
@@ -405,7 +405,7 @@ Early stage. 225 tests passing, 16 pending. The goal is drop-in compatibility wi
 | Feature | Status | Test |
 |---|---|---|
 | `JSON.stringify()` | :x: | `JSON.stringify({ a: 1 })` |
-| `Map` | :x: | `new Map()` |
+| `Map` | :white_check_mark: | `new Map()`, `.set()`, `.get()`, `.has()`, `.delete()`, `.size`, `.values()` |
 | `Set` | :x: | `new Set([1, 2, 3])` |
 | `RegExp` | :x: | `/hello/.test("hello world")` |
 | `Number.isInteger()` | :white_check_mark: | `Number.isInteger(42)` |

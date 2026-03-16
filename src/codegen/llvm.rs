@@ -11,7 +11,9 @@ use inkwell::targets::{
     CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine,
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, StructType};
-use inkwell::values::{BasicMetadataValueEnum, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::values::{
+    BasicMetadataValueEnum, BasicValueEnum, FunctionValue, IntValue, PointerValue,
+};
 use inkwell::OptimizationLevel;
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
@@ -72,6 +74,8 @@ pub struct Codegen<'ctx> {
     /// String enum member values: enum_name -> (member_name -> string_value)
     /// Used to resolve computed property keys like [TaskStatus.Todo] → "todo"
     enum_string_values: HashMap<String, HashMap<String, String>>,
+    /// Class field initializers: class_name -> Vec<(field_name, initializer_expr)>
+    class_field_initializers: HashMap<String, Vec<(String, Expr)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +107,14 @@ enum VarType {
     Tuple(Vec<VarType>),
     /// String array: array of {char*, i64} strings
     StringArray,
+    /// JavaScript Map<K, V> — opaque heap pointer to MgMap
+    Map {
+        val_vt: Box<VarType>,
+    },
+    /// Array of typed objects — {void**, i64, i64}; elements accessed via pointer load
+    ObjArray {
+        elem_vt: Box<VarType>,
+    },
 }
 
 struct LoopContext<'ctx> {
@@ -169,6 +181,7 @@ impl<'ctx> Codegen<'ctx> {
             generic_alias_params: HashMap::new(),
             pending_loop_label: None,
             enum_string_values: HashMap::new(),
+            class_field_initializers: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -485,6 +498,56 @@ impl<'ctx> Codegen<'ctx> {
         self.module.add_function(
             "tscc_parseFloat",
             f64_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+
+        // --- Map functions ---
+        // tscc_map_alloc() → MgMap*
+        self.module
+            .add_function("tscc_map_alloc", ptr_type.fn_type(&[], false), None);
+        // tscc_map_set(map*, key_ptr, key_len, val_ptr, val_size) → void
+        self.module.add_function(
+            "tscc_map_set",
+            void_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                ],
+                false,
+            ),
+            None,
+        );
+        // tscc_map_get(map*, key_ptr, key_len) → void*
+        self.module.add_function(
+            "tscc_map_get",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        // tscc_map_has(map*, key_ptr, key_len) → i1
+        self.module.add_function(
+            "tscc_map_has",
+            i1_type.fn_type(&[ptr_type.into(), ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        // tscc_map_delete(map*, key_ptr, key_len) → i1
+        self.module.add_function(
+            "tscc_map_delete",
+            i1_type.fn_type(&[ptr_type.into(), ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        // tscc_map_size(map*) → i64
+        self.module.add_function(
+            "tscc_map_size",
+            i64_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // tscc_map_values_alloc(map*, *out_count) → void** (malloc'd array of value ptrs)
+        self.module.add_function(
+            "tscc_map_values_alloc",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
             None,
         );
     }
@@ -2291,6 +2354,42 @@ impl<'ctx> Codegen<'ctx> {
                         "Tuple index must be a numeric literal",
                         expr.span.clone(),
                     ))
+                } else if let VarType::ObjArray { ref elem_vt } = obj_vt {
+                    // ObjArray[i] — load void* at data[i], then load the element type
+                    let (idx_val, idx_vt) = self.compile_expr(index, function)?;
+                    let idx_i64 = match idx_vt {
+                        VarType::Integer => idx_val.into_int_value(),
+                        _ => self
+                            .builder
+                            .build_float_to_signed_int(
+                                idx_val.into_float_value(),
+                                self.context.i64_type(),
+                                "idx",
+                            )
+                            .unwrap(),
+                    };
+                    let data_ptr = self
+                        .builder
+                        .build_extract_value(obj_val.into_struct_value(), 0, "oa_data")
+                        .unwrap()
+                        .into_pointer_value();
+                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+                    let elem_llvm = self.var_type_to_llvm(elem_vt);
+                    let elem_ptr_ptr = unsafe {
+                        self.builder
+                            .build_gep(ptr_type, data_ptr, &[idx_i64], "oa_epp")
+                            .unwrap()
+                    };
+                    let elem_ptr = self
+                        .builder
+                        .build_load(ptr_type, elem_ptr_ptr, "oa_ep")
+                        .unwrap()
+                        .into_pointer_value();
+                    let elem_val = self
+                        .builder
+                        .build_load(elem_llvm, elem_ptr, "oa_elem")
+                        .unwrap();
+                    Ok((elem_val, *elem_vt.clone()))
                 } else {
                     Err(CompileError::error(
                         "Index access only supported on arrays, objects, and tuples",
@@ -2848,6 +2947,58 @@ impl<'ctx> Codegen<'ctx> {
         ))
     }
 
+    /// Emit field initializers for a class and its parent chain (parent-first order).
+    fn run_field_initializers(
+        &mut self,
+        class_name: &str,
+        alloca: PointerValue<'ctx>,
+        struct_type: StructType<'ctx>,
+        all_fields: &[(String, VarType)],
+        function: FunctionValue<'ctx>,
+    ) -> Result<(), CompileError> {
+        // Run parent initializers first
+        let parent = self
+            .class_struct_types
+            .get(class_name)
+            .and_then(|(_, _, p)| p.clone());
+        if let Some(ref pname) = parent {
+            let parent_data = self.class_struct_types.get(pname).cloned();
+            if let Some((parent_struct, parent_fields, _)) = parent_data {
+                self.run_field_initializers(
+                    pname,
+                    alloca,
+                    parent_struct,
+                    &parent_fields,
+                    function,
+                )?;
+            }
+        }
+
+        // Emit this class's own field initializers
+        let initializers = self
+            .class_field_initializers
+            .get(class_name)
+            .cloned()
+            .unwrap_or_default();
+        for (field_name, init_expr) in initializers {
+            let (init_val, _) = self.compile_expr(&init_expr, function)?;
+            // Find the field index in the full struct layout
+            if let Some(idx) = all_fields.iter().position(|(n, _)| n == &field_name) {
+                let field_ptr = self
+                    .builder
+                    .build_struct_gep(
+                        struct_type,
+                        alloca,
+                        idx as u32,
+                        &format!("init_{}", field_name),
+                    )
+                    .unwrap();
+                self.builder.build_store(field_ptr, init_val).unwrap();
+            }
+        }
+        Ok(())
+    }
+
     fn compile_new_expr(
         &mut self,
         class_name: &str,
@@ -2855,6 +3006,24 @@ impl<'ctx> Codegen<'ctx> {
         function: FunctionValue<'ctx>,
         span: &Span,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        // new Map() — call tscc_map_alloc()
+        if class_name == "Map" {
+            let alloc_fn = self.module.get_function("tscc_map_alloc").unwrap();
+            let map_ptr = self
+                .builder
+                .build_call(alloc_fn, &[], "map_new")
+                .unwrap()
+                .try_as_basic_value()
+                .left()
+                .unwrap();
+            return Ok((
+                map_ptr,
+                VarType::Map {
+                    val_vt: Box::new(VarType::Number),
+                },
+            ));
+        }
+
         let (struct_type, field_info, parent_class) = self
             .class_struct_types
             .get(class_name)
@@ -2874,6 +3043,12 @@ impl<'ctx> Codegen<'ctx> {
         // Zero-initialize
         let zero = struct_type.const_zero();
         self.builder.build_store(alloca, zero).unwrap();
+
+        // Run field initializers (parent hierarchy first, then own)
+        let prev_this = self.current_this.clone();
+        self.current_this = Some((alloca, obj_vt.clone()));
+        self.run_field_initializers(class_name, alloca, struct_type, &field_info, function)?;
+        self.current_this = prev_this;
 
         // Call constructor if it exists (check own constructor, then parent's)
         let ctor_name = format!("{}_constructor", class_name);
@@ -2988,6 +3163,16 @@ impl<'ctx> Codegen<'ctx> {
             name.to_string(),
             (struct_type, all_fields.clone(), parent.clone()),
         );
+
+        // Collect field initializers for use in compile_new_expr
+        let initializers: Vec<(String, Expr)> = fields
+            .iter()
+            .filter_map(|f| f.initializer.as_ref().map(|e| (f.name.clone(), e.clone())))
+            .collect();
+        if !initializers.is_empty() {
+            self.class_field_initializers
+                .insert(name.to_string(), initializers);
+        }
 
         let obj_vt = VarType::Object {
             struct_type_name: name.to_string(),
@@ -3173,6 +3358,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "function",
             VarType::Union(_) => "object", // fallback for non-identifier unions
+            VarType::Map { .. } | VarType::ObjArray { .. } => "object",
         };
         Ok((self.create_string_literal(type_str), VarType::String))
     }
@@ -3273,6 +3459,45 @@ impl<'ctx> Codegen<'ctx> {
 
         // Object member access
         let (obj_val, obj_vt) = self.compile_expr(object, function)?;
+
+        // Map .size property
+        if let VarType::Map { .. } = obj_vt {
+            if property == "size" {
+                let size_fn = self.module.get_function("tscc_map_size").unwrap();
+                let count = self
+                    .builder
+                    .build_call(size_fn, &[obj_val.into_pointer_value().into()], "msize")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                let count_f64 = self
+                    .builder
+                    .build_signed_int_to_float(
+                        count.into_int_value(),
+                        self.context.f64_type(),
+                        "msizef",
+                    )
+                    .unwrap();
+                return Ok((count_f64.into(), VarType::Number));
+            }
+        }
+
+        // ObjArray .length
+        if let VarType::ObjArray { .. } = obj_vt {
+            if property == "length" {
+                let len = self
+                    .builder
+                    .build_extract_value(obj_val.into_struct_value(), 1, "oa_len")
+                    .unwrap()
+                    .into_int_value();
+                let len_f64 = self
+                    .builder
+                    .build_signed_int_to_float(len, self.context.f64_type(), "oa_lenf")
+                    .unwrap();
+                return Ok((len_f64.into(), VarType::Number));
+            }
+        }
 
         // Array .length
         if matches!(obj_vt, VarType::Array) && property == "length" {
@@ -3677,6 +3902,20 @@ impl<'ctx> Codegen<'ctx> {
             // Array methods: object.method(args)
             if matches!(obj_vt, VarType::Array) {
                 return self.compile_array_method(object, obj_val, property, args, function, span);
+            }
+
+            // ObjArray methods: length, forEach
+            if let VarType::ObjArray { ref elem_vt } = obj_vt {
+                let elem_vt = elem_vt.clone();
+                return self
+                    .compile_obj_array_method(obj_val, &elem_vt, property, args, function, span);
+            }
+
+            // Map methods: set, get, has, delete, size, values
+            if let VarType::Map { ref val_vt } = obj_vt {
+                let val_vt = val_vt.clone();
+                return self
+                    .compile_map_method(object, obj_val, &val_vt, property, args, function, span);
             }
 
             // Object/class method calls
@@ -4215,6 +4454,12 @@ impl<'ctx> Codegen<'ctx> {
                     // Tuples shouldn't reach here — elements are indexed individually
                     self.print_string_literal("[tuple]", print_str);
                 }
+                VarType::Map { .. } => {
+                    self.print_string_literal("[Map]", print_str);
+                }
+                VarType::ObjArray { .. } => {
+                    self.print_string_literal("[Array]", print_str);
+                }
             }
         }
 
@@ -4676,6 +4921,392 @@ impl<'ctx> Codegen<'ctx> {
             }
             _ => Err(CompileError::error(
                 format!("Unknown number method '{}'", method),
+                span.clone(),
+            )),
+        }
+    }
+
+    /// Returns the byte size of an LLVM type as an i64 IntValue (using LLVM's sizeof).
+    fn llvm_sizeof(&self, llvm_type: BasicTypeEnum<'ctx>) -> IntValue<'ctx> {
+        match llvm_type {
+            BasicTypeEnum::IntType(t) => t.size_of(),
+            BasicTypeEnum::FloatType(t) => t.size_of(),
+            BasicTypeEnum::StructType(t) => t.size_of().expect("struct should be sized"),
+            BasicTypeEnum::PointerType(t) => t.size_of(),
+            BasicTypeEnum::ArrayType(t) => t.size_of().expect("array should be sized"),
+            BasicTypeEnum::VectorType(t) => t.size_of().expect("vector should be sized"),
+        }
+    }
+
+    fn compile_map_method(
+        &mut self,
+        _object_expr: &Expr,
+        map_val: BasicValueEnum<'ctx>,
+        val_vt: &VarType,
+        method: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let map_ptr = map_val.into_pointer_value();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        // Extract {data_ptr, len} from a string value (VarType::String)
+        macro_rules! str_parts {
+            ($sval:expr) => {{
+                let sv = $sval.into_struct_value();
+                let dp = self
+                    .builder
+                    .build_extract_value(sv, 0, "kp")
+                    .unwrap()
+                    .into_pointer_value();
+                let dl = self
+                    .builder
+                    .build_extract_value(sv, 1, "kl")
+                    .unwrap()
+                    .into_int_value();
+                (dp, dl)
+            }};
+        }
+
+        match method {
+            "set" => {
+                if args.len() < 2 {
+                    return Err(CompileError::error(
+                        "map.set() requires 2 arguments",
+                        span.clone(),
+                    ));
+                }
+                let (key_val, _) = self.compile_expr(&args[0], function)?;
+                let (key_ptr, key_len) = str_parts!(key_val);
+
+                let (val_val, actual_vt) = self.compile_expr(&args[1], function)?;
+                let val_llvm = self.var_type_to_llvm(&actual_vt);
+                let val_alloca = self.builder.build_alloca(val_llvm, "mset_val").unwrap();
+                self.builder.build_store(val_alloca, val_val).unwrap();
+                let val_size = self.llvm_sizeof(val_llvm);
+
+                let set_fn = self.module.get_function("tscc_map_set").unwrap();
+                self.builder
+                    .build_call(
+                        set_fn,
+                        &[
+                            map_ptr.into(),
+                            key_ptr.into(),
+                            key_len.into(),
+                            val_alloca.into(),
+                            val_size.into(),
+                        ],
+                        "",
+                    )
+                    .unwrap();
+
+                // Return the map itself (enables chaining)
+                Ok((
+                    map_val,
+                    VarType::Map {
+                        val_vt: Box::new(actual_vt),
+                    },
+                ))
+            }
+            "get" => {
+                if args.is_empty() {
+                    return Err(CompileError::error(
+                        "map.get() requires 1 argument",
+                        span.clone(),
+                    ));
+                }
+                let (key_val, _) = self.compile_expr(&args[0], function)?;
+                let (key_ptr, key_len) = str_parts!(key_val);
+
+                let get_fn = self.module.get_function("tscc_map_get").unwrap();
+                let raw_ptr = self
+                    .builder
+                    .build_call(
+                        get_fn,
+                        &[map_ptr.into(), key_ptr.into(), key_len.into()],
+                        "mget_ptr",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_pointer_value();
+
+                // If NULL → return default zero value; else load the value
+                let val_llvm = self.var_type_to_llvm(val_vt);
+                let null_ptr = ptr_type.const_null();
+                let is_null = self
+                    .builder
+                    .build_int_compare(inkwell::IntPredicate::EQ, raw_ptr, null_ptr, "map_is_null")
+                    .unwrap();
+
+                let found_bb = self.context.append_basic_block(function, "map_found");
+                let miss_bb = self.context.append_basic_block(function, "map_miss");
+                let merge_bb = self.context.append_basic_block(function, "map_merge");
+
+                self.builder
+                    .build_conditional_branch(is_null, miss_bb, found_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(found_bb);
+                let loaded = self
+                    .builder
+                    .build_load(val_llvm, raw_ptr, "mget_val")
+                    .unwrap();
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                let found_bb_end = self.builder.get_insert_block().unwrap();
+
+                self.builder.position_at_end(miss_bb);
+                let zero_val = self.default_value(val_vt);
+                self.builder.build_unconditional_branch(merge_bb).unwrap();
+                let miss_bb_end = self.builder.get_insert_block().unwrap();
+
+                self.builder.position_at_end(merge_bb);
+                let phi = self.builder.build_phi(val_llvm, "mget_result").unwrap();
+                phi.add_incoming(&[(&loaded, found_bb_end), (&zero_val, miss_bb_end)]);
+
+                Ok((phi.as_basic_value(), val_vt.clone()))
+            }
+            "has" => {
+                if args.is_empty() {
+                    return Err(CompileError::error(
+                        "map.has() requires 1 argument",
+                        span.clone(),
+                    ));
+                }
+                let (key_val, _) = self.compile_expr(&args[0], function)?;
+                let (key_ptr, key_len) = str_parts!(key_val);
+
+                let has_fn = self.module.get_function("tscc_map_has").unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        has_fn,
+                        &[map_ptr.into(), key_ptr.into(), key_len.into()],
+                        "mhas",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::Boolean))
+            }
+            "delete" => {
+                if args.is_empty() {
+                    return Err(CompileError::error(
+                        "map.delete() requires 1 argument",
+                        span.clone(),
+                    ));
+                }
+                let (key_val, _) = self.compile_expr(&args[0], function)?;
+                let (key_ptr, key_len) = str_parts!(key_val);
+
+                let del_fn = self.module.get_function("tscc_map_delete").unwrap();
+                let result = self
+                    .builder
+                    .build_call(
+                        del_fn,
+                        &[map_ptr.into(), key_ptr.into(), key_len.into()],
+                        "mdel",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((result, VarType::Boolean))
+            }
+            "size" => {
+                let size_fn = self.module.get_function("tscc_map_size").unwrap();
+                let count = self
+                    .builder
+                    .build_call(size_fn, &[map_ptr.into()], "msize")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                Ok((count, VarType::Integer))
+            }
+            "values" => {
+                // Returns ObjArray: {void**, count, cap}
+                let i64_type = self.context.i64_type();
+                let count_alloca = self.builder.build_alloca(i64_type, "mv_count").unwrap();
+                let vals_fn = self.module.get_function("tscc_map_values_alloc").unwrap();
+                let void_star_star = self
+                    .builder
+                    .build_call(vals_fn, &[map_ptr.into(), count_alloca.into()], "mv_ptrs")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                let count = self
+                    .builder
+                    .build_load(i64_type, count_alloca, "mv_len")
+                    .unwrap();
+
+                // Build the ObjArray struct: {ptr, i64, i64}
+                let mut arr_struct = self.array_type.const_zero();
+                arr_struct = self
+                    .builder
+                    .build_insert_value(arr_struct, void_star_star, 0, "oa.ptr")
+                    .unwrap()
+                    .into_struct_value();
+                arr_struct = self
+                    .builder
+                    .build_insert_value(arr_struct, count, 1, "oa.len")
+                    .unwrap()
+                    .into_struct_value();
+                arr_struct = self
+                    .builder
+                    .build_insert_value(arr_struct, count, 2, "oa.cap")
+                    .unwrap()
+                    .into_struct_value();
+
+                Ok((
+                    arr_struct.into(),
+                    VarType::ObjArray {
+                        elem_vt: Box::new(val_vt.clone()),
+                    },
+                ))
+            }
+            _ => Err(CompileError::error(
+                format!("Unknown Map method '{}'", method),
+                span.clone(),
+            )),
+        }
+    }
+
+    fn compile_obj_array_method(
+        &mut self,
+        arr_val: BasicValueEnum<'ctx>,
+        elem_vt: &VarType,
+        method: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let i64_type = self.context.i64_type();
+        let f64_type = self.context.f64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        match method {
+            "length" => {
+                let len = self
+                    .builder
+                    .build_extract_value(arr_val.into_struct_value(), 1, "oa_len")
+                    .unwrap()
+                    .into_int_value();
+                let len_f64 = self
+                    .builder
+                    .build_signed_int_to_float(len, f64_type, "oa_len_f")
+                    .unwrap();
+                Ok((len_f64.into(), VarType::Number))
+            }
+            "forEach" => {
+                if args.is_empty() {
+                    return Err(CompileError::error(
+                        "forEach requires a callback",
+                        span.clone(),
+                    ));
+                }
+                let (cb_val, cb_vt) = self.compile_expr(&args[0], function)?;
+                let (cb_fn_ptr, cb_env_ptr) = self.extract_closure_parts(cb_val)?;
+
+                let data_ptr = self
+                    .builder
+                    .build_extract_value(arr_val.into_struct_value(), 0, "oa_data")
+                    .unwrap()
+                    .into_pointer_value();
+                let length = self
+                    .builder
+                    .build_extract_value(arr_val.into_struct_value(), 1, "oa_len")
+                    .unwrap()
+                    .into_int_value();
+                let elem_llvm = self.var_type_to_llvm(elem_vt);
+
+                let pre_bb = self.builder.get_insert_block().unwrap();
+                let header_bb = self.context.append_basic_block(function, "oafe.header");
+                let body_bb = self.context.append_basic_block(function, "oafe.body");
+                let exit_bb = self.context.append_basic_block(function, "oafe.exit");
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+
+                self.builder.position_at_end(header_bb);
+                let i_phi = self.builder.build_phi(i64_type, "oafe_i").unwrap();
+                i_phi.add_incoming(&[(&i64_type.const_int(0, false), pre_bb)]);
+                let i = i_phi.as_basic_value().into_int_value();
+                let cond = self
+                    .builder
+                    .build_int_compare(IntPredicate::SLT, i, length, "oafe_cond")
+                    .unwrap();
+                self.builder
+                    .build_conditional_branch(cond, body_bb, exit_bb)
+                    .unwrap();
+
+                self.builder.position_at_end(body_bb);
+                // Load void* at data[i], then load the element
+                let elem_ptr_ptr = unsafe {
+                    self.builder
+                        .build_gep(ptr_type, data_ptr, &[i], "oafe_pp")
+                        .unwrap()
+                };
+                let elem_ptr = self
+                    .builder
+                    .build_load(ptr_type, elem_ptr_ptr, "oafe_ep")
+                    .unwrap()
+                    .into_pointer_value();
+                let elem_val = self
+                    .builder
+                    .build_load(elem_llvm, elem_ptr, "oafe_elem")
+                    .unwrap();
+                let i_f64 = self
+                    .builder
+                    .build_signed_int_to_float(i, f64_type, "oafe_if")
+                    .unwrap();
+
+                // Determine callback function type from VarType
+                let cb_ret_vt = if let VarType::Closure {
+                    ref return_type, ..
+                } = cb_vt
+                {
+                    (**return_type).clone()
+                } else {
+                    VarType::Number
+                };
+                let elem_llvm_meta: BasicMetadataTypeEnum = elem_llvm.into();
+                let cb_fn_type = match cb_ret_vt {
+                    VarType::Number => {
+                        f64_type.fn_type(&[ptr_type.into(), elem_llvm_meta, f64_type.into()], false)
+                    }
+                    VarType::Boolean => self
+                        .context
+                        .bool_type()
+                        .fn_type(&[ptr_type.into(), elem_llvm_meta, f64_type.into()], false),
+                    _ => self
+                        .context
+                        .void_type()
+                        .fn_type(&[ptr_type.into(), elem_llvm_meta, f64_type.into()], false),
+                };
+                self.builder
+                    .build_indirect_call(
+                        cb_fn_type,
+                        cb_fn_ptr,
+                        &[cb_env_ptr.into(), elem_val.into(), i_f64.into()],
+                        "",
+                    )
+                    .unwrap();
+
+                let i_next = self
+                    .builder
+                    .build_int_add(i, i64_type.const_int(1, false), "oafe_n")
+                    .unwrap();
+                i_phi.add_incoming(&[(&i_next, self.builder.get_insert_block().unwrap())]);
+                self.builder.build_unconditional_branch(header_bb).unwrap();
+
+                self.builder.position_at_end(exit_bb);
+                Ok((f64_type.const_float(0.0).into(), VarType::Number))
+            }
+            _ => Err(CompileError::error(
+                format!("Unknown ObjArray method '{}'", method),
                 span.clone(),
             )),
         }
@@ -5384,6 +6015,8 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(self.create_string_literal("[union]"))
             }
             VarType::Tuple(_) => Ok(self.create_string_literal("[tuple]")),
+            VarType::Map { .. } => Ok(self.create_string_literal("[Map]")),
+            VarType::ObjArray { .. } => Ok(self.create_string_literal("[Array]")),
         }
     }
 
@@ -5458,7 +6091,10 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Integer => self.context.i64_type().into(),
             VarType::String => self.string_type.into(),
             VarType::Boolean => self.context.bool_type().into(),
-            VarType::Array | VarType::StringArray => self.array_type.into(),
+            VarType::Array | VarType::StringArray | VarType::ObjArray { .. } => {
+                self.array_type.into()
+            }
+            VarType::Map { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             VarType::FunctionPtr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             VarType::Closure { .. } => self.closure_type.into(),
             VarType::Object {
@@ -5591,6 +6227,13 @@ impl<'ctx> Codegen<'ctx> {
                 VarType::Tuple(element_types)
             }
             TypeAnnKind::Generic { name, type_args } => {
+                // Map<K, V> → VarType::Map { val_vt }
+                if name == "Map" && type_args.len() >= 2 {
+                    let val_vt = self.type_ann_to_var_type(&type_args[1]);
+                    return VarType::Map {
+                        val_vt: Box::new(val_vt),
+                    };
+                }
                 // Resolve generic type alias by substituting type args
                 // For codegen, look up the alias body and substitute
                 if let Some(alias_ann) = self.type_aliases_for_codegen.get(name).cloned() {
@@ -5681,6 +6324,12 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 val.into()
             }
+            VarType::Map { .. } => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
+            VarType::ObjArray { .. } => self.array_type.const_zero().into(),
         }
     }
 
@@ -6499,6 +7148,8 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Object { .. } => "o",
             VarType::Union(_) => "u",
             VarType::Tuple(_) => "t",
+            VarType::Map { .. } => "m",
+            VarType::ObjArray { .. } => "oa",
         }
     }
 

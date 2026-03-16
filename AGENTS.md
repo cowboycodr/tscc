@@ -14,7 +14,7 @@ export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
 ```sh
 cargo build                          # dev build
 cargo build --release                # optimized build
-cargo test                           # all tests (~225 pass, ~16 ignored)
+cargo test                           # all tests (~232 pass, ~16 ignored)
 cargo test test_name                 # single test by name
 cargo test module::test_name         # e.g. cargo test variables::let_with_number
 cargo test -- --ignored              # run only ignored (unimplemented) tests

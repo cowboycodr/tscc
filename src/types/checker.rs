@@ -1055,6 +1055,13 @@ impl TypeChecker {
                     if let Type::Array(ref elem_type) = obj_type {
                         return self.check_array_method_call(property, args, elem_type, &expr.span);
                     }
+                    // Unknown type (e.g. Map) — type-check args and return Unknown
+                    if obj_type == Type::Unknown {
+                        for arg in args {
+                            self.check_expr(arg)?;
+                        }
+                        return Ok(Type::Unknown);
+                    }
                     // Object/class method calls
                     let fields = match &obj_type {
                         Type::Object { fields } => Some(fields.clone()),
@@ -1293,6 +1300,11 @@ impl TypeChecker {
                     }
                 }
 
+                // Unknown type (e.g. Map) — return Unknown for any property access
+                if obj_type == Type::Unknown {
+                    return Ok(Type::Unknown);
+                }
+
                 Err(CompileError::error(
                     format!(
                         "Property '{}' does not exist on type '{}'",
@@ -1397,6 +1409,14 @@ impl TypeChecker {
             }
 
             ExprKind::NewExpr { class_name, args } => {
+                // new Map() — built-in, returns Map type
+                if class_name == "Map" {
+                    for arg in args {
+                        self.check_expr(arg)?;
+                    }
+                    return Ok(Type::Unknown);
+                }
+
                 let class_type = self.class_types.get(class_name).cloned().ok_or_else(|| {
                     CompileError::error(
                         format!("Cannot find class '{}'", class_name),

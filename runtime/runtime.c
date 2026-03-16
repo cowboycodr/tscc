@@ -428,6 +428,90 @@ double tscc_number_isNaN(double value) {
 }
 
 // ============================================================
+// Map functions (Map<K, V> — string keys, arbitrary value blobs)
+// ============================================================
+typedef struct {
+    char**      keys;
+    long long*  key_lens;
+    void**      values;     // malloc'd copies of each value
+    long long   count;
+    long long   capacity;
+} MgMap;
+
+MgMap* tscc_map_alloc() {
+    MgMap* m = (MgMap*)malloc(sizeof(MgMap));
+    m->keys     = NULL;
+    m->key_lens = NULL;
+    m->values   = NULL;
+    m->count    = 0;
+    m->capacity = 0;
+    return m;
+}
+
+static long long tscc_map_find(MgMap* m, char* key, long long klen) {
+    for (long long i = 0; i < m->count; i++) {
+        if (m->key_lens[i] == klen && memcmp(m->keys[i], key, (size_t)klen) == 0)
+            return i;
+    }
+    return -1;
+}
+
+void tscc_map_set(MgMap* m, char* key, long long klen, void* val, long long vsize) {
+    long long idx = tscc_map_find(m, key, klen);
+    if (idx >= 0) {
+        memcpy(m->values[idx], val, (size_t)vsize);
+        return;
+    }
+    if (m->count >= m->capacity) {
+        m->capacity = m->capacity < 4 ? 4 : m->capacity * 2;
+        m->keys     = (char**)realloc(m->keys,     (size_t)m->capacity * sizeof(char*));
+        m->key_lens = (long long*)realloc(m->key_lens, (size_t)m->capacity * sizeof(long long));
+        m->values   = (void**)realloc(m->values,   (size_t)m->capacity * sizeof(void*));
+    }
+    m->keys[m->count] = (char*)malloc((size_t)(klen + 1));
+    memcpy(m->keys[m->count], key, (size_t)klen);
+    m->keys[m->count][klen] = '\0';
+    m->key_lens[m->count] = klen;
+    m->values[m->count]   = malloc((size_t)vsize);
+    memcpy(m->values[m->count], val, (size_t)vsize);
+    m->count++;
+}
+
+void* tscc_map_get(MgMap* m, char* key, long long klen) {
+    long long idx = tscc_map_find(m, key, klen);
+    return idx >= 0 ? m->values[idx] : NULL;
+}
+
+int tscc_map_has(MgMap* m, char* key, long long klen) {
+    return tscc_map_find(m, key, klen) >= 0 ? 1 : 0;
+}
+
+int tscc_map_delete(MgMap* m, char* key, long long klen) {
+    long long idx = tscc_map_find(m, key, klen);
+    if (idx < 0) return 0;
+    free(m->keys[idx]);
+    free(m->values[idx]);
+    for (long long i = idx; i < m->count - 1; i++) {
+        m->keys[i]     = m->keys[i + 1];
+        m->key_lens[i] = m->key_lens[i + 1];
+        m->values[i]   = m->values[i + 1];
+    }
+    m->count--;
+    return 1;
+}
+
+long long tscc_map_size(MgMap* m) { return m->count; }
+
+// Returns a newly malloc'd void** of value pointers; writes count to *out_count
+void** tscc_map_values_alloc(MgMap* m, long long* out_count) {
+    *out_count = m->count;
+    if (m->count == 0) return NULL;
+    void** ptrs = (void**)malloc((size_t)m->count * sizeof(void*));
+    for (long long i = 0; i < m->count; i++) ptrs[i] = m->values[i];
+    return ptrs;
+}
+
+// ============================================================
 // Global functions
 // ============================================================
 double tscc_parseInt(char* data, long long len) {

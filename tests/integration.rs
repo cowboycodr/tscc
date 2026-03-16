@@ -1294,7 +1294,102 @@ console.log(n, s, b)
 }
 
 // ============================================================
-// 14. NOT YET IMPLEMENTED — TypeScript Coverage Gap
+// 14. MAP
+// ============================================================
+mod map {
+    use super::*;
+
+    #[test]
+    fn map_set_get() {
+        let src = "
+const m = new Map()
+m.set(\"hello\", 42)
+console.log(m.get(\"hello\"))
+";
+        assert_eq!(run_ts(src), "42\n");
+    }
+
+    #[test]
+    fn map_has_delete() {
+        let src = "
+const m = new Map()
+m.set(\"a\", 1)
+console.log(m.has(\"a\"))
+console.log(m.has(\"b\"))
+m.delete(\"a\")
+console.log(m.has(\"a\"))
+";
+        assert_eq!(run_ts(src), "true\nfalse\nfalse\n");
+    }
+
+    #[test]
+    fn map_size() {
+        let src = "
+const m = new Map()
+m.set(\"x\", 1)
+m.set(\"y\", 2)
+m.set(\"z\", 3)
+console.log(m.size)
+m.delete(\"y\")
+console.log(m.size)
+";
+        assert_eq!(run_ts(src), "3\n2\n");
+    }
+
+    #[test]
+    fn map_overwrite() {
+        let src = "
+const m = new Map()
+m.set(\"key\", 1)
+m.set(\"key\", 99)
+console.log(m.get(\"key\"))
+";
+        assert_eq!(run_ts(src), "99\n");
+    }
+
+    #[test]
+    fn map_get_missing() {
+        let src = "
+const m = new Map()
+m.set(\"a\", 10)
+const v = m.get(\"missing\")
+console.log(v)
+";
+        assert_eq!(run_ts(src), "0\n");
+    }
+
+    #[test]
+    fn map_type_annotation() {
+        let src = "
+const m: Map<string, number> = new Map()
+m.set(\"pi\", 3.14)
+console.log(m.get(\"pi\"))
+";
+        assert_eq!(run_ts(src), "3.14\n");
+    }
+
+    #[test]
+    fn map_field_initializer() {
+        let src = "
+class Store {
+  items: Map<string, number> = new Map()
+  add(k: string, v: number): void {
+    this.items.set(k, v)
+  }
+  get(k: string): number {
+    return this.items.get(k)
+  }
+}
+const s = new Store()
+s.add(\"x\", 42)
+console.log(s.get(\"x\"))
+";
+        assert_eq!(run_ts(src), "42\n");
+    }
+}
+
+// ============================================================
+// 15. NOT YET IMPLEMENTED — TypeScript Coverage Gap
 //
 // Each #[ignore] test represents a TypeScript feature that tscc
 // does not yet support. The total ignored count = coverage gap.

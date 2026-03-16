@@ -130,6 +130,7 @@ pub struct SwitchCase {
 pub struct ClassField {
     pub name: String,
     pub type_ann: Option<TypeAnnotation>,
+    pub initializer: Option<Expr>,
     pub span: Span,
 }
 
