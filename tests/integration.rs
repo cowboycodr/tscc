@@ -1766,7 +1766,6 @@ console.log(getLength([1, 2, 3]))
     }
 
     #[test]
-    #[ignore = "tuples require heterogeneous struct-based codegen"]
     fn tuple_type() {
         let src = r#"
 let pair: [number, string] = [1, "one"]

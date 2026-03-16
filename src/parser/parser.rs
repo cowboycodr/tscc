@@ -888,6 +888,22 @@ impl Parser {
                     span: self.span_from(&span),
                 }
             }
+            Token::LeftBracket => {
+                // Tuple type: [number, string, ...]
+                self.advance(); // consume '['
+                let mut element_types = Vec::new();
+                while !self.check(&Token::RightBracket) && !self.is_at_end() {
+                    element_types.push(self.type_annotation()?);
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Token::RightBracket, "Expected ']' in tuple type")?;
+                TypeAnnotation {
+                    kind: TypeAnnKind::Tuple(element_types),
+                    span: self.span_from(&span),
+                }
+            }
             _ => {
                 return Err(self.error("Expected type annotation"));
             }

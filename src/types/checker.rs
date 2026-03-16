@@ -105,6 +105,37 @@ impl TypeChecker {
                     .map(|ann| self.resolve_type_annotation(ann));
 
                 let init_type = if let Some(init) = initializer {
+                    // Special case: array literal assigned to a tuple type —
+                    // check each element against the tuple element types
+                    if let Some(Type::Tuple(ref tuple_types)) = declared_type {
+                        if let ExprKind::ArrayLiteral { elements } = &init.kind {
+                            if elements.len() != tuple_types.len() {
+                                return Err(CompileError::error(
+                                    format!(
+                                        "Tuple of length {} is not assignable to tuple of length {}",
+                                        elements.len(),
+                                        tuple_types.len()
+                                    ),
+                                    stmt.span.clone(),
+                                ));
+                            }
+                            for (elem, expected) in elements.iter().zip(tuple_types.iter()) {
+                                let elem_type = self.check_expr(elem)?;
+                                if !self.is_assignable(&elem_type, expected) {
+                                    return Err(CompileError::error(
+                                        format!(
+                                            "Type '{}' is not assignable to type '{}'",
+                                            elem_type, expected
+                                        ),
+                                        stmt.span.clone(),
+                                    ));
+                                }
+                            }
+                            // All checks passed — use the declared tuple type
+                            self.define(name.clone(), declared_type.unwrap(), *is_const);
+                            return Ok(());
+                        }
+                    }
                     Some(self.check_expr(init)?)
                 } else {
                     None
@@ -753,6 +784,25 @@ impl TypeChecker {
                                 }
                             }
                         }
+                        Ok(Type::Unknown)
+                    }
+                    Type::Tuple(elements) => {
+                        // Tuple indexing with numeric literal: pair[0], pair[1]
+                        if let ExprKind::NumberLiteral(n) = &index.kind {
+                            let idx = *n as usize;
+                            if idx < elements.len() {
+                                return Ok(elements[idx].clone());
+                            }
+                            return Err(CompileError::error(
+                                format!(
+                                    "Tuple index {} out of bounds for tuple of length {}",
+                                    idx,
+                                    elements.len()
+                                ),
+                                expr.span.clone(),
+                            ));
+                        }
+                        // Dynamic index on tuple — return unknown
                         Ok(Type::Unknown)
                     }
                     _ => Ok(Type::Unknown),
@@ -1638,6 +1688,16 @@ impl TypeChecker {
             let ret_ok = self.is_assignable(from_ret, to_ret);
             return params_ok && ret_ok;
         }
+        // Tuple structural compatibility: same length, each element assignable
+        if let (Type::Tuple(from_elems), Type::Tuple(to_elems)) = (from, to) {
+            if from_elems.len() != to_elems.len() {
+                return false;
+            }
+            return from_elems
+                .iter()
+                .zip(to_elems.iter())
+                .all(|(f, t)| self.is_assignable(f, t));
+        }
         false
     }
 
@@ -1735,6 +1795,12 @@ impl TypeChecker {
                     .collect(),
                 return_type: Box::new(self.resolve_type_annotation(return_type)),
             },
+            TypeAnnKind::Tuple(elements) => Type::Tuple(
+                elements
+                    .iter()
+                    .map(|e| self.resolve_type_annotation(e))
+                    .collect(),
+            ),
         }
     }
 

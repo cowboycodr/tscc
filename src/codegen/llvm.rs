@@ -78,6 +78,8 @@ enum VarType {
     /// Tagged union: runtime type tag + variant data
     /// LLVM layout: { i8 tag, double num_slot, ptr str_ptr_slot, i64 aux_slot }
     Union(Vec<VarType>),
+    /// Tuple: heterogeneous fixed-length struct
+    Tuple(Vec<VarType>),
 }
 
 struct LoopContext<'ctx> {
@@ -651,7 +653,23 @@ impl<'ctx> Codegen<'ctx> {
                 type_ann,
                 ..
             } => {
+                // Check if the target type is a tuple
+                let target_vt = type_ann.as_ref().map(|ann| self.type_ann_to_var_type(ann));
+
                 let (alloca, var_type) = if let Some(init) = initializer {
+                    // Special case: tuple-typed variable with array literal initializer
+                    if let Some(VarType::Tuple(ref elem_types)) = target_vt {
+                        if let ExprKind::ArrayLiteral { elements } = &init.kind {
+                            let tuple_vt = VarType::Tuple(elem_types.clone());
+                            let (val, _) =
+                                self.compile_tuple_literal(elements, elem_types, function)?;
+                            let alloca = self.create_alloca(function, &tuple_vt, name);
+                            self.builder.build_store(alloca, val).unwrap();
+                            self.set_variable(name.clone(), alloca, tuple_vt);
+                            return Ok(());
+                        }
+                    }
+
                     let (val, vt) = self.compile_expr(init, function)?;
                     // Register non-closure arrow function under the variable name
                     if let VarType::FunctionPtr { ref fn_name } = vt {
@@ -1931,9 +1949,38 @@ impl<'ctx> Codegen<'ctx> {
                         "Dynamic object property access not supported",
                         expr.span.clone(),
                     ))
+                } else if let VarType::Tuple(ref elem_types) = obj_vt {
+                    // Tuple index access with compile-time constant index
+                    if let ExprKind::NumberLiteral(n) = &index.kind {
+                        let idx = *n as usize;
+                        if idx < elem_types.len() {
+                            let elem_vt = elem_types[idx].clone();
+                            let val = self
+                                .builder
+                                .build_extract_value(
+                                    obj_val.into_struct_value(),
+                                    idx as u32,
+                                    &format!("tup.{}", idx),
+                                )
+                                .unwrap();
+                            return Ok((val.into(), elem_vt));
+                        }
+                        return Err(CompileError::error(
+                            format!(
+                                "Tuple index {} out of bounds for tuple of length {}",
+                                idx,
+                                elem_types.len()
+                            ),
+                            expr.span.clone(),
+                        ));
+                    }
+                    Err(CompileError::error(
+                        "Tuple index must be a numeric literal",
+                        expr.span.clone(),
+                    ))
                 } else {
                     Err(CompileError::error(
-                        "Index access only supported on arrays and objects",
+                        "Index access only supported on arrays, objects, and tuples",
                         expr.span.clone(),
                     ))
                 }
@@ -2486,6 +2533,33 @@ impl<'ctx> Codegen<'ctx> {
         Ok((val, obj_vt))
     }
 
+    /// Compile an array literal as a tuple struct.
+    /// Each element is compiled to its expected type and inserted into the struct.
+    fn compile_tuple_literal(
+        &mut self,
+        elements: &[Expr],
+        elem_types: &[VarType],
+        function: FunctionValue<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let tuple_vt = VarType::Tuple(elem_types.to_vec());
+        let llvm_type = self.var_type_to_llvm(&tuple_vt).into_struct_type();
+        let mut struct_val = llvm_type.const_zero();
+
+        for (i, elem) in elements.iter().enumerate() {
+            if i >= elem_types.len() {
+                break;
+            }
+            let (val, _vt) = self.compile_expr(elem, function)?;
+            struct_val = self
+                .builder
+                .build_insert_value(struct_val, val, i as u32, "tup.elem")
+                .unwrap()
+                .into_struct_value();
+        }
+
+        Ok((struct_val.into(), tuple_vt))
+    }
+
     fn compile_class_decl(
         &mut self,
         name: &str,
@@ -2721,7 +2795,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Number | VarType::Integer => "number",
             VarType::String => "string",
             VarType::Boolean => "boolean",
-            VarType::Array | VarType::Object { .. } => "object",
+            VarType::Array | VarType::Object { .. } | VarType::Tuple(_) => "object",
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "function",
             VarType::Union(_) => "object", // fallback for non-identifier unions
         };
@@ -3733,6 +3807,10 @@ impl<'ctx> Codegen<'ctx> {
                     // Unions should be narrowed before printing; fallback to [union]
                     self.print_string_literal("[union]", print_str);
                 }
+                VarType::Tuple(_) => {
+                    // Tuples shouldn't reach here — elements are indexed individually
+                    self.print_string_literal("[tuple]", print_str);
+                }
             }
         }
 
@@ -4710,6 +4788,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Unions should be narrowed before to_string is called; fallback
                 Ok(self.create_string_literal("[union]"))
             }
+            VarType::Tuple(_) => Ok(self.create_string_literal("[tuple]")),
         }
     }
 
@@ -4804,6 +4883,13 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             VarType::Union(_) => self.get_union_llvm_type().into(),
+            VarType::Tuple(ref elements) => {
+                let field_types: Vec<BasicTypeEnum> = elements
+                    .iter()
+                    .map(|vt| self.var_type_to_llvm(vt))
+                    .collect();
+                self.context.struct_type(&field_types, false).into()
+            }
         }
     }
 
@@ -4897,6 +4983,13 @@ impl<'ctx> Codegen<'ctx> {
                     return_type: Box::new(ret_vt),
                 }
             }
+            TypeAnnKind::Tuple(elements) => {
+                let element_types: Vec<VarType> = elements
+                    .iter()
+                    .map(|e| self.type_ann_to_var_type(e))
+                    .collect();
+                VarType::Tuple(element_types)
+            }
         }
     }
 
@@ -4928,6 +5021,20 @@ impl<'ctx> Codegen<'ctx> {
                 val.into()
             }
             VarType::Union(_) => self.get_union_llvm_type().const_zero().into(),
+            VarType::Tuple(ref elements) => {
+                let llvm_type = self.var_type_to_llvm(vt);
+                let st = llvm_type.into_struct_type();
+                let mut val = st.const_zero();
+                for (i, elem_vt) in elements.iter().enumerate() {
+                    let default = self.default_value(elem_vt);
+                    val = self
+                        .builder
+                        .build_insert_value(val, default, i as u32, "tup.init")
+                        .unwrap()
+                        .into_struct_value();
+                }
+                val.into()
+            }
         }
     }
 

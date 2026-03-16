@@ -193,6 +193,8 @@ pub enum TypeAnnKind {
     Intersection(Vec<TypeAnnotation>),
     /// keyof Type — resolves to union of string literal keys
     Keyof(Box<TypeAnnotation>),
+    /// Tuple type: [number, string]
+    Tuple(Vec<TypeAnnotation>),
     /// Function type: (params) => return_type
     FunctionType {
         params: Vec<TypeAnnotation>,

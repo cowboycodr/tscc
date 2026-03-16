@@ -28,6 +28,8 @@ pub enum Type {
     Union(Vec<Type>),
     /// Intersection type: Named & Aged (merged fields)
     Intersection(Vec<Type>),
+    /// Tuple type: [number, string] — heterogeneous fixed-length array
+    Tuple(Vec<Type>),
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -85,6 +87,16 @@ impl std::fmt::Display for Type {
                     write!(f, "{}", t)?;
                 }
                 Ok(())
+            }
+            Type::Tuple(types) => {
+                write!(f, "[")?;
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, "]")
             }
             Type::Unknown => write!(f, "unknown"),
         }
