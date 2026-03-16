@@ -842,7 +842,18 @@ impl TypeChecker {
             ExprKind::ObjectLiteral { properties } => {
                 let mut fields = Vec::new();
                 for prop in properties {
-                    if prop.is_method {
+                    if prop.is_spread {
+                        // Spread: { ...expr } — merge source fields into this object's type
+                        let spread_ty = self.check_expr(&prop.value)?;
+                        if let Type::Object {
+                            fields: spread_fields,
+                        } = spread_ty
+                        {
+                            for (name, ty) in spread_fields {
+                                fields.push((name, ty));
+                            }
+                        }
+                    } else if prop.is_method {
                         // For methods, build a function type
                         let param_types: Vec<Type> = prop
                             .params

@@ -263,6 +263,8 @@ pub struct ObjectProperty {
     pub key: String,
     pub value: Expr,
     pub is_method: bool,
+    /// True for spread elements: { ...expr } — key is empty when this is set
+    pub is_spread: bool,
     /// For methods: the parameters
     pub params: Vec<Parameter>,
     /// For methods: the return type annotation

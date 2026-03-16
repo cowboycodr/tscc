@@ -2550,7 +2550,20 @@ impl<'ctx> Codegen<'ctx> {
 
         // First pass: compile non-method properties to determine field types
         for prop in properties {
-            if !prop.is_method {
+            if prop.is_spread {
+                // Spread: { ...expr } — extract all fields from the source struct
+                let (spread_val, spread_vt) = self.compile_expr(&prop.value, function)?;
+                if let VarType::Object { ref fields, .. } = spread_vt {
+                    let struct_val = spread_val.into_struct_value();
+                    for (i, (field_name, field_vt)) in fields.iter().enumerate() {
+                        let extracted = self
+                            .builder
+                            .build_extract_value(struct_val, i as u32, field_name)
+                            .unwrap();
+                        field_vals.push((field_name.clone(), extracted, field_vt.clone()));
+                    }
+                }
+            } else if !prop.is_method {
                 let (val, vt) = self.compile_expr(&prop.value, function)?;
                 field_vals.push((prop.key.clone(), val, vt));
             } else {

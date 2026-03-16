@@ -2095,6 +2095,23 @@ impl Parser {
                 let mut properties = Vec::new();
                 while !self.check(&Token::RightBrace) && !self.is_at_end() {
                     let prop_span = self.current_span();
+
+                    // Spread element: { ...expr }
+                    if self.match_token(&Token::Ellipsis) {
+                        let spread_expr = self.expression()?;
+                        properties.push(ObjectProperty {
+                            key: String::new(),
+                            value: spread_expr,
+                            is_spread: true,
+                            is_method: false,
+                            params: Vec::new(),
+                            return_type: None,
+                            span: self.span_from(&prop_span),
+                        });
+                        self.match_token(&Token::Comma);
+                        continue;
+                    }
+
                     let key = self.expect_identifier("Expected property name")?;
 
                     if self.check(&Token::LeftParen) {
@@ -2123,6 +2140,7 @@ impl Parser {
                             key,
                             value,
                             is_method: true,
+                            is_spread: false,
                             params,
                             return_type,
                             span: self.span_from(&prop_span),
@@ -2137,6 +2155,7 @@ impl Parser {
                             key,
                             value,
                             is_method: false,
+                            is_spread: false,
                             params: Vec::new(),
                             return_type: None,
                             span: self.span_from(&prop_span),
@@ -2149,6 +2168,7 @@ impl Parser {
                             key,
                             value,
                             is_method: false,
+                            is_spread: false,
                             params: Vec::new(),
                             return_type: None,
                             span: self.span_from(&prop_span),
