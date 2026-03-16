@@ -2127,6 +2127,20 @@ impl Parser {
                             return_type,
                             span: self.span_from(&prop_span),
                         });
+                    } else if self.check(&Token::Comma) || self.check(&Token::RightBrace) {
+                        // Shorthand property: { name } → { name: name }
+                        let value = Expr {
+                            kind: ExprKind::Identifier(key.clone()),
+                            span: prop_span.clone(),
+                        };
+                        properties.push(ObjectProperty {
+                            key,
+                            value,
+                            is_method: false,
+                            params: Vec::new(),
+                            return_type: None,
+                            span: self.span_from(&prop_span),
+                        });
                     } else {
                         // Regular property: key: value
                         self.expect(&Token::Colon, "Expected ':' after property name")?;
