@@ -1609,6 +1609,52 @@ impl TypeChecker {
                     .collect();
                 Type::Union(types)
             }
+            TypeAnnKind::Intersection(variants) => {
+                // Merge object/class fields from all variants
+                let types: Vec<Type> = variants
+                    .iter()
+                    .map(|v| self.resolve_type_annotation(v))
+                    .collect();
+                // Flatten into a single Object type by merging fields
+                let mut merged_fields: Vec<(String, Type)> = Vec::new();
+                for ty in &types {
+                    match ty {
+                        Type::Object { fields } | Type::Class { fields, .. } => {
+                            for (name, field_ty) in fields {
+                                if !merged_fields.iter().any(|(n, _)| n == name) {
+                                    merged_fields.push((name.clone(), field_ty.clone()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if merged_fields.is_empty() {
+                    Type::Intersection(types)
+                } else {
+                    Type::Object {
+                        fields: merged_fields,
+                    }
+                }
+            }
+            TypeAnnKind::Keyof(inner) => {
+                // Resolve inner type, extract field names as string literal union
+                let inner_type = self.resolve_type_annotation(inner);
+                match &inner_type {
+                    Type::Object { fields } | Type::Class { fields, .. } => {
+                        let literals: Vec<Type> = fields
+                            .iter()
+                            .map(|(name, _)| Type::StringLiteral(name.clone()))
+                            .collect();
+                        if literals.len() == 1 {
+                            literals.into_iter().next().unwrap()
+                        } else {
+                            Type::Union(literals)
+                        }
+                    }
+                    _ => Type::String, // fallback
+                }
+            }
             TypeAnnKind::FunctionType {
                 params,
                 return_type,

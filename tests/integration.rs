@@ -1769,7 +1769,7 @@ console.log(getLength([1, 2, 3]))
     }
 
     #[test]
-    #[ignore = "tuple types not implemented"]
+    #[ignore = "tuples require heterogeneous struct-based codegen"]
     fn tuple_type() {
         let src = r#"
 let pair: [number, string] = [1, "one"]
@@ -2051,7 +2051,6 @@ console.log(d)
     }
 
     #[test]
-    #[ignore = "intersection types not implemented"]
     fn intersection_type() {
         let src = r#"
 interface Named {
@@ -2081,7 +2080,6 @@ console.log(cfg.host)
     }
 
     #[test]
-    #[ignore = "keyof not implemented"]
     fn keyof_operator() {
         let src = r#"
 interface Point {

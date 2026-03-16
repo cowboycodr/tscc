@@ -4539,6 +4539,31 @@ impl<'ctx> Codegen<'ctx> {
                     self.number_mode.clone()
                 }
             }
+            TypeAnnKind::Intersection(variants) => {
+                // Intersection merges object fields — build combined object type
+                let mut all_fields: Vec<(String, VarType)> = Vec::new();
+                for v in variants {
+                    if let VarType::Object { fields, .. } = self.type_ann_to_var_type(v) {
+                        for (name, vt) in fields {
+                            if !all_fields.iter().any(|(n, _)| n == &name) {
+                                all_fields.push((name, vt));
+                            }
+                        }
+                    }
+                }
+                if all_fields.is_empty() {
+                    self.number_mode.clone()
+                } else {
+                    VarType::Object {
+                        struct_type_name: format!("__intersection_{}", all_fields.len()),
+                        fields: all_fields,
+                    }
+                }
+            }
+            TypeAnnKind::Keyof(_) => {
+                // keyof resolves to string literal union — at codegen it's just a string
+                VarType::String
+            }
             TypeAnnKind::FunctionType {
                 params,
                 return_type,

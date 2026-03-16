@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 202 tests passing, 37 pending — 85% of test suite**
+**Current status: 204 tests passing, 35 pending — 85% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -56,7 +56,7 @@ Each requires a new AST node and coordinated changes across parser → checker �
 - [ ] **Labeled statements** — `outer: for (...) { break outer }`
 - [ ] **Tuple types** — `[number, string]` *(fixed-length array with typed positions)*
 - [ ] **`JSON.stringify()`** — `JSON.stringify({ a: 1 })` *(runtime C function)*
-- [ ] **Intersection types** — `Named & Aged`
+- [x] **Intersection types** — `Named & Aged`
 - [x] **String literal types** — `type Dir = "up" | "down"`
 - [ ] **Type narrowing** — `if (typeof val === "string") { ... }`
 

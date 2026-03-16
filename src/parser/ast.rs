@@ -172,6 +172,10 @@ pub enum TypeAnnKind {
     NumberLiteral(f64),
     /// Union type: string | number
     Union(Vec<TypeAnnotation>),
+    /// Intersection type: Named & Aged
+    Intersection(Vec<TypeAnnotation>),
+    /// keyof Type — resolves to union of string literal keys
+    Keyof(Box<TypeAnnotation>),
     /// Function type: (params) => return_type
     FunctionType {
         params: Vec<TypeAnnotation>,

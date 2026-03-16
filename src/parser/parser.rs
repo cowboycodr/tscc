@@ -680,143 +680,9 @@ impl Parser {
     fn type_annotation(&mut self) -> Result<TypeAnnotation, CompileError> {
         let span = self.current_span();
 
-        // typeof x — variable type lookup
-        if self.match_token(&Token::Typeof) {
-            let name = self.expect_identifier("Expected identifier after 'typeof'")?;
-            let mut base = TypeAnnotation {
-                kind: TypeAnnKind::Typeof(name),
-                span: self.span_from(&span),
-            };
-            // Check for array type suffix: typeof x[]
-            while self.check(&Token::LeftBracket) {
-                if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket)
-                {
-                    self.advance();
-                    self.advance();
-                    base = TypeAnnotation {
-                        kind: TypeAnnKind::Array(Box::new(base)),
-                        span: self.span_from(&span),
-                    };
-                } else {
-                    break;
-                }
-            }
-            return Ok(base);
-        }
-
-        // Check for function type: (params) => ReturnType
-        if self.check(&Token::LeftParen) {
-            if let Some(func_type) = self.try_function_type(&span)? {
-                return Ok(func_type);
-            }
-        }
-
-        let mut base = match self.peek_token() {
-            Token::NumberType => {
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::Number,
-                    span: self.span_from(&span),
-                }
-            }
-            Token::StringType => {
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::String,
-                    span: self.span_from(&span),
-                }
-            }
-            Token::BooleanType => {
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::Boolean,
-                    span: self.span_from(&span),
-                }
-            }
-            Token::Void => {
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::Void,
-                    span: self.span_from(&span),
-                }
-            }
-            Token::Null => {
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::Null,
-                    span: self.span_from(&span),
-                }
-            }
-            Token::Undefined => {
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::Undefined,
-                    span: self.span_from(&span),
-                }
-            }
-            Token::LeftBrace => {
-                // Object type: { x: number, y: string }
-                self.advance();
-                let mut fields = Vec::new();
-                while !self.check(&Token::RightBrace) && !self.is_at_end() {
-                    let field_name = self.expect_identifier("Expected field name in type")?;
-                    self.expect(&Token::Colon, "Expected ':' in object type")?;
-                    let field_type = self.type_annotation()?;
-                    fields.push((field_name, field_type));
-                    // Allow comma or semicolon as separator
-                    if !self.match_token(&Token::Comma) {
-                        self.match_token(&Token::Semicolon);
-                    }
-                }
-                self.expect(&Token::RightBrace, "Expected '}' in object type")?;
-                TypeAnnotation {
-                    kind: TypeAnnKind::Object { fields },
-                    span: self.span_from(&span),
-                }
-            }
-            Token::String(s) => {
-                let s = s.clone();
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::StringLiteral(s),
-                    span: self.span_from(&span),
-                }
-            }
-            Token::Number(n) => {
-                let n = n;
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::NumberLiteral(n),
-                    span: self.span_from(&span),
-                }
-            }
-            Token::Identifier(name) => {
-                let name = name.clone();
-                self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::Named(name),
-                    span: self.span_from(&span),
-                }
-            }
-            _ => {
-                return Err(self.error("Expected type annotation"));
-            }
-        };
-
-        // Check for array type suffix: Type[]
-        while self.check(&Token::LeftBracket) {
-            // Peek ahead to see if it's []
-            if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket) {
-                self.advance(); // consume [
-                self.advance(); // consume ]
-                base = TypeAnnotation {
-                    kind: TypeAnnKind::Array(Box::new(base)),
-                    span: self.span_from(&span),
-                };
-            } else {
-                break;
-            }
-        }
+        // Parse the first type (handles typeof, keyof, function types,
+        // primitives, identifiers, array suffix, and intersection &)
+        let base = self.type_annotation_base()?;
 
         // Check for union type: Type | Type | ...
         if self.check(&Token::Pipe) {
@@ -833,9 +699,22 @@ impl Parser {
         Ok(base)
     }
 
-    /// Parse a single type (without union) — used by union parsing to avoid left-recursion
+    /// Parse a single type (without union) — handles typeof, keyof, function types,
+    /// primitives, identifiers, array suffix, and intersection &.
     fn type_annotation_base(&mut self) -> Result<TypeAnnotation, CompileError> {
         let span = self.current_span();
+
+        // keyof Type
+        if let Token::Identifier(ref kw) = self.peek_token() {
+            if kw == "keyof" {
+                self.advance();
+                let inner = self.type_annotation()?;
+                return Ok(TypeAnnotation {
+                    kind: TypeAnnKind::Keyof(Box::new(inner)),
+                    span: self.span_from(&span),
+                });
+            }
+        }
 
         // typeof x
         if self.match_token(&Token::Typeof) {
@@ -946,6 +825,111 @@ impl Parser {
                 self.expect(&Token::RightBrace, "Expected '}' in object type")?;
                 TypeAnnotation {
                     kind: TypeAnnKind::Object { fields },
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Named(name),
+                    span: self.span_from(&span),
+                }
+            }
+            _ => {
+                return Err(self.error("Expected type annotation"));
+            }
+        };
+
+        // Array suffix
+        while self.check(&Token::LeftBracket) {
+            if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket) {
+                self.advance();
+                self.advance();
+                base = TypeAnnotation {
+                    kind: TypeAnnKind::Array(Box::new(base)),
+                    span: self.span_from(&span),
+                };
+            } else {
+                break;
+            }
+        }
+
+        // Intersection: Type & Type & ... (binds tighter than union |)
+        if self.check(&Token::Ampersand) {
+            let mut variants = vec![base];
+            while self.match_token(&Token::Ampersand) {
+                variants.push(self.type_annotation_atom()?);
+            }
+            return Ok(TypeAnnotation {
+                kind: TypeAnnKind::Intersection(variants),
+                span: self.span_from(&span),
+            });
+        }
+
+        Ok(base)
+    }
+
+    /// Parse a single atomic type (no union, no intersection) — used by intersection parsing
+    fn type_annotation_atom(&mut self) -> Result<TypeAnnotation, CompileError> {
+        let span = self.current_span();
+
+        let mut base = match self.peek_token() {
+            Token::NumberType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Number,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::StringType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::String,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::BooleanType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Boolean,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Void => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Void,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Null => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Null,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Undefined => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Undefined,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::String(s) => {
+                let s = s.clone();
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::StringLiteral(s),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Number(n) => {
+                let n = n;
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::NumberLiteral(n),
                     span: self.span_from(&span),
                 }
             }

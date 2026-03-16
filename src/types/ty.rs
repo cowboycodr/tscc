@@ -26,6 +26,8 @@ pub enum Type {
     NumberLiteral(String),
     /// Union type: string | number
     Union(Vec<Type>),
+    /// Intersection type: Named & Aged (merged fields)
+    Intersection(Vec<Type>),
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -70,6 +72,15 @@ impl std::fmt::Display for Type {
                 for (i, t) in types.iter().enumerate() {
                     if i > 0 {
                         write!(f, " | ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                Ok(())
+            }
+            Type::Intersection(types) => {
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " & ")?;
                     }
                     write!(f, "{}", t)?;
                 }
