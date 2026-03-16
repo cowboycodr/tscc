@@ -34,6 +34,8 @@ pub struct TypeChecker {
     type_param_types: HashMap<String, Type>,
     /// Generic function signatures: name -> (type_param_names, param_types, return_type)
     generic_functions: HashMap<String, (Vec<String>, Vec<Type>, Type)>,
+    /// Generic type aliases: name -> (type_param_names, body)
+    generic_type_aliases: HashMap<String, (Vec<String>, TypeAnnotation)>,
 }
 
 impl TypeChecker {
@@ -49,6 +51,7 @@ impl TypeChecker {
             type_aliases: HashMap::new(),
             type_param_types: HashMap::new(),
             generic_functions: HashMap::new(),
+            generic_type_aliases: HashMap::new(),
         };
         checker.push_scope();
         checker.register_builtins();
@@ -437,12 +440,24 @@ impl TypeChecker {
                 Ok(())
             }
 
-            StmtKind::TypeAlias { name, type_ann } => {
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                type_ann,
+            } => {
                 // Register the alias for use in resolve_type_annotation
                 self.type_aliases.insert(name.clone(), type_ann.clone());
-                // Also resolve and register so Named(alias_name) can find it
-                let resolved = self.resolve_type_annotation(type_ann);
-                self.interface_types.insert(name.clone(), resolved);
+                // For non-generic aliases, resolve and register immediately
+                if type_params.is_empty() {
+                    let resolved = self.resolve_type_annotation(type_ann);
+                    self.interface_types.insert(name.clone(), resolved);
+                } else {
+                    // Generic type alias — store type param names for later resolution
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_type_aliases
+                        .insert(name.clone(), (tp_names, type_ann.clone()));
+                }
                 Ok(())
             }
 
@@ -1856,6 +1871,61 @@ impl TypeChecker {
                     .map(|e| self.resolve_type_annotation(e))
                     .collect(),
             ),
+            TypeAnnKind::Generic { name, type_args } => {
+                // Resolve generic type alias: IsNumber<number>
+                if let Some((tp_names, body)) = self.generic_type_aliases.get(name).cloned() {
+                    // Resolve type args, then substitute into the body
+                    let mut subs: HashMap<String, Type> = HashMap::new();
+                    for (tp_name, arg) in tp_names.iter().zip(type_args.iter()) {
+                        subs.insert(tp_name.clone(), self.resolve_type_annotation(arg));
+                    }
+                    // Temporarily set type_param_types for the body resolution
+                    // Since resolve_type_annotation takes &self, we need a workaround:
+                    // Build a simple inline resolver for the body using the substitution map
+                    return self.resolve_generic_type_body(&body, &subs);
+                }
+                // Fall back to named type lookup
+                if let Some(ty) = self.interface_types.get(name) {
+                    return ty.clone();
+                }
+                Type::Unknown
+            }
+            TypeAnnKind::Conditional {
+                check_type,
+                extends_type,
+                true_type,
+                false_type,
+            } => {
+                let check = self.resolve_type_annotation(check_type);
+                let extends = self.resolve_type_annotation(extends_type);
+                if self.is_assignable(&check, &extends) {
+                    self.resolve_type_annotation(true_type)
+                } else {
+                    self.resolve_type_annotation(false_type)
+                }
+            }
+            TypeAnnKind::Mapped { .. } => {
+                // Mapped types produce no runtime values — resolve to Unknown
+                Type::Unknown
+            }
+            TypeAnnKind::IndexedAccess {
+                object_type,
+                index_type,
+            } => {
+                let obj = self.resolve_type_annotation(object_type);
+                let idx = self.resolve_type_annotation(index_type);
+                // T[P] where T is an object type and P is a string literal → field type
+                if let Type::Object { ref fields } = obj {
+                    if let Type::StringLiteral(ref key) = idx {
+                        for (name, ty) in fields {
+                            if name == key {
+                                return ty.clone();
+                            }
+                        }
+                    }
+                }
+                Type::Unknown
+            }
         }
     }
 
@@ -1886,6 +1956,39 @@ impl TypeChecker {
             }
         }
         None
+    }
+
+    /// Resolve a type annotation body with type parameter substitutions.
+    /// Used for generic type alias instantiation (e.g., IsNumber<number>).
+    fn resolve_generic_type_body(
+        &self,
+        ann: &TypeAnnotation,
+        subs: &HashMap<String, Type>,
+    ) -> Type {
+        match &ann.kind {
+            TypeAnnKind::Named(name) => {
+                if let Some(ty) = subs.get(name) {
+                    return ty.clone();
+                }
+                self.resolve_type_annotation(ann)
+            }
+            TypeAnnKind::Conditional {
+                check_type,
+                extends_type,
+                true_type,
+                false_type,
+            } => {
+                let check = self.resolve_generic_type_body(check_type, subs);
+                let extends = self.resolve_generic_type_body(extends_type, subs);
+                if self.is_assignable(&check, &extends) {
+                    self.resolve_generic_type_body(true_type, subs)
+                } else {
+                    self.resolve_generic_type_body(false_type, subs)
+                }
+            }
+            // For other kinds, delegate to the normal resolver (subs won't apply)
+            _ => self.resolve_type_annotation(ann),
+        }
     }
 
     /// Detect `typeof x === "type"` or `typeof x !== "type"` pattern.

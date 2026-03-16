@@ -63,6 +63,10 @@ pub struct Codegen<'ctx> {
     >,
     /// Active type parameter substitutions for monomorphization
     type_substitutions: HashMap<String, VarType>,
+    /// Type alias bodies for codegen resolution
+    type_aliases_for_codegen: HashMap<String, TypeAnnotation>,
+    /// Generic type alias param names: name -> (param_names, body)
+    generic_alias_params: HashMap<String, (Vec<String>, TypeAnnotation)>,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +157,8 @@ impl<'ctx> Codegen<'ctx> {
             function_param_var_types: HashMap::new(),
             generic_templates: HashMap::new(),
             type_substitutions: HashMap::new(),
+            type_aliases_for_codegen: HashMap::new(),
+            generic_alias_params: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -756,7 +762,20 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
 
-            StmtKind::TypeAlias { .. } => {
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                type_ann,
+            } => {
+                // Register for codegen type resolution
+                self.type_aliases_for_codegen
+                    .insert(name.clone(), type_ann.clone());
+                if !type_params.is_empty() {
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_alias_params
+                        .insert(name.clone(), (tp_names, type_ann.clone()));
+                }
                 // Type aliases are erased — no runtime code
                 Ok(())
             }
@@ -4930,7 +4949,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn type_ann_to_var_type(&self, ann: &TypeAnnotation) -> VarType {
+    fn type_ann_to_var_type(&mut self, ann: &TypeAnnotation) -> VarType {
         match &ann.kind {
             TypeAnnKind::Number => self.number_mode.clone(),
             TypeAnnKind::String => VarType::String,
@@ -5030,6 +5049,52 @@ impl<'ctx> Codegen<'ctx> {
                     .map(|e| self.type_ann_to_var_type(e))
                     .collect();
                 VarType::Tuple(element_types)
+            }
+            TypeAnnKind::Generic { name, type_args } => {
+                // Resolve generic type alias by substituting type args
+                // For codegen, look up the alias body and substitute
+                if let Some(alias_ann) = self.type_aliases_for_codegen.get(name).cloned() {
+                    // Build substitution map from type param names
+                    if let Some((tp_names, _)) = self.generic_alias_params.get(name).cloned() {
+                        // Resolve type args first to avoid borrow conflict
+                        let resolved_args: Vec<VarType> = type_args
+                            .iter()
+                            .map(|arg| self.type_ann_to_var_type(arg))
+                            .collect();
+                        let prev_subs = self.type_substitutions.clone();
+                        for (tp_name, vt) in tp_names.iter().zip(resolved_args.into_iter()) {
+                            self.type_substitutions.insert(tp_name.clone(), vt);
+                        }
+                        let result = self.type_ann_to_var_type(&alias_ann);
+                        self.type_substitutions = prev_subs;
+                        return result;
+                    }
+                }
+                self.number_mode.clone()
+            }
+            TypeAnnKind::Conditional {
+                check_type,
+                extends_type,
+                true_type,
+                false_type,
+            } => {
+                // Evaluate conditional type at codegen time
+                let check = self.type_ann_to_var_type(check_type);
+                let extends = self.type_ann_to_var_type(extends_type);
+                // Simple check: if the types match categories
+                if Self::var_types_compatible(&check, &extends) {
+                    self.type_ann_to_var_type(true_type)
+                } else {
+                    self.type_ann_to_var_type(false_type)
+                }
+            }
+            TypeAnnKind::Mapped { .. } => {
+                // Mapped types are type-only — no runtime representation
+                self.number_mode.clone()
+            }
+            TypeAnnKind::IndexedAccess { .. } => {
+                // Indexed access types are type-only — fallback
+                self.number_mode.clone()
             }
         }
     }
@@ -5867,6 +5932,19 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap_or_else(|| self.context.f64_type().const_float(0.0).into());
 
         Ok((ret_val, ret_vt))
+    }
+
+    /// Check if two VarTypes are in the same category (for conditional type evaluation).
+    fn var_types_compatible(a: &VarType, b: &VarType) -> bool {
+        matches!(
+            (a, b),
+            (
+                VarType::Number | VarType::Integer,
+                VarType::Number | VarType::Integer
+            ) | (VarType::String, VarType::String)
+                | (VarType::Boolean, VarType::Boolean)
+                | (VarType::Array, VarType::Array)
+        )
     }
 
     /// Short suffix for a VarType, used in mangled specialization names.

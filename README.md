@@ -148,11 +148,11 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 211 tests passing, 28 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**211 passing** / **28 not yet implemented** — 88% of test suite
+**213 passing** / **26 not yet implemented** — 89% of test suite
 
 ### Literals & Primitives
 
@@ -383,8 +383,8 @@ Early stage. 211 tests passing, 28 pending. The goal is drop-in compatibility wi
 | Intersection types | :white_check_mark: | `Named & Aged` |
 | `readonly` | :white_check_mark: | `readonly host: string` |
 | `keyof` | :white_check_mark: | `keyof Point` |
-| Conditional types | :x: | `T extends number ? "yes" : "no"` |
-| Mapped types | :x: | `{ [P in keyof T]: T[P] }` |
+| Conditional types | :white_check_mark: | `T extends number ? "yes" : "no"` |
+| Mapped types | :white_check_mark: | `{ [P in keyof T]: T[P] }` |
 | `typeof` in type position | :white_check_mark: | `let y: typeof x` |
 | `satisfies` | :white_check_mark: | `"red" satisfies Colors` |
 | `as const` | :white_check_mark: | `[1, 2, 3] as const` |

@@ -93,6 +93,7 @@ pub enum StmtKind {
     },
     TypeAlias {
         name: String,
+        type_params: Vec<TypeParam>,
         type_ann: TypeAnnotation,
     },
     EnumDecl {
@@ -203,6 +204,29 @@ pub enum TypeAnnKind {
     Keyof(Box<TypeAnnotation>),
     /// Tuple type: [number, string]
     Tuple(Vec<TypeAnnotation>),
+    /// Generic named type reference with type arguments: IsNumber<number>
+    Generic {
+        name: String,
+        type_args: Vec<TypeAnnotation>,
+    },
+    /// Conditional type: T extends number ? "yes" : "no"
+    Conditional {
+        check_type: Box<TypeAnnotation>,
+        extends_type: Box<TypeAnnotation>,
+        true_type: Box<TypeAnnotation>,
+        false_type: Box<TypeAnnotation>,
+    },
+    /// Mapped type: { [P in keyof T]: T[P] }
+    Mapped {
+        param: String,
+        constraint: Box<TypeAnnotation>,
+        value_type: Box<TypeAnnotation>,
+    },
+    /// Indexed access type: T[P]
+    IndexedAccess {
+        object_type: Box<TypeAnnotation>,
+        index_type: Box<TypeAnnotation>,
+    },
     /// Function type: (params) => return_type
     FunctionType {
         params: Vec<TypeAnnotation>,

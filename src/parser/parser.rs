@@ -230,6 +230,20 @@ impl Parser {
         Ok(type_params)
     }
 
+    /// Parse type arguments: `<number>`, `<string, number>`
+    fn parse_type_args(&mut self) -> Result<Vec<TypeAnnotation>, CompileError> {
+        self.expect(&Token::Less, "Expected '<'")?;
+        let mut type_args = Vec::new();
+        loop {
+            type_args.push(self.type_annotation()?);
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::Greater, "Expected '>' after type arguments")?;
+        Ok(type_args)
+    }
+
     fn class_declaration(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         self.advance(); // consume 'class'
@@ -364,12 +378,24 @@ impl Parser {
         self.advance(); // consume 'type' identifier
 
         let name = self.expect_identifier("Expected type alias name")?;
+
+        // Optional type parameters: type IsNumber<T> = ...
+        let type_params = if self.check(&Token::Less) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
+
         self.expect(&Token::Assign, "Expected '=' in type alias")?;
         let type_ann = self.type_annotation()?;
         self.consume_semicolon()?;
 
         Ok(Statement {
-            kind: StmtKind::TypeAlias { name, type_ann },
+            kind: StmtKind::TypeAlias {
+                name,
+                type_params,
+                type_ann,
+            },
             span: self.span_from(&start_span),
         })
     }
@@ -776,6 +802,25 @@ impl Parser {
         // primitives, identifiers, array suffix, and intersection &)
         let base = self.type_annotation_base()?;
 
+        // Check for conditional type: CheckType extends ExtendsType ? TrueType : FalseType
+        if self.check(&Token::Extends) {
+            self.advance(); // consume 'extends'
+            let extends_type = self.type_annotation_base()?;
+            self.expect(&Token::Question, "Expected '?' in conditional type")?;
+            let true_type = self.type_annotation()?;
+            self.expect(&Token::Colon, "Expected ':' in conditional type")?;
+            let false_type = self.type_annotation()?;
+            return Ok(TypeAnnotation {
+                kind: TypeAnnKind::Conditional {
+                    check_type: Box::new(base),
+                    extends_type: Box::new(extends_type),
+                    true_type: Box::new(true_type),
+                    false_type: Box::new(false_type),
+                },
+                span: self.span_from(&span),
+            });
+        }
+
         // Check for union type: Type | Type | ...
         if self.check(&Token::Pipe) {
             let mut variants = vec![base];
@@ -899,6 +944,43 @@ impl Parser {
             }
             Token::LeftBrace => {
                 self.advance();
+
+                // Skip optional 'readonly' modifier
+                if let Token::Identifier(ref kw) = self.peek_token() {
+                    if kw == "readonly" {
+                        self.advance();
+                    }
+                }
+
+                // Check for mapped type: { [P in keyof T]: T[P] }
+                if self.check(&Token::LeftBracket) {
+                    let saved = self.current;
+                    self.advance(); // consume '['
+                    if let Ok(param) = self.expect_identifier("mapped type param") {
+                        if let Token::Identifier(ref kw) = self.peek_token() {
+                            if kw == "in" {
+                                self.advance(); // consume 'in'
+                                let constraint = self.type_annotation()?;
+                                self.expect(&Token::RightBracket, "Expected ']'")?;
+                                self.expect(&Token::Colon, "Expected ':'")?;
+                                let value_type = self.type_annotation()?;
+                                self.match_token(&Token::Semicolon);
+                                self.expect(&Token::RightBrace, "Expected '}'")?;
+                                return Ok(TypeAnnotation {
+                                    kind: TypeAnnKind::Mapped {
+                                        param,
+                                        constraint: Box::new(constraint),
+                                        value_type: Box::new(value_type),
+                                    },
+                                    span: self.span_from(&span),
+                                });
+                            }
+                        }
+                    }
+                    // Not a mapped type — backtrack
+                    self.current = saved;
+                }
+
                 let mut fields = Vec::new();
                 while !self.check(&Token::RightBrace) && !self.is_at_end() {
                     if let Token::Identifier(ref kw) = self.peek_token() {
@@ -923,9 +1005,28 @@ impl Parser {
             Token::Identifier(name) => {
                 let name = name.clone();
                 self.advance();
-                TypeAnnotation {
-                    kind: TypeAnnKind::Named(name),
-                    span: self.span_from(&span),
+
+                // Check for type arguments: IsNumber<number>
+                if self.check(&Token::Less) {
+                    // Speculatively parse type args — save position
+                    let saved = self.current;
+                    if let Ok(type_args) = self.parse_type_args() {
+                        TypeAnnotation {
+                            kind: TypeAnnKind::Generic { name, type_args },
+                            span: self.span_from(&span),
+                        }
+                    } else {
+                        self.current = saved;
+                        TypeAnnotation {
+                            kind: TypeAnnKind::Named(name),
+                            span: self.span_from(&span),
+                        }
+                    }
+                } else {
+                    TypeAnnotation {
+                        kind: TypeAnnKind::Named(name),
+                        span: self.span_from(&span),
+                    }
                 }
             }
             Token::LeftBracket => {
@@ -949,9 +1050,10 @@ impl Parser {
             }
         };
 
-        // Array suffix
+        // Array suffix or indexed access type
         while self.check(&Token::LeftBracket) {
             if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket) {
+                // Empty brackets: Type[] → array
                 self.advance();
                 self.advance();
                 base = TypeAnnotation {
@@ -959,7 +1061,17 @@ impl Parser {
                     span: self.span_from(&span),
                 };
             } else {
-                break;
+                // Non-empty brackets: T[P] → indexed access type
+                self.advance(); // consume '['
+                let index_type = self.type_annotation()?;
+                self.expect(&Token::RightBracket, "Expected ']'")?;
+                base = TypeAnnotation {
+                    kind: TypeAnnKind::IndexedAccess {
+                        object_type: Box::new(base),
+                        index_type: Box::new(index_type),
+                    },
+                    span: self.span_from(&span),
+                };
             }
         }
 

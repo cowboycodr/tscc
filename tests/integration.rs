@@ -2087,7 +2087,6 @@ console.log(k)
     }
 
     #[test]
-    #[ignore = "conditional types not implemented"]
     fn conditional_type() {
         let src = r#"
 type IsNumber<T> = T extends number ? "yes" : "no"
@@ -2098,7 +2097,6 @@ console.log(x)
     }
 
     #[test]
-    #[ignore = "mapped types not implemented"]
     fn mapped_type() {
         let src = r#"
 type Readonly<T> = {

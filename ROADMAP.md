@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 211 tests passing, 28 pending — 88% of test suite**
+**Current status: 213 tests passing, 26 pending — 89% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -72,8 +72,8 @@ Significant design work. Each could be a multi-session effort.
 - [ ] **`Set`** — `new Set([1, 2, 3])` *(runtime hash set)*
 - [ ] **`RegExp`** — `/hello/.test("hello world")` *(link against PCRE or re2)*
 - [ ] **`keyof`** — `keyof Point`
-- [ ] **Conditional types** — `T extends number ? "yes" : "no"`
-- [ ] **Mapped types** — `{ [P in keyof T]: T[P] }`
+- [x] **Conditional types** — `T extends number ? "yes" : "no"`
+- [x] **Mapped types** — `{ [P in keyof T]: T[P] }`
 
 ---
 
