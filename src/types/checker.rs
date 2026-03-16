@@ -387,13 +387,58 @@ impl TypeChecker {
                 else_branch,
             } => {
                 self.check_expr(condition)?;
+
+                // Detect typeof narrowing: typeof x === "type" / typeof x !== "type"
+                let narrowing = Self::detect_typeof_narrowing(condition).and_then(
+                    |(var_name, type_str, is_eq)| {
+                        if let Some(Type::Union(variants)) = self.lookup(&var_name) {
+                            let target = Self::type_string_to_type(&type_str);
+                            let remaining: Vec<Type> = variants
+                                .iter()
+                                .filter(|v| !Self::is_same_type_category(v, &target))
+                                .cloned()
+                                .collect();
+                            Some((var_name, target, remaining, is_eq))
+                        } else {
+                            None
+                        }
+                    },
+                );
+
                 self.push_scope();
+                if let Some((ref var_name, ref target, ref remaining, is_eq)) = narrowing {
+                    // In then-branch: narrow to matched type (=== → target, !== → remaining)
+                    if is_eq {
+                        self.define(var_name.clone(), target.clone(), false);
+                    } else if remaining.len() == 1 {
+                        self.define(var_name.clone(), remaining[0].clone(), false);
+                    } else if !remaining.is_empty() {
+                        self.define(var_name.clone(), Type::Union(remaining.clone()), false);
+                    }
+                }
                 for stmt in then_branch {
                     self.check_statement(stmt)?;
                 }
                 self.pop_scope();
+
                 if let Some(else_stmts) = else_branch {
                     self.push_scope();
+                    if let Some((ref var_name, ref target, ref remaining, is_eq)) = narrowing {
+                        // In else-branch: narrow to the complement
+                        if is_eq {
+                            if remaining.len() == 1 {
+                                self.define(var_name.clone(), remaining[0].clone(), false);
+                            } else if !remaining.is_empty() {
+                                self.define(
+                                    var_name.clone(),
+                                    Type::Union(remaining.clone()),
+                                    false,
+                                );
+                            }
+                        } else {
+                            self.define(var_name.clone(), target.clone(), false);
+                        }
+                    }
                     for stmt in else_stmts {
                         self.check_statement(stmt)?;
                     }
@@ -1720,5 +1765,61 @@ impl TypeChecker {
             }
         }
         None
+    }
+
+    /// Detect `typeof x === "type"` or `typeof x !== "type"` pattern.
+    /// Returns (variable_name, type_string, is_equality).
+    fn detect_typeof_narrowing(condition: &Expr) -> Option<(String, String, bool)> {
+        if let ExprKind::Binary { left, op, right } = &condition.kind {
+            if matches!(op, BinOp::StrictEqual | BinOp::StrictNotEqual) {
+                let is_eq = *op == BinOp::StrictEqual;
+                // typeof x === "type"
+                if let ExprKind::Typeof { operand } = &left.kind {
+                    if let ExprKind::Identifier(name) = &operand.kind {
+                        if let ExprKind::StringLiteral(type_str) = &right.kind {
+                            return Some((name.clone(), type_str.clone(), is_eq));
+                        }
+                    }
+                }
+                // "type" === typeof x
+                if let ExprKind::Typeof { operand } = &right.kind {
+                    if let ExprKind::Identifier(name) = &operand.kind {
+                        if let ExprKind::StringLiteral(type_str) = &left.kind {
+                            return Some((name.clone(), type_str.clone(), is_eq));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Map a typeof string to a Type.
+    fn type_string_to_type(s: &str) -> Type {
+        match s {
+            "number" => Type::Number,
+            "string" => Type::String,
+            "boolean" => Type::Boolean,
+            "object" => Type::Object { fields: Vec::new() },
+            "function" => Type::Function {
+                params: Vec::new(),
+                return_type: Box::new(Type::Void),
+            },
+            _ => Type::Unknown,
+        }
+    }
+
+    /// Check if a type matches the same category as a target (for narrowing filtering).
+    fn is_same_type_category(ty: &Type, target: &Type) -> bool {
+        matches!(
+            (ty, target),
+            (
+                Type::Number | Type::NumberLiteral(_),
+                Type::Number | Type::NumberLiteral(_)
+            ) | (
+                Type::String | Type::StringLiteral(_),
+                Type::String | Type::StringLiteral(_)
+            ) | (Type::Boolean, Type::Boolean)
+        )
     }
 }

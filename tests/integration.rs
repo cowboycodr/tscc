@@ -1689,7 +1689,6 @@ printPoint({ x: 1, y: 2 })
     // --- Type system features ---
 
     #[test]
-    #[ignore = "union type codegen requires runtime type narrowing"]
     fn union_type() {
         let src = r#"
 function format(val: string | number): string {
@@ -2022,7 +2021,6 @@ p.then(v => console.log(v))
     // --- Misc TypeScript features ---
 
     #[test]
-    #[ignore = "type narrowing not implemented"]
     fn type_narrowing() {
         let src = r#"
 function process(val: string | number): void {

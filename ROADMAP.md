@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 206 tests passing, 33 pending — 86% of test suite**
+**Current status: 208 tests passing, 31 pending — 87% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -58,7 +58,7 @@ Each requires a new AST node and coordinated changes across parser → checker �
 - [ ] **`JSON.stringify()`** — `JSON.stringify({ a: 1 })` *(runtime C function)*
 - [x] **Intersection types** — `Named & Aged`
 - [x] **String literal types** — `type Dir = "up" | "down"`
-- [ ] **Type narrowing** — `if (typeof val === "string") { ... }`
+- [x] **Type narrowing** — `if (typeof val === "string") { ... }`
 
 ---
 

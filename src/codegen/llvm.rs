@@ -49,6 +49,8 @@ pub struct Codegen<'ctx> {
     function_param_defaults: HashMap<String, Vec<Option<Expr>>>,
     /// Index of rest parameter for variadic functions (fn_name -> rest param index)
     function_rest_param_index: HashMap<String, usize>,
+    /// Parameter VarTypes for functions (for union wrapping at call sites)
+    function_param_var_types: HashMap<String, Vec<VarType>>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,9 @@ enum VarType {
         struct_type_name: String,
         fields: Vec<(String, VarType)>,
     },
+    /// Tagged union: runtime type tag + variant data
+    /// LLVM layout: { i8 tag, double num_slot, ptr str_ptr_slot, i64 aux_slot }
+    Union(Vec<VarType>),
 }
 
 struct LoopContext<'ctx> {
@@ -131,6 +136,7 @@ impl<'ctx> Codegen<'ctx> {
             function_return_types: HashMap::new(),
             function_param_defaults: HashMap::new(),
             function_rest_param_index: HashMap::new(),
+            function_param_var_types: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -782,53 +788,189 @@ impl<'ctx> Codegen<'ctx> {
                 then_branch,
                 else_branch,
             } => {
-                let (cond_val, _) = self.compile_expr(condition, function)?;
-                let cond_bool = self.to_bool(cond_val)?;
+                // Check for typeof narrowing pattern on a union variable
+                let narrowing = Self::detect_typeof_narrowing(condition).and_then(
+                    |(var_name, type_str, is_eq)| {
+                        if let Some((ptr, VarType::Union(ref variants))) =
+                            self.get_variable(&var_name)
+                        {
+                            let target_vt = self.type_string_to_var_type(&type_str);
+                            let target_tag = Self::union_tag_for_var_type(&target_vt);
+                            // Compute remaining variants after narrowing
+                            let remaining: Vec<VarType> = variants
+                                .iter()
+                                .filter(|v| Self::union_tag_for_var_type(v) != target_tag)
+                                .cloned()
+                                .collect();
+                            Some((var_name, ptr, target_vt, target_tag, remaining, is_eq))
+                        } else {
+                            None
+                        }
+                    },
+                );
 
-                let then_bb = self.context.append_basic_block(function, "then");
-                let else_bb = self.context.append_basic_block(function, "else");
-                let merge_bb = self.context.append_basic_block(function, "merge");
-
-                self.builder
-                    .build_conditional_branch(cond_bool.into_int_value(), then_bb, else_bb)
-                    .unwrap();
-
-                self.builder.position_at_end(then_bb);
-                self.push_scope();
-                for s in then_branch {
-                    self.compile_statement(s, function)?;
-                }
-                self.pop_scope();
-                if self
-                    .builder
-                    .get_insert_block()
-                    .unwrap()
-                    .get_terminator()
-                    .is_none()
+                if let Some((var_name, union_ptr, target_vt, target_tag, remaining, is_eq)) =
+                    narrowing
                 {
-                    self.builder.build_unconditional_branch(merge_bb).unwrap();
-                }
+                    // Compile as tag comparison instead of generic condition
+                    let union_type = self.get_union_llvm_type();
+                    let tag_ptr = self
+                        .builder
+                        .build_struct_gep(union_type, union_ptr, 0, "tag_ptr")
+                        .unwrap();
+                    let tag = self
+                        .builder
+                        .build_load(self.context.i8_type(), tag_ptr, "tag")
+                        .unwrap()
+                        .into_int_value();
+                    let expected_tag = self.context.i8_type().const_int(target_tag as u64, false);
+                    let cmp = self
+                        .builder
+                        .build_int_compare(IntPredicate::EQ, tag, expected_tag, "tag_cmp")
+                        .unwrap();
 
-                self.builder.position_at_end(else_bb);
-                if let Some(else_stmts) = else_branch {
+                    let then_bb = self.context.append_basic_block(function, "then");
+                    let else_bb = self.context.append_basic_block(function, "else");
+                    let merge_bb = self.context.append_basic_block(function, "merge");
+
+                    self.builder
+                        .build_conditional_branch(cmp, then_bb, else_bb)
+                        .unwrap();
+
+                    // Determine which type goes in which branch based on === vs !==
+                    let (then_vt, _else_vt_list) = if is_eq {
+                        (target_vt.clone(), remaining.clone())
+                    } else {
+                        // !== : then-branch gets remaining, else-branch gets target
+                        let else_list = vec![target_vt.clone()];
+                        // For then-branch with !==, use first remaining or fallback
+                        let then_single = remaining.first().cloned().unwrap_or(target_vt.clone());
+                        (then_single, else_list)
+                    };
+                    let (then_extract_vt, else_extract_list) = if is_eq {
+                        (target_vt.clone(), remaining.clone())
+                    } else {
+                        let else_list = vec![target_vt.clone()];
+                        let then_single = remaining.first().cloned().unwrap_or(target_vt.clone());
+                        (then_single, else_list)
+                    };
+
+                    // Then branch: narrow to matched type
+                    self.builder.position_at_end(then_bb);
                     self.push_scope();
-                    for s in else_stmts {
+                    let narrowed_val = self.extract_from_union(union_ptr, &then_extract_vt);
+                    let narrowed_alloca = self.create_alloca(function, &then_vt, &var_name);
+                    self.builder
+                        .build_store(narrowed_alloca, narrowed_val)
+                        .unwrap();
+                    self.set_variable(var_name.clone(), narrowed_alloca, then_vt);
+                    for s in then_branch {
                         self.compile_statement(s, function)?;
                     }
                     self.pop_scope();
-                }
-                if self
-                    .builder
-                    .get_insert_block()
-                    .unwrap()
-                    .get_terminator()
-                    .is_none()
-                {
-                    self.builder.build_unconditional_branch(merge_bb).unwrap();
-                }
+                    let then_terminated = self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_some();
+                    if !then_terminated {
+                        self.builder.build_unconditional_branch(merge_bb).unwrap();
+                    }
 
-                self.builder.position_at_end(merge_bb);
-                Ok(())
+                    // Else branch: narrow to remaining type(s)
+                    self.builder.position_at_end(else_bb);
+                    if let Some(else_stmts) = else_branch {
+                        self.push_scope();
+                        // If only one remaining type, extract it
+                        if else_extract_list.len() == 1 {
+                            let else_vt = &else_extract_list[0];
+                            let else_val = self.extract_from_union(union_ptr, else_vt);
+                            let else_alloca = self.create_alloca(function, else_vt, &var_name);
+                            self.builder.build_store(else_alloca, else_val).unwrap();
+                            self.set_variable(var_name.clone(), else_alloca, else_vt.clone());
+                        }
+                        for s in else_stmts {
+                            self.compile_statement(s, function)?;
+                        }
+                        self.pop_scope();
+                    }
+                    if self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_none()
+                    {
+                        self.builder.build_unconditional_branch(merge_bb).unwrap();
+                    }
+
+                    self.builder.position_at_end(merge_bb);
+
+                    // Post-if narrowing: if then-branch terminated (return/break),
+                    // the merge block only runs from the else path. Narrow the variable
+                    // to the else type in the current scope.
+                    if then_terminated && else_branch.is_none() {
+                        if else_extract_list.len() == 1 {
+                            let post_vt = &else_extract_list[0];
+                            let post_val = self.extract_from_union(union_ptr, post_vt);
+                            let post_alloca = self.create_alloca(function, post_vt, &var_name);
+                            self.builder.build_store(post_alloca, post_val).unwrap();
+                            self.set_variable(var_name.clone(), post_alloca, post_vt.clone());
+                        }
+                    }
+
+                    Ok(())
+                } else {
+                    // Normal (non-narrowing) if statement
+                    let (cond_val, _) = self.compile_expr(condition, function)?;
+                    let cond_bool = self.to_bool(cond_val)?;
+
+                    let then_bb = self.context.append_basic_block(function, "then");
+                    let else_bb = self.context.append_basic_block(function, "else");
+                    let merge_bb = self.context.append_basic_block(function, "merge");
+
+                    self.builder
+                        .build_conditional_branch(cond_bool.into_int_value(), then_bb, else_bb)
+                        .unwrap();
+
+                    self.builder.position_at_end(then_bb);
+                    self.push_scope();
+                    for s in then_branch {
+                        self.compile_statement(s, function)?;
+                    }
+                    self.pop_scope();
+                    if self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_none()
+                    {
+                        self.builder.build_unconditional_branch(merge_bb).unwrap();
+                    }
+
+                    self.builder.position_at_end(else_bb);
+                    if let Some(else_stmts) = else_branch {
+                        self.push_scope();
+                        for s in else_stmts {
+                            self.compile_statement(s, function)?;
+                        }
+                        self.pop_scope();
+                    }
+                    if self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_none()
+                    {
+                        self.builder.build_unconditional_branch(merge_bb).unwrap();
+                    }
+
+                    self.builder.position_at_end(merge_bb);
+                    Ok(())
+                }
             }
 
             StmtKind::While { condition, body } => {
@@ -1409,6 +1551,10 @@ impl<'ctx> Codegen<'ctx> {
             self.function_return_types
                 .insert(name.to_string(), vt.clone());
         }
+
+        // Store parameter VarTypes for call-site union wrapping
+        self.function_param_var_types
+            .insert(name.to_string(), param_types.clone());
 
         // Mark function as nounwind (no exceptions) to enable better optimization
         let nounwind_id = Attribute::get_named_enum_kind_id("nounwind");
@@ -2563,6 +2709,13 @@ impl<'ctx> Codegen<'ctx> {
         operand: &Expr,
         function: FunctionValue<'ctx>,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        // Special case: typeof on a union-typed variable → runtime tag check
+        if let ExprKind::Identifier(name) = &operand.kind {
+            if let Some((ptr, VarType::Union(_))) = self.get_variable(name) {
+                return self.compile_typeof_union(ptr, function);
+            }
+        }
+
         let (_val, vt) = self.compile_expr(operand, function)?;
         let type_str = match vt {
             VarType::Number | VarType::Integer => "number",
@@ -2570,8 +2723,73 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Boolean => "boolean",
             VarType::Array | VarType::Object { .. } => "object",
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "function",
+            VarType::Union(_) => "object", // fallback for non-identifier unions
         };
         Ok((self.create_string_literal(type_str), VarType::String))
+    }
+
+    /// Compile `typeof` for a union-typed variable at runtime.
+    /// Reads the tag from the union struct and returns the appropriate type string.
+    fn compile_typeof_union(
+        &mut self,
+        union_ptr: PointerValue<'ctx>,
+        function: FunctionValue<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let union_llvm_type = self.get_union_llvm_type();
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(union_llvm_type, union_ptr, 0, "tag_ptr")
+            .unwrap();
+        let tag = self
+            .builder
+            .build_load(self.context.i8_type(), tag_ptr, "tag")
+            .unwrap()
+            .into_int_value();
+
+        let number_bb = self.context.append_basic_block(function, "typeof_number");
+        let string_bb = self.context.append_basic_block(function, "typeof_string");
+        let boolean_bb = self.context.append_basic_block(function, "typeof_boolean");
+        let merge_bb = self.context.append_basic_block(function, "typeof_merge");
+
+        self.builder
+            .build_switch(
+                tag,
+                string_bb, // default
+                &[
+                    (self.context.i8_type().const_int(0, false), number_bb),
+                    (self.context.i8_type().const_int(1, false), string_bb),
+                    (self.context.i8_type().const_int(2, false), boolean_bb),
+                ],
+            )
+            .unwrap();
+
+        self.builder.position_at_end(number_bb);
+        let number_str = self.create_string_literal("number");
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+        let number_bb_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(string_bb);
+        let string_str = self.create_string_literal("string");
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+        let string_bb_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(boolean_bb);
+        let boolean_str = self.create_string_literal("boolean");
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+        let boolean_bb_end = self.builder.get_insert_block().unwrap();
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self
+            .builder
+            .build_phi(self.string_type, "typeof_result")
+            .unwrap();
+        phi.add_incoming(&[
+            (&number_str, number_bb_end),
+            (&string_str, string_bb_end),
+            (&boolean_str, boolean_bb_end),
+        ]);
+
+        Ok((phi.as_basic_value(), VarType::String))
     }
 
     fn compile_member_access(
@@ -3218,23 +3436,40 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
                 compiled_args.push(rest_arr.into_struct_value().into());
             } else {
-                for arg in args {
+                let target_param_vts = self.function_param_var_types.get(name).cloned();
+                for (arg_idx, arg) in args.iter().enumerate() {
                     let (val, vt) = self.compile_expr(arg, function)?;
-                    // Convert f64 → i64 when calling an integer function from float context
-                    let val =
-                        if is_target_integer && !caller_is_integer && matches!(vt, VarType::Number)
-                        {
-                            self.builder
-                                .build_float_to_signed_int(
-                                    val.into_float_value(),
-                                    self.context.i64_type(),
-                                    "f2i",
-                                )
-                                .unwrap()
-                                .into()
-                        } else {
-                            val
-                        };
+
+                    // Check if the target parameter is a union type
+                    let is_union_param = target_param_vts
+                        .as_ref()
+                        .and_then(|pvts| pvts.get(arg_idx))
+                        .map(|pvt| matches!(pvt, VarType::Union(_)))
+                        .unwrap_or(false);
+
+                    let val = if is_union_param && !matches!(vt, VarType::Union(_)) {
+                        // Wrap concrete value in union struct for union-typed parameter
+                        let union_ptr = self.wrap_in_union(val, &vt, function);
+                        let union_type = self.get_union_llvm_type();
+                        self.builder
+                            .build_load(union_type, union_ptr, "union_arg")
+                            .unwrap()
+                    } else if is_target_integer
+                        && !caller_is_integer
+                        && matches!(vt, VarType::Number)
+                    {
+                        // Convert f64 → i64 when calling an integer function from float context
+                        self.builder
+                            .build_float_to_signed_int(
+                                val.into_float_value(),
+                                self.context.i64_type(),
+                                "f2i",
+                            )
+                            .unwrap()
+                            .into()
+                    } else {
+                        val
+                    };
                     compiled_args.push(val.into());
                 }
             }
@@ -3493,6 +3728,10 @@ impl<'ctx> Codegen<'ctx> {
                         }
                     }
                     self.print_string_literal(" }", print_str);
+                }
+                VarType::Union(_) => {
+                    // Unions should be narrowed before printing; fallback to [union]
+                    self.print_string_literal("[union]", print_str);
                 }
             }
         }
@@ -4467,6 +4706,10 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(self.create_string_literal("[Function]"))
             }
             VarType::Object { .. } => Ok(self.create_string_literal("[object Object]")),
+            VarType::Union(_) => {
+                // Unions should be narrowed before to_string is called; fallback
+                Ok(self.create_string_literal("[union]"))
+            }
         }
     }
 
@@ -4560,6 +4803,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.context.struct_type(&field_types, false).into()
                 }
             }
+            VarType::Union(_) => self.get_union_llvm_type().into(),
         }
     }
 
@@ -4603,13 +4847,14 @@ impl<'ctx> Codegen<'ctx> {
             TypeAnnKind::StringLiteral(_) => VarType::String,
             TypeAnnKind::NumberLiteral(_) => self.number_mode.clone(),
             TypeAnnKind::Union(variants) => {
-                // Union types are erased at codegen — use first variant's type
-                // as a fallback for uninitialized variables. The concrete value
-                // determines the actual LLVM type at runtime.
-                if let Some(first) = variants.first() {
-                    self.type_ann_to_var_type(first)
-                } else {
+                let var_types: Vec<VarType> = variants
+                    .iter()
+                    .map(|v| self.type_ann_to_var_type(v))
+                    .collect();
+                if var_types.is_empty() {
                     self.number_mode.clone()
+                } else {
+                    VarType::Union(var_types)
                 }
             }
             TypeAnnKind::Intersection(variants) => {
@@ -4682,7 +4927,228 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 val.into()
             }
+            VarType::Union(_) => self.get_union_llvm_type().const_zero().into(),
         }
+    }
+
+    // --- Tagged union support ---
+
+    /// LLVM struct type for tagged unions: { i8 tag, double num_slot, ptr str_ptr, i64 aux }
+    fn get_union_llvm_type(&self) -> StructType<'ctx> {
+        self.context.struct_type(
+            &[
+                self.context.i8_type().into(),                         // tag
+                self.context.f64_type().into(),                        // number slot
+                self.context.ptr_type(AddressSpace::default()).into(), // string data ptr
+                self.context.i64_type().into(),                        // string len / bool
+            ],
+            false,
+        )
+    }
+
+    /// Map a concrete VarType to a union tag constant.
+    fn union_tag_for_var_type(vt: &VarType) -> u8 {
+        match vt {
+            VarType::Number | VarType::Integer => 0,
+            VarType::String => 1,
+            VarType::Boolean => 2,
+            _ => 3,
+        }
+    }
+
+    /// Map a typeof string like "number" to a VarType.
+    fn type_string_to_var_type(&self, s: &str) -> VarType {
+        match s {
+            "number" => VarType::Number,
+            "string" => VarType::String,
+            "boolean" => VarType::Boolean,
+            _ => VarType::Number,
+        }
+    }
+
+    /// Wrap a concrete value into a tagged union struct, stored at an alloca.
+    /// Returns the alloca pointer (NOT the loaded struct value).
+    fn wrap_in_union(
+        &self,
+        value: BasicValueEnum<'ctx>,
+        value_vt: &VarType,
+        function: FunctionValue<'ctx>,
+    ) -> PointerValue<'ctx> {
+        let union_type = self.get_union_llvm_type();
+        let alloca = self.create_alloca(function, &VarType::Union(vec![]), "union_wrap");
+
+        // Store tag
+        let tag_ptr = self
+            .builder
+            .build_struct_gep(union_type, alloca, 0, "tag_ptr")
+            .unwrap();
+        let tag = Self::union_tag_for_var_type(value_vt);
+        self.builder
+            .build_store(tag_ptr, self.context.i8_type().const_int(tag as u64, false))
+            .unwrap();
+
+        // Store value into appropriate slot
+        match value_vt {
+            VarType::Number => {
+                let num_ptr = self
+                    .builder
+                    .build_struct_gep(union_type, alloca, 1, "num_ptr")
+                    .unwrap();
+                self.builder.build_store(num_ptr, value).unwrap();
+            }
+            VarType::Integer => {
+                // Convert i64 → f64 before storing in number slot
+                let float_val = self
+                    .builder
+                    .build_signed_int_to_float(
+                        value.into_int_value(),
+                        self.context.f64_type(),
+                        "i2f",
+                    )
+                    .unwrap();
+                let num_ptr = self
+                    .builder
+                    .build_struct_gep(union_type, alloca, 1, "num_ptr")
+                    .unwrap();
+                self.builder.build_store(num_ptr, float_val).unwrap();
+            }
+            VarType::String => {
+                let str_val = value.into_struct_value();
+                let data = self
+                    .builder
+                    .build_extract_value(str_val, 0, "str_data")
+                    .unwrap();
+                let len = self
+                    .builder
+                    .build_extract_value(str_val, 1, "str_len")
+                    .unwrap();
+                let str_ptr_slot = self
+                    .builder
+                    .build_struct_gep(union_type, alloca, 2, "str_ptr_slot")
+                    .unwrap();
+                self.builder.build_store(str_ptr_slot, data).unwrap();
+                let str_len_slot = self
+                    .builder
+                    .build_struct_gep(union_type, alloca, 3, "str_len_slot")
+                    .unwrap();
+                self.builder.build_store(str_len_slot, len).unwrap();
+            }
+            VarType::Boolean => {
+                let bool_i64 = self
+                    .builder
+                    .build_int_z_extend(value.into_int_value(), self.context.i64_type(), "b2i")
+                    .unwrap();
+                let aux_ptr = self
+                    .builder
+                    .build_struct_gep(union_type, alloca, 3, "aux_ptr")
+                    .unwrap();
+                self.builder.build_store(aux_ptr, bool_i64).unwrap();
+            }
+            _ => {} // other types not supported in unions yet
+        }
+
+        alloca
+    }
+
+    /// Extract a concrete value from a tagged union alloca, assuming the tag matches `target_vt`.
+    fn extract_from_union(
+        &self,
+        union_ptr: PointerValue<'ctx>,
+        target_vt: &VarType,
+    ) -> BasicValueEnum<'ctx> {
+        let union_type = self.get_union_llvm_type();
+        match target_vt {
+            VarType::Number => {
+                let num_ptr = self
+                    .builder
+                    .build_struct_gep(union_type, union_ptr, 1, "num_ptr")
+                    .unwrap();
+                self.builder
+                    .build_load(self.context.f64_type(), num_ptr, "num_val")
+                    .unwrap()
+            }
+            VarType::String => {
+                let str_ptr_slot = self
+                    .builder
+                    .build_struct_gep(union_type, union_ptr, 2, "str_ptr_slot")
+                    .unwrap();
+                let data = self
+                    .builder
+                    .build_load(
+                        self.context.ptr_type(AddressSpace::default()),
+                        str_ptr_slot,
+                        "str_data",
+                    )
+                    .unwrap();
+                let str_len_slot = self
+                    .builder
+                    .build_struct_gep(union_type, union_ptr, 3, "str_len_slot")
+                    .unwrap();
+                let len = self
+                    .builder
+                    .build_load(self.context.i64_type(), str_len_slot, "str_len")
+                    .unwrap();
+                // Build the string struct { ptr, i64 }
+                let mut struct_val = self.string_type.const_zero();
+                struct_val = self
+                    .builder
+                    .build_insert_value(struct_val, data, 0, "str.ptr")
+                    .unwrap()
+                    .into_struct_value();
+                struct_val = self
+                    .builder
+                    .build_insert_value(struct_val, len, 1, "str.len")
+                    .unwrap()
+                    .into_struct_value();
+                struct_val.into()
+            }
+            VarType::Boolean => {
+                let aux_ptr = self
+                    .builder
+                    .build_struct_gep(union_type, union_ptr, 3, "aux_ptr")
+                    .unwrap();
+                let i64_val = self
+                    .builder
+                    .build_load(self.context.i64_type(), aux_ptr, "bool_i64")
+                    .unwrap();
+                self.builder
+                    .build_int_truncate(
+                        i64_val.into_int_value(),
+                        self.context.bool_type(),
+                        "bool_val",
+                    )
+                    .unwrap()
+                    .into()
+            }
+            _ => self.context.f64_type().const_float(0.0).into(),
+        }
+    }
+
+    /// Detect `typeof x === "type"` or `typeof x !== "type"` pattern in a condition.
+    /// Returns (variable_name, type_string, is_equality).
+    fn detect_typeof_narrowing(condition: &Expr) -> Option<(String, String, bool)> {
+        if let ExprKind::Binary { left, op, right } = &condition.kind {
+            if matches!(op, BinOp::StrictEqual | BinOp::StrictNotEqual) {
+                let is_eq = *op == BinOp::StrictEqual;
+                // typeof x === "type"
+                if let ExprKind::Typeof { operand } = &left.kind {
+                    if let ExprKind::Identifier(name) = &operand.kind {
+                        if let ExprKind::StringLiteral(type_str) = &right.kind {
+                            return Some((name.clone(), type_str.clone(), is_eq));
+                        }
+                    }
+                }
+                // "type" === typeof x
+                if let ExprKind::Typeof { operand } = &right.kind {
+                    if let ExprKind::Identifier(name) = &operand.kind {
+                        if let ExprKind::StringLiteral(type_str) = &left.kind {
+                            return Some((name.clone(), type_str.clone(), is_eq));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn push_scope(&mut self) {
