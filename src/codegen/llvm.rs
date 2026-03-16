@@ -651,11 +651,30 @@ impl<'ctx> Codegen<'ctx> {
         // First pass: register interfaces and classes (so type_ann_to_var_type works)
         for stmt in &program.statements {
             match &stmt.kind {
-                StmtKind::InterfaceDecl { name, fields } => {
-                    let field_vts: Vec<(String, VarType)> = fields
-                        .iter()
-                        .map(|(fname, ann)| (fname.clone(), self.type_ann_to_var_type(ann)))
-                        .collect();
+                StmtKind::InterfaceDecl {
+                    name,
+                    extends,
+                    fields,
+                } => {
+                    // Prepend inherited fields from parent interfaces
+                    let mut field_vts: Vec<(String, VarType)> = Vec::new();
+                    for parent_name in extends {
+                        if let Some((_, parent_fvts, _)) =
+                            self.class_struct_types.get(parent_name).cloned()
+                        {
+                            for pf in parent_fvts {
+                                if !field_vts.iter().any(|(n, _)| n == &pf.0) {
+                                    field_vts.push(pf);
+                                }
+                            }
+                        }
+                    }
+                    for (fname, ann) in fields {
+                        let vt = self.type_ann_to_var_type(ann);
+                        if !field_vts.iter().any(|(n, _)| n == fname) {
+                            field_vts.push((fname.clone(), vt));
+                        }
+                    }
                     let field_llvm_types: Vec<BasicTypeEnum> = field_vts
                         .iter()
                         .map(|(_, vt)| self.var_type_to_llvm(vt))
@@ -808,13 +827,32 @@ impl<'ctx> Codegen<'ctx> {
                 methods,
             } => self.compile_class_decl(name, parent, fields, constructor, methods, function),
 
-            StmtKind::InterfaceDecl { name, fields } => {
+            StmtKind::InterfaceDecl {
+                name,
+                extends,
+                fields,
+            } => {
                 // Interfaces produce no runtime code, but we register the struct layout
                 // so type_ann_to_var_type can resolve Named(interface_name)
-                let field_vts: Vec<(String, VarType)> = fields
-                    .iter()
-                    .map(|(fname, ann)| (fname.clone(), self.type_ann_to_var_type(ann)))
-                    .collect();
+                // Prepend inherited fields from parent interfaces
+                let mut field_vts: Vec<(String, VarType)> = Vec::new();
+                for parent_name in extends {
+                    if let Some((_, parent_fvts, _)) =
+                        self.class_struct_types.get(parent_name).cloned()
+                    {
+                        for pf in parent_fvts {
+                            if !field_vts.iter().any(|(n, _)| n == &pf.0) {
+                                field_vts.push(pf);
+                            }
+                        }
+                    }
+                }
+                for (fname, ann) in fields {
+                    let vt = self.type_ann_to_var_type(ann);
+                    if !field_vts.iter().any(|(n, _)| n == fname) {
+                        field_vts.push((fname.clone(), vt));
+                    }
+                }
                 let field_llvm_types: Vec<BasicTypeEnum> = field_vts
                     .iter()
                     .map(|(_, vt)| self.var_type_to_llvm(vt))

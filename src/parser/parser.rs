@@ -373,6 +373,15 @@ impl Parser {
 
         let name = self.expect_identifier("Expected interface name")?;
 
+        // Optional: extends A, B, C
+        let mut extends = Vec::new();
+        if self.match_token(&Token::Extends) {
+            extends.push(self.expect_identifier("Expected parent interface name")?);
+            while self.match_token(&Token::Comma) {
+                extends.push(self.expect_identifier("Expected parent interface name")?);
+            }
+        }
+
         self.expect(&Token::LeftBrace, "Expected '{' before interface body")?;
 
         let mut fields = Vec::new();
@@ -396,7 +405,11 @@ impl Parser {
         self.consume_semicolon()?;
 
         Ok(Statement {
-            kind: StmtKind::InterfaceDecl { name, fields },
+            kind: StmtKind::InterfaceDecl {
+                name,
+                extends,
+                fields,
+            },
             span: self.span_from(&start_span),
         })
     }

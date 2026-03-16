@@ -1667,6 +1667,43 @@ console.log(d.speak())
     // --- Interfaces ---
 
     #[test]
+    fn interface_extends() {
+        let src = "
+interface Identifiable {
+  id: number
+}
+interface Named extends Identifiable {
+  name: string
+}
+function greet(n: Named): void {
+  console.log(n.id, n.name)
+}
+greet({ id: 1, name: \"Alice\" })
+";
+        assert_eq!(run_ts(src), "1 Alice\n");
+    }
+
+    #[test]
+    fn interface_extends_multi() {
+        let src = "
+interface HasId {
+  id: number
+}
+interface HasName {
+  name: string
+}
+interface User extends HasId, HasName {
+  active: boolean
+}
+function print_user(u: User): void {
+  console.log(u.id, u.name, u.active)
+}
+print_user({ id: 42, name: \"Bob\", active: true })
+";
+        assert_eq!(run_ts(src), "42 Bob true\n");
+    }
+
+    #[test]
     fn interface_basic() {
         let src = r#"
 interface Point {

@@ -148,11 +148,11 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 223 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 225 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**223 passing** / **16 not yet implemented** — 93% of test suite
+**225 passing** / **16 not yet implemented** — 93% of test suite
 
 ### Literals & Primitives
 
@@ -361,6 +361,7 @@ Early stage. 223 tests passing, 16 pending. The goal is drop-in compatibility wi
 | Class methods | :white_check_mark: | `p.toString()` |
 | Class inheritance | :white_check_mark: | `class Dog extends Animal` |
 | Interfaces | :white_check_mark: | `interface Point { x: number }` |
+| Interface inheritance | :white_check_mark: | `interface B extends A` |
 | Array destructuring | :white_check_mark: | `let [a, b] = [1, 2]` |
 | Object destructuring | :white_check_mark: | `let { x, y } = { x: 1, y: 2 }` |
 

@@ -37,6 +37,7 @@ pub enum StmtKind {
     },
     InterfaceDecl {
         name: String,
+        extends: Vec<String>,
         fields: Vec<(String, TypeAnnotation)>,
     },
     If {

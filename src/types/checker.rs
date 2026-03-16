@@ -479,11 +479,34 @@ impl TypeChecker {
                 Ok(())
             }
 
-            StmtKind::InterfaceDecl { name, fields } => {
-                let field_types: Vec<(String, Type)> = fields
-                    .iter()
-                    .map(|(n, ann)| (n.clone(), self.resolve_type_annotation(ann)))
-                    .collect();
+            StmtKind::InterfaceDecl {
+                name,
+                extends,
+                fields,
+            } => {
+                // Collect inherited fields from parent interfaces (prefix layout)
+                let mut field_types: Vec<(String, Type)> = Vec::new();
+                for parent_name in extends {
+                    if let Some(parent_type) = self.interface_types.get(parent_name).cloned() {
+                        if let Type::Object {
+                            fields: parent_fields,
+                        } = parent_type
+                        {
+                            for pf in parent_fields {
+                                if !field_types.iter().any(|(n, _)| n == &pf.0) {
+                                    field_types.push(pf);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Append own fields
+                for (n, ann) in fields {
+                    let t = self.resolve_type_annotation(ann);
+                    if !field_types.iter().any(|(existing, _)| existing == n) {
+                        field_types.push((n.clone(), t));
+                    }
+                }
                 let iface_type = Type::Object {
                     fields: field_types,
                 };
