@@ -325,6 +325,24 @@ impl Parser {
                 continue;
             }
 
+            // Skip access modifiers: public, private, protected, static, readonly, abstract, override
+            while let Token::Identifier(ref kw) = self.peek_token() {
+                if matches!(
+                    kw.as_str(),
+                    "public"
+                        | "private"
+                        | "protected"
+                        | "static"
+                        | "readonly"
+                        | "abstract"
+                        | "override"
+                ) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+
             // Method or field: starts with an identifier
             let member_name = self.expect_identifier("Expected class member name")?;
 
@@ -349,12 +367,16 @@ impl Parser {
                     span: self.span_from(&member_span),
                 });
             } else {
-                // Field: name: Type
+                // Field: name: Type = initializer
                 let type_ann = if self.match_token(&Token::Colon) {
                     Some(self.type_annotation()?)
                 } else {
                     None
                 };
+                // Consume optional initializer (discarded for now — field init codegen TBD)
+                if self.match_token(&Token::Assign) {
+                    self.expression()?;
+                }
                 self.consume_semicolon()?;
                 fields.push(ClassField {
                     name: member_name,
