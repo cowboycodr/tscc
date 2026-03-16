@@ -14,7 +14,7 @@ export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
 ```sh
 cargo build                          # dev build
 cargo build --release                # optimized build
-cargo test                           # all tests (~170 pass, ~70 ignored)
+cargo test                           # all tests (~225 pass, ~16 ignored)
 cargo test test_name                 # single test by name
 cargo test module::test_name         # e.g. cargo test variables::let_with_number
 cargo test -- --ignored              # run only ignored (unimplemented) tests
@@ -149,7 +149,7 @@ fn feature_name() {
 
 - **Semicolons are optional** in tscc (lenient parsing, like TypeScript)
 - **Function hoisting is NOT supported** — type checker doesn't pre-scan declarations
-- **Import aliasing (`as`) is broken in codegen** — alias maps in checker but codegen uses original name
+- **Import aliasing (`as`) works for functions** — `import { add as sum }` correctly registers the alias in codegen (`llvm.rs:1326`). Does NOT yet handle variable or class imports with aliases.
 - `inkwell` `AggregateValueEnum` doesn't impl `Into<BasicValueEnum>` — call `.into_struct_value().into()`
 - Template literals are desugared to string concatenation in the scanner (not a parser feature)
 - LLVM contexts are safe to create per-thread; each test gets its own
@@ -160,3 +160,17 @@ fn feature_name() {
 - **Interfaces are type-only** — they register a struct layout in codegen (for `type_ann_to_var_type` to resolve Named types) but generate no runtime code.
 - **`this` in methods** is a pointer to the struct, passed as the first parameter. `this.prop` compiles to `struct_gep` + load/store.
 - **Object methods** are compiled as regular LLVM functions with a `self` pointer. Method calls pass the object's alloca as the first argument.
+
+## Known Technical Debt
+
+These are **intentional shortcuts that produce incorrect runtime behaviour** — not missing features, but things that currently compile silently and give wrong results. Each has a ROADMAP entry.
+
+- **Class field initializers are not compiled** — `class Foo { x = 5 }` parses the `= 5` but throws it away. `ClassField` has no `initializer` field. The field is an uninitialized slot in the LLVM struct at runtime. Fix requires adding `initializer: Option<Expr>` to `ClassField` and emitting assignments at the top of the constructor body.
+
+- **Unknown/unregistered generic types silently resolve to `f64`** — Any type annotation for an unregistered generic (`Map<K,V>`, `Promise<T>`, `Set<T>`, etc.) hits the fallthrough in `type_ann_to_var_type` (`llvm.rs:5613`) and becomes `f64` with no error or warning. Code that uses these types compiles and silently produces garbage. Should emit a hard error instead.
+
+- **`var` is block-scoped, not function-scoped** — tscc treats `var` identically to `let`. JavaScript `var` hoists to function scope; tscc's `var` does not. Code that relies on `var` hoisting or function scoping will silently behave differently.
+
+- **`Type::Unknown` is universally assignable** — In `checker.rs`, `Type::Unknown` (produced by unresolved type references) is accepted as both a valid source and target in every assignability check. This means type errors from unknown types flow through silently rather than surfacing as diagnostics.
+
+- **Postfix/prefix `++`/`--` only work on simple identifiers** — `x[i]++` and `x.prop++` silently drop the operator token. The `postfix()` parser only creates an update node for `ExprKind::Identifier`. Other lvalue targets are parsed correctly but the `++`/`--` is not consumed.

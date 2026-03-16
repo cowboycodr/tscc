@@ -187,7 +187,7 @@ Early stage. 225 tests passing, 16 pending. The goal is drop-in compatibility wi
 | Multiple variables | :white_check_mark: | `let a = 1; let b = 2` |
 | Uninitialized `let` | :white_check_mark: | `let x: number` (defaults to 0) |
 | Optional semicolons | :white_check_mark: | `let x = 42` |
-| `var` declarations | :white_check_mark: | `var x = 42` |
+| `var` declarations | :warning: | `var x = 42` — treated as `let` (block-scoped, no hoisting) |
 
 ### Arithmetic Operators
 
@@ -357,6 +357,7 @@ Early stage. 225 tests passing, 16 pending. The goal is drop-in compatibility wi
 | Object methods | :white_check_mark: | `obj.getX()` |
 | `console.log(obj)` | :white_check_mark: | `{ name: 'Kian', age: 19 }` |
 | Class declarations | :white_check_mark: | `class Point { ... }` |
+| Class field initializers | :warning: | `class Foo { x = 5 }` — parsed but not executed |
 | `new` + constructor | :white_check_mark: | `new Point(3, 4)` |
 | Class methods | :white_check_mark: | `p.toString()` |
 | Class inheritance | :white_check_mark: | `class Dog extends Animal` |

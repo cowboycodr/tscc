@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 213 tests passing, 26 pending — 89% of test suite**
+**Current status: 225 tests passing, 16 pending — 93% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -36,7 +36,7 @@ These require only parser/checker changes — zero LLVM codegen.
 ### Small Language Features
 - [ ] Function expressions — `let f = function(x) { return x }` *(same as arrow, different keyword)*
 - [ ] `for...in` — `for (let key in obj)` *(iterate object field names as strings)*
-- [ ] Import aliasing fix — `import { add as sum }` *(known codegen bug — 1-line fix)*
+- [x] Import aliasing — `import { add as sum }` *(functions only; variable/class imports with aliases not yet handled)*
 
 ---
 
@@ -101,7 +101,37 @@ These are long-term aspirations that require tscc to be substantially complete f
 
 ---
 
+## Known Technical Debt
+
+These are things that currently **compile without error but produce wrong runtime behaviour**. They are not missing features — they are silent incorrectnesses. Fix these before claiming TypeScript compatibility.
+
+### Class field initializers not compiled
+`class Foo { x = 5 }` parses the `= 5` but discards it. The field is an uninitialized LLVM struct slot at runtime. `ClassField` has no `initializer` field in the AST.
+
+**Fix:** Add `initializer: Option<Expr>` to `ClassField`. In codegen, emit initializer assignments at the top of the constructor body (before user-written constructor code).
+
+### Unknown generic types silently become `f64`
+Any type annotation for an unregistered generic — `Map<K,V>`, `Promise<T>`, `Set<T>`, etc. — hits the fallthrough in `type_ann_to_var_type` (`llvm.rs:5613`) and silently becomes `f64`. Code using these types compiles and produces garbage values.
+
+**Fix:** Emit a hard compile error for unrecognised named/generic types instead of silently falling back.
+
+### `var` is block-scoped, not function-scoped
+tscc treats `var` identically to `let`. JavaScript `var` hoists to function scope. Code relying on `var`'s hoisting or cross-block visibility silently behaves differently.
+
+**Fix:** In the parser/codegen, track `var`-declared variables separately and allocate them in the function's entry block rather than the current block.
+
+### `Type::Unknown` is universally assignable
+`Type::Unknown` (produced by unresolved type references) is accepted as a valid source and target in every assignability check in `checker.rs`. Type errors involving unknown types flow through silently.
+
+**Fix:** Treat `Type::Unknown` as an error type that poisons any expression it touches, surfacing a diagnostic at the point of first unresolved reference.
+
+### Postfix/prefix `++`/`--` only work on simple identifiers
+`x[i]++` and `x.prop++` silently drop the `++` token. The `postfix()` parser only creates an update node for `ExprKind::Identifier`. The token is not consumed, causing it to be misinterpreted as a prefix operator on the next statement, which then fails.
+
+**Fix:** Generalize `PostfixUpdate`/`PrefixUpdate` AST nodes to hold `target: Box<Expr>` instead of `name: String`. Handle `IndexAccess` and `Member` targets in codegen.
+
+---
+
 ## Known Bugs
 
-- **Import aliasing codegen** — `import { add as sum }` maps alias in checker but codegen looks up original name. Fix: thread alias→original map into codegen.
 - **Function hoisting** — type checker rejects calls to functions declared later in the file. Fix: two-pass check (pre-scan declarations before checking bodies).
