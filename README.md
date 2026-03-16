@@ -142,17 +142,17 @@ TypeScript source
     Native binary
 ```
 
-Written in Rust. Single crate. ~12,600 lines of Rust + ~470 lines of C runtime.
+Written in Rust. Single crate. ~15,000 lines of Rust + ~546 lines of C runtime.
 
 The runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It is compiled once at `cargo build` time and embedded directly into the `tscc` binary — no C toolchain is required on the user's machine to compile TypeScript files.
 
 ## Status
 
-Early stage. 232 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 238 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**232 passing** / **16 not yet implemented** — 93% of test suite
+**238 passing** / **16 not yet implemented** — 94% of test suite
 
 ### Literals & Primitives
 
@@ -201,8 +201,8 @@ Early stage. 232 tests passing, 16 pending. The goal is drop-in compatibility wi
 | Exponentiation `**` | :white_check_mark: | `2 ** 10` |
 | Operator precedence | :white_check_mark: | `2 + 3 * 4` = 14 |
 | Parenthesized expressions | :white_check_mark: | `(2 + 3) * 4` = 20 |
-| Postfix `++` / `--` | :white_check_mark: | `x++`, `x--` |
-| Prefix `++` / `--` | :white_check_mark: | `++x`, `--x` |
+| Postfix `++` / `--` | :white_check_mark: | `x++`, `arr[i]++`, `obj[key]++` |
+| Prefix `++` / `--` | :white_check_mark: | `++x`, `++arr[i]` |
 | Unary negate | :white_check_mark: | `-x` |
 | `+=` `-=` `*=` `/=` | :white_check_mark: | `x += 3` |
 
