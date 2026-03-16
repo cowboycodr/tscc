@@ -328,6 +328,59 @@ mod arithmetic {
     }
 
     #[test]
+    fn postfix_increment_array_element() {
+        assert_eq!(
+            run_ts("const arr = [1, 2, 3]\narr[1]++\nconsole.log(arr[1])"),
+            "3\n"
+        );
+    }
+
+    #[test]
+    fn postfix_decrement_array_element() {
+        assert_eq!(
+            run_ts("const arr = [10, 20, 30]\narr[0]--\nconsole.log(arr[0])"),
+            "9\n"
+        );
+    }
+
+    #[test]
+    fn postfix_array_element_returns_old_value() {
+        assert_eq!(
+            run_ts("const arr = [5, 6, 7]\nconsole.log(arr[2]++)"),
+            "7\n"
+        );
+    }
+
+    #[test]
+    fn postfix_increment_object_field_dynamic_key() {
+        assert_eq!(
+            run_ts(
+                "const counts = { a: 0, b: 0 }\nconst key = \"a\"\ncounts[key]++\nconsole.log(counts.a)"
+            ),
+            "1\n"
+        );
+    }
+
+    #[test]
+    fn postfix_increment_object_field_dynamic_key_no_match_noop() {
+        // Key that doesn't match any field is a silent no-op
+        assert_eq!(
+            run_ts(
+                "const counts = { a: 0, b: 0 }\nconst key = \"z\"\ncounts[key]++\nconsole.log(counts.a)"
+            ),
+            "0\n"
+        );
+    }
+
+    #[test]
+    fn prefix_increment_array_element() {
+        assert_eq!(
+            run_ts("const arr = [1, 2, 3]\n++arr[0]\nconsole.log(arr[0])"),
+            "2\n"
+        );
+    }
+
+    #[test]
     fn unary_negate() {
         assert_eq!(run_ts("let x = 5\nconsole.log(-x)"), "-5\n");
     }

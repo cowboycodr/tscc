@@ -550,6 +550,14 @@ impl<'ctx> Codegen<'ctx> {
             ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
             None,
         );
+
+        // libc memcmp(s1, s2, n) → i32  (used for runtime string key comparisons)
+        let i32_type = self.context.i32_type();
+        self.module.add_function(
+            "memcmp",
+            i32_type.fn_type(&[ptr_type.into(), ptr_type.into(), i64_type.into()], false),
+            None,
+        );
     }
 
     // --- Integer narrowing analysis ---
@@ -2539,48 +2547,12 @@ impl<'ctx> Codegen<'ctx> {
                 self.compile_expr(expr, function)
             }
 
-            ExprKind::PostfixUpdate { name, op } | ExprKind::PrefixUpdate { name, op } => {
-                let (ptr, vt) = self.get_variable(name).ok_or_else(|| {
-                    CompileError::error(format!("Undefined variable '{}'", name), expr.span.clone())
-                })?;
-                let llvm_type = self.var_type_to_llvm(&vt);
-                let old_val = self.builder.build_load(llvm_type, ptr, name).unwrap();
+            ExprKind::PostfixUpdate { target, op } => {
+                self.compile_update(target, *op, true, function, &expr.span)
+            }
 
-                if matches!(vt, VarType::Integer) {
-                    let old_int = old_val.into_int_value();
-                    let one = self.context.i64_type().const_int(1, false);
-                    let new_val = match op {
-                        UpdateOp::Increment => {
-                            self.builder.build_int_add(old_int, one, "inc").unwrap()
-                        }
-                        UpdateOp::Decrement => {
-                            self.builder.build_int_sub(old_int, one, "dec").unwrap()
-                        }
-                    };
-                    self.builder.build_store(ptr, new_val).unwrap();
-                    let result = match &expr.kind {
-                        ExprKind::PostfixUpdate { .. } => old_int,
-                        _ => new_val,
-                    };
-                    Ok((result.into(), VarType::Integer))
-                } else {
-                    let old_float = old_val.into_float_value();
-                    let one = self.context.f64_type().const_float(1.0);
-                    let new_val = match op {
-                        UpdateOp::Increment => {
-                            self.builder.build_float_add(old_float, one, "inc").unwrap()
-                        }
-                        UpdateOp::Decrement => {
-                            self.builder.build_float_sub(old_float, one, "dec").unwrap()
-                        }
-                    };
-                    self.builder.build_store(ptr, new_val).unwrap();
-                    let result = match &expr.kind {
-                        ExprKind::PostfixUpdate { .. } => old_float,
-                        _ => new_val,
-                    };
-                    Ok((result.into(), VarType::Number))
-                }
+            ExprKind::PrefixUpdate { target, op } => {
+                self.compile_update(target, *op, false, function, &expr.span)
             }
 
             ExprKind::ArrowFunction {
@@ -2945,6 +2917,410 @@ impl<'ctx> Codegen<'ctx> {
             format!("Cannot assign to property '{}' in this context", property),
             span.clone(),
         ))
+    }
+
+    /// Compile a `++` / `--` update on any valid lvalue target.
+    ///
+    /// `is_postfix = true`  → return the *old* value (postfix `x++`)
+    /// `is_postfix = false` → return the *new* value (prefix  `++x`)
+    fn compile_update(
+        &mut self,
+        target: &Expr,
+        op: UpdateOp,
+        is_postfix: bool,
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        match &target.kind {
+            // ── Simple identifier: x++ / ++x ─────────────────────────────────
+            ExprKind::Identifier(name) => {
+                let (ptr, vt) = self.get_variable(name).ok_or_else(|| {
+                    CompileError::error(format!("Undefined variable '{}'", name), span.clone())
+                })?;
+                let llvm_type = self.var_type_to_llvm(&vt);
+                let old_val = self.builder.build_load(llvm_type, ptr, name).unwrap();
+
+                if matches!(vt, VarType::Integer) {
+                    let old_int = old_val.into_int_value();
+                    let one = self.context.i64_type().const_int(1, false);
+                    let new_val = match op {
+                        UpdateOp::Increment => {
+                            self.builder.build_int_add(old_int, one, "inc").unwrap()
+                        }
+                        UpdateOp::Decrement => {
+                            self.builder.build_int_sub(old_int, one, "dec").unwrap()
+                        }
+                    };
+                    self.builder.build_store(ptr, new_val).unwrap();
+                    let result = if is_postfix { old_int } else { new_val };
+                    Ok((result.into(), VarType::Integer))
+                } else {
+                    let old_float = old_val.into_float_value();
+                    let one = self.context.f64_type().const_float(1.0);
+                    let new_val = match op {
+                        UpdateOp::Increment => {
+                            self.builder.build_float_add(old_float, one, "inc").unwrap()
+                        }
+                        UpdateOp::Decrement => {
+                            self.builder.build_float_sub(old_float, one, "dec").unwrap()
+                        }
+                    };
+                    self.builder.build_store(ptr, new_val).unwrap();
+                    let result = if is_postfix { old_float } else { new_val };
+                    Ok((result.into(), VarType::Number))
+                }
+            }
+
+            // ── Index access: arr[i]++ or obj[key]++ ─────────────────────────
+            ExprKind::IndexAccess { object, index } => {
+                // We need the alloca of the base variable
+                let ExprKind::Identifier(obj_name) = &object.kind else {
+                    return Err(CompileError::error(
+                        "++/-- requires a simple variable as base",
+                        span.clone(),
+                    ));
+                };
+                let (obj_ptr, obj_vt) = self.get_variable(obj_name).ok_or_else(|| {
+                    CompileError::error(format!("Undefined variable '{}'", obj_name), span.clone())
+                })?;
+
+                match obj_vt.clone() {
+                    // ── Array element: arr[i]++ ───────────────────────────────
+                    VarType::Array => {
+                        let arr_llvm = self.var_type_to_llvm(&VarType::Array);
+                        let arr_val = self.builder.build_load(arr_llvm, obj_ptr, "arr").unwrap();
+                        let data_ptr = self
+                            .builder
+                            .build_extract_value(arr_val.into_struct_value(), 0, "data")
+                            .unwrap()
+                            .into_pointer_value();
+
+                        let (idx_val, idx_vt) = self.compile_expr(index, function)?;
+                        let idx_i64 = match idx_vt {
+                            VarType::Integer => idx_val.into_int_value(),
+                            VarType::Number => self
+                                .builder
+                                .build_float_to_signed_int(
+                                    idx_val.into_float_value(),
+                                    self.context.i64_type(),
+                                    "idx",
+                                )
+                                .unwrap(),
+                            _ => {
+                                return Err(CompileError::error(
+                                    "Array index must be a number",
+                                    span.clone(),
+                                ))
+                            }
+                        };
+
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_gep(
+                                    self.context.f64_type(),
+                                    data_ptr,
+                                    &[idx_i64],
+                                    "elem_ptr",
+                                )
+                                .unwrap()
+                        };
+                        let old_float = self
+                            .builder
+                            .build_load(self.context.f64_type(), elem_ptr, "old")
+                            .unwrap()
+                            .into_float_value();
+                        let one = self.context.f64_type().const_float(1.0);
+                        let new_float = match op {
+                            UpdateOp::Increment => {
+                                self.builder.build_float_add(old_float, one, "inc").unwrap()
+                            }
+                            UpdateOp::Decrement => {
+                                self.builder.build_float_sub(old_float, one, "dec").unwrap()
+                            }
+                        };
+                        self.builder.build_store(elem_ptr, new_float).unwrap();
+                        let result = if is_postfix { old_float } else { new_float };
+                        Ok((result.into(), VarType::Number))
+                    }
+
+                    // ── Object field with dynamic string key: obj[key]++ ──────
+                    VarType::Object {
+                        ref fields,
+                        ref struct_type_name,
+                    } => {
+                        let (idx_val, _idx_vt) = self.compile_expr(index, function)?;
+                        let idx_str = idx_val.into_struct_value();
+                        let idx_ptr = self
+                            .builder
+                            .build_extract_value(idx_str, 0, "idx_ptr")
+                            .unwrap()
+                            .into_pointer_value();
+                        let idx_len = self
+                            .builder
+                            .build_extract_value(idx_str, 1, "idx_len")
+                            .unwrap()
+                            .into_int_value();
+
+                        let memcmp_fn = self.module.get_function("memcmp").unwrap();
+                        let f64_type = self.context.f64_type();
+                        let obj_struct_type = self
+                            .var_type_to_llvm(&VarType::Object {
+                                struct_type_name: struct_type_name.clone(),
+                                fields: fields.clone(),
+                            })
+                            .into_struct_type();
+
+                        // Build one basic block per field + a no-match block + a merge block
+                        let merge_bb = self.context.append_basic_block(function, "upd.merge");
+
+                        // Collect field info (clone to avoid borrow issues)
+                        let fields_snap: Vec<(String, VarType)> = fields.clone();
+                        let n = fields_snap.len();
+
+                        // Create check blocks and hit blocks
+                        let check_bbs: Vec<_> = (0..n)
+                            .map(|i| {
+                                self.context
+                                    .append_basic_block(function, &format!("upd.check{}", i))
+                            })
+                            .collect();
+                        let hit_bbs: Vec<_> = (0..n)
+                            .map(|i| {
+                                self.context
+                                    .append_basic_block(function, &format!("upd.hit{}", i))
+                            })
+                            .collect();
+                        let nomatch_bb = self.context.append_basic_block(function, "upd.nomatch");
+
+                        // Jump to first check
+                        self.builder
+                            .build_unconditional_branch(check_bbs[0])
+                            .unwrap();
+
+                        // Emit old-value storage for postfix semantics
+                        // We use a stack slot so each hit block can write the old value
+                        // and the merge phi can read it.
+                        // (Simpler: just use phi across hit blocks + nomatch.)
+
+                        let mut old_vals: Vec<(BasicValueEnum<'ctx>, _)> = Vec::new();
+
+                        for (i, (field_name, _field_vt)) in fields_snap.iter().enumerate() {
+                            // ── check block ──────────────────────────────────
+                            self.builder.position_at_end(check_bbs[i]);
+
+                            let field_bytes = field_name.as_bytes();
+                            let field_len_val = self
+                                .context
+                                .i64_type()
+                                .const_int(field_bytes.len() as u64, false);
+
+                            // Length comparison: idx_len == field_len
+                            let len_eq = self
+                                .builder
+                                .build_int_compare(
+                                    inkwell::IntPredicate::EQ,
+                                    idx_len,
+                                    field_len_val,
+                                    "len_eq",
+                                )
+                                .unwrap();
+
+                            // Bytes comparison block
+                            let bytes_bb = self
+                                .context
+                                .append_basic_block(function, &format!("upd.bytes{}", i));
+                            let next_bb = if i + 1 < n {
+                                check_bbs[i + 1]
+                            } else {
+                                nomatch_bb
+                            };
+                            self.builder
+                                .build_conditional_branch(len_eq, bytes_bb, next_bb)
+                                .unwrap();
+
+                            // ── bytes block ───────────────────────────────────
+                            self.builder.position_at_end(bytes_bb);
+                            let lit_ptr = self
+                                .builder
+                                .build_global_string_ptr(field_name, "fk")
+                                .unwrap()
+                                .as_pointer_value();
+                            let cmp_result = self
+                                .builder
+                                .build_call(
+                                    memcmp_fn,
+                                    &[idx_ptr.into(), lit_ptr.into(), field_len_val.into()],
+                                    "memcmp",
+                                )
+                                .unwrap()
+                                .try_as_basic_value()
+                                .left()
+                                .unwrap()
+                                .into_int_value();
+                            let zero_i32 = self.context.i32_type().const_int(0, false);
+                            let bytes_eq = self
+                                .builder
+                                .build_int_compare(
+                                    inkwell::IntPredicate::EQ,
+                                    cmp_result,
+                                    zero_i32,
+                                    "bytes_eq",
+                                )
+                                .unwrap();
+                            self.builder
+                                .build_conditional_branch(bytes_eq, hit_bbs[i], next_bb)
+                                .unwrap();
+
+                            // ── hit block ─────────────────────────────────────
+                            self.builder.position_at_end(hit_bbs[i]);
+                            let field_ptr = self
+                                .builder
+                                .build_struct_gep(
+                                    obj_struct_type,
+                                    obj_ptr,
+                                    i as u32,
+                                    &format!("obj.{}", field_name),
+                                )
+                                .unwrap();
+                            let old_f = self
+                                .builder
+                                .build_load(f64_type, field_ptr, "old")
+                                .unwrap()
+                                .into_float_value();
+                            let one = f64_type.const_float(1.0);
+                            let new_f = match op {
+                                UpdateOp::Increment => {
+                                    self.builder.build_float_add(old_f, one, "inc").unwrap()
+                                }
+                                UpdateOp::Decrement => {
+                                    self.builder.build_float_sub(old_f, one, "dec").unwrap()
+                                }
+                            };
+                            self.builder.build_store(field_ptr, new_f).unwrap();
+                            self.builder.build_unconditional_branch(merge_bb).unwrap();
+                            old_vals.push((old_f.into(), hit_bbs[i]));
+                        }
+
+                        // ── no-match block (silent no-op) ─────────────────────
+                        self.builder.position_at_end(nomatch_bb);
+                        let zero_f: BasicValueEnum<'ctx> = f64_type.const_float(0.0).into();
+                        self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+                        // ── merge block ────────────────────────────────────────
+                        self.builder.position_at_end(merge_bb);
+                        let phi = self.builder.build_phi(f64_type, "upd.result").unwrap();
+                        for (val, bb) in &old_vals {
+                            phi.add_incoming(&[(val, *bb)]);
+                        }
+                        // no-match contributes 0.0 (postfix: returns 0, prefix: 0)
+                        phi.add_incoming(&[(&zero_f, nomatch_bb)]);
+
+                        let result = if is_postfix {
+                            phi.as_basic_value() // old value
+                        } else {
+                            // prefix: we don't have a single "new value" phi across all fields.
+                            // Return the old+1 value via a second phi.
+                            // For simplicity use the postfix phi + constant 1 delta (same for all fields).
+                            let one = f64_type.const_float(1.0);
+                            match op {
+                                UpdateOp::Increment => self
+                                    .builder
+                                    .build_float_add(
+                                        phi.as_basic_value().into_float_value(),
+                                        one,
+                                        "pre_inc",
+                                    )
+                                    .unwrap()
+                                    .into(),
+                                UpdateOp::Decrement => self
+                                    .builder
+                                    .build_float_sub(
+                                        phi.as_basic_value().into_float_value(),
+                                        one,
+                                        "pre_dec",
+                                    )
+                                    .unwrap()
+                                    .into(),
+                            }
+                        };
+                        Ok((result, VarType::Number))
+                    }
+
+                    _ => Err(CompileError::error(
+                        "++/-- index target must be an array or object",
+                        span.clone(),
+                    )),
+                }
+            }
+
+            // ── Member access: obj.prop++ ─────────────────────────────────────
+            ExprKind::Member { object, property } => {
+                // Resolve the object's alloca and struct layout
+                let get_ptr_and_vt =
+                    |cg: &mut Self| -> Result<(PointerValue<'ctx>, VarType), CompileError> {
+                        if matches!(object.kind, ExprKind::This) {
+                            if let Some((this_ptr, this_vt)) = cg.current_this.clone() {
+                                return Ok((this_ptr, this_vt));
+                            }
+                            return Err(CompileError::error(
+                                "Cannot use 'this' outside of a method",
+                                span.clone(),
+                            ));
+                        }
+                        if let ExprKind::Identifier(obj_name) = &object.kind {
+                            if let Some((ptr, vt)) = cg.get_variable(obj_name) {
+                                return Ok((ptr, vt));
+                            }
+                        }
+                        Err(CompileError::error(
+                            "++/-- member target must be a simple variable or 'this'",
+                            span.clone(),
+                        ))
+                    };
+                let (obj_ptr, obj_vt) = get_ptr_and_vt(self)?;
+                if let VarType::Object { ref fields, .. } = obj_vt.clone() {
+                    if let Some(i) = fields.iter().position(|(n, _)| n == property) {
+                        let llvm_type = self.var_type_to_llvm(&obj_vt);
+                        let struct_type = llvm_type.into_struct_type();
+                        let field_ptr = self
+                            .builder
+                            .build_struct_gep(
+                                struct_type,
+                                obj_ptr,
+                                i as u32,
+                                &format!("obj.{}", property),
+                            )
+                            .unwrap();
+                        let old_float = self
+                            .builder
+                            .build_load(self.context.f64_type(), field_ptr, "old")
+                            .unwrap()
+                            .into_float_value();
+                        let one = self.context.f64_type().const_float(1.0);
+                        let new_float = match op {
+                            UpdateOp::Increment => {
+                                self.builder.build_float_add(old_float, one, "inc").unwrap()
+                            }
+                            UpdateOp::Decrement => {
+                                self.builder.build_float_sub(old_float, one, "dec").unwrap()
+                            }
+                        };
+                        self.builder.build_store(field_ptr, new_float).unwrap();
+                        let result = if is_postfix { old_float } else { new_float };
+                        return Ok((result.into(), VarType::Number));
+                    }
+                }
+                Err(CompileError::error(
+                    format!("Property '{}' not found for ++/--", property),
+                    span.clone(),
+                ))
+            }
+
+            _ => Err(CompileError::error(
+                "Invalid target for ++/--",
+                span.clone(),
+            )),
+        }
     }
 
     /// Emit field initializers for a class and its parent chain (parent-first order).
@@ -6749,8 +7125,8 @@ impl<'ctx> Codegen<'ctx> {
                 Self::collect_idents_in_expr(object, out);
                 Self::collect_idents_in_expr(value, out);
             }
-            ExprKind::PostfixUpdate { name, .. } | ExprKind::PrefixUpdate { name, .. } => {
-                out.insert(name.clone());
+            ExprKind::PostfixUpdate { target, .. } | ExprKind::PrefixUpdate { target, .. } => {
+                Self::collect_idents_in_expr(target, out);
             }
             ExprKind::Conditional {
                 condition,

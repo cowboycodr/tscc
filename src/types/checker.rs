@@ -1508,16 +1508,8 @@ impl TypeChecker {
 
             ExprKind::Grouping { expr } => self.check_expr(expr),
 
-            ExprKind::PostfixUpdate { name, .. } | ExprKind::PrefixUpdate { name, .. } => {
-                let ty = self.lookup(name).ok_or_else(|| {
-                    CompileError::error(format!("Cannot find name '{}'", name), expr.span.clone())
-                })?;
-                if ty != Type::Number {
-                    return Err(CompileError::error(
-                        format!("Operator '++/--' requires number, got '{}'", ty),
-                        expr.span.clone(),
-                    ));
-                }
+            ExprKind::PostfixUpdate { target, .. } | ExprKind::PrefixUpdate { target, .. } => {
+                self.check_expr(target)?;
                 Ok(Type::Number)
             }
 

@@ -1826,11 +1826,11 @@ impl Parser {
             Token::PlusPlus => {
                 let span = self.current_span();
                 self.advance();
-                let name = self.expect_identifier("Expected variable name after '++'")?;
+                let target = self.call()?;
                 Ok(Expr {
                     span: self.span_from(&span),
                     kind: ExprKind::PrefixUpdate {
-                        name,
+                        target: Box::new(target),
                         op: UpdateOp::Increment,
                     },
                 })
@@ -1838,11 +1838,11 @@ impl Parser {
             Token::MinusMinus => {
                 let span = self.current_span();
                 self.advance();
-                let name = self.expect_identifier("Expected variable name after '--'")?;
+                let target = self.call()?;
                 Ok(Expr {
                     span: self.span_from(&span),
                     kind: ExprKind::PrefixUpdate {
-                        name,
+                        target: Box::new(target),
                         op: UpdateOp::Decrement,
                     },
                 })
@@ -1854,34 +1854,38 @@ impl Parser {
     fn postfix(&mut self) -> Result<Expr, CompileError> {
         let mut expr = self.call()?;
 
-        match self.peek_token() {
-            Token::PlusPlus => {
-                if let ExprKind::Identifier(name) = &expr.kind {
-                    let name = name.clone();
+        // Only consume ++/-- when the LHS is a valid lvalue
+        let is_lvalue = matches!(
+            expr.kind,
+            ExprKind::Identifier(_) | ExprKind::IndexAccess { .. } | ExprKind::Member { .. }
+        );
+
+        if is_lvalue {
+            match self.peek_token() {
+                Token::PlusPlus => {
+                    let start_span = expr.span.clone();
                     self.advance();
                     expr = Expr {
-                        span: self.span_from(&expr.span),
+                        span: self.span_from(&start_span),
                         kind: ExprKind::PostfixUpdate {
-                            name,
+                            target: Box::new(expr),
                             op: UpdateOp::Increment,
                         },
                     };
                 }
-            }
-            Token::MinusMinus => {
-                if let ExprKind::Identifier(name) = &expr.kind {
-                    let name = name.clone();
+                Token::MinusMinus => {
+                    let start_span = expr.span.clone();
                     self.advance();
                     expr = Expr {
-                        span: self.span_from(&expr.span),
+                        span: self.span_from(&start_span),
                         kind: ExprKind::PostfixUpdate {
-                            name,
+                            target: Box::new(expr),
                             op: UpdateOp::Decrement,
                         },
                     };
                 }
+                _ => {}
             }
-            _ => {}
         }
 
         Ok(expr)

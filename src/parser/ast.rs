@@ -349,11 +349,11 @@ pub enum ExprKind {
         expr: Box<Expr>,
     },
     PostfixUpdate {
-        name: String,
+        target: Box<Expr>,
         op: UpdateOp,
     },
     PrefixUpdate {
-        name: String,
+        target: Box<Expr>,
         op: UpdateOp,
     },
     /// Type assertion: expr as Type (erased at codegen)
