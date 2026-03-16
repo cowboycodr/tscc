@@ -71,7 +71,7 @@ Significant design work. Each could be a multi-session effort.
 - [ ] **`Map`** — `new Map<string, number>()` *(runtime hash map)*
 - [ ] **`Set`** — `new Set([1, 2, 3])` *(runtime hash set)*
 - [ ] **`RegExp`** — `/hello/.test("hello world")` *(link against PCRE or re2)*
-- [ ] **`keyof`** — `keyof Point`
+- [x] **`keyof`** — `keyof Point`
 - [x] **Conditional types** — `T extends number ? "yes" : "no"`
 - [x] **Mapped types** — `{ [P in keyof T]: T[P] }`
 

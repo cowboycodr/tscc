@@ -142,7 +142,7 @@ TypeScript source
     Native binary
 ```
 
-Written in Rust. Single crate. ~9,000 lines of Rust + ~285 lines of C runtime.
+Written in Rust. Single crate. ~12,200 lines of Rust + ~370 lines of C runtime.
 
 The runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It is compiled once at `cargo build` time and embedded directly into the `tscc` binary — no C toolchain is required on the user's machine to compile TypeScript files.
 
