@@ -1987,6 +1987,10 @@ impl TypeChecker {
             let ret_ok = self.is_assignable(from_ret, to_ret);
             return params_ok && ret_ok;
         }
+        // Array covariance: Array<A> assignable to Array<B> when A assignable to B
+        if let (Type::Array(from_elem), Type::Array(to_elem)) = (from, to) {
+            return self.is_assignable(from_elem, to_elem);
+        }
         // Tuple structural compatibility: same length, each element assignable
         if let (Type::Tuple(from_elems), Type::Tuple(to_elems)) = (from, to) {
             if from_elems.len() != to_elems.len() {
