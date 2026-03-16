@@ -51,6 +51,18 @@ pub struct Codegen<'ctx> {
     function_rest_param_index: HashMap<String, usize>,
     /// Parameter VarTypes for functions (for union wrapping at call sites)
     function_param_var_types: HashMap<String, Vec<VarType>>,
+    /// Generic function templates: name -> (type_param_names, params, return_type, body)
+    generic_templates: HashMap<
+        String,
+        (
+            Vec<String>,
+            Vec<Parameter>,
+            Option<TypeAnnotation>,
+            Vec<Statement>,
+        ),
+    >,
+    /// Active type parameter substitutions for monomorphization
+    type_substitutions: HashMap<String, VarType>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +151,8 @@ impl<'ctx> Codegen<'ctx> {
             function_param_defaults: HashMap::new(),
             function_rest_param_index: HashMap::new(),
             function_param_var_types: HashMap::new(),
+            generic_templates: HashMap::new(),
+            type_substitutions: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -410,8 +424,15 @@ impl<'ctx> Codegen<'ctx> {
     fn analyze_integer_functions(program: &Program) -> HashSet<String> {
         let mut result = HashSet::new();
         for stmt in &program.statements {
-            if let StmtKind::FunctionDecl { name, body, .. } = &stmt.kind {
-                if Self::is_function_integer_safe(name, body, &result) {
+            if let StmtKind::FunctionDecl {
+                name,
+                type_params,
+                body,
+                ..
+            } = &stmt.kind
+            {
+                // Generic functions are monomorphized — skip integer analysis
+                if type_params.is_empty() && Self::is_function_integer_safe(name, body, &result) {
                     result.insert(name.clone());
                 }
             }
@@ -578,17 +599,28 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
-        // Second pass: compile all function declarations
+        // Second pass: compile all function declarations (skip generics — they're monomorphized on demand)
         for stmt in &program.statements {
             if let StmtKind::FunctionDecl {
                 name,
+                type_params,
                 params,
                 return_type,
                 body,
                 ..
             } = &stmt.kind
             {
-                self.compile_function_decl(name, params, return_type, body)?;
+                if !type_params.is_empty() {
+                    // Store as template for monomorphization at call sites
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_templates.insert(
+                        name.clone(),
+                        (tp_names, params.clone(), return_type.clone(), body.clone()),
+                    );
+                } else {
+                    self.compile_function_decl(name, params, return_type, body)?;
+                }
             }
         }
 
@@ -3408,6 +3440,11 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
 
+            // Check if this is a call to a generic function — monomorphize on demand
+            if self.generic_templates.contains_key(name.as_str()) {
+                return self.compile_generic_call(name, args, function, span);
+            }
+
             let func = self
                 .functions
                 .get(name)
@@ -4913,6 +4950,10 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             TypeAnnKind::Named(name) => {
+                // Check type parameter substitutions first (generics)
+                if let Some(vt) = self.type_substitutions.get(name) {
+                    return vt.clone();
+                }
                 // Look up class struct types
                 if let Some((_, field_info, _)) = self.class_struct_types.get(name) {
                     VarType::Object {
@@ -5730,6 +5771,117 @@ impl<'ctx> Codegen<'ctx> {
         };
 
         Ok((closure_val.into(), closure_vt))
+    }
+
+    /// Monomorphize and call a generic function.
+    /// Infers type parameters from compiled argument types, generates a specialized
+    /// function if not already compiled, then calls it.
+    fn compile_generic_call(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        // Compile arguments first to determine concrete types
+        let mut compiled_args: Vec<(BasicValueEnum<'ctx>, VarType)> = Vec::new();
+        for arg in args {
+            compiled_args.push(self.compile_expr(arg, function)?);
+        }
+
+        // Look up the generic template
+        let (tp_names, params, return_type, body) =
+            self.generic_templates.get(name).cloned().ok_or_else(|| {
+                CompileError::error(
+                    format!("Generic template '{}' not found", name),
+                    span.clone(),
+                )
+            })?;
+
+        // Infer type parameters from argument VarTypes
+        let mut substitutions: HashMap<String, VarType> = HashMap::new();
+        for (i, param) in params.iter().enumerate() {
+            if let Some(ref ann) = param.type_ann {
+                if let TypeAnnKind::Named(ref type_name) = ann.kind {
+                    if tp_names.contains(type_name) {
+                        if let Some((_, ref arg_vt)) = compiled_args.get(i) {
+                            substitutions.insert(type_name.clone(), arg_vt.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Generate mangled specialization name
+        let suffix: String = tp_names
+            .iter()
+            .map(|tp| {
+                substitutions
+                    .get(tp)
+                    .map(Self::var_type_suffix)
+                    .unwrap_or("u")
+            })
+            .collect::<Vec<_>>()
+            .join("_");
+        let mangled_name = format!("{}${}", name, suffix);
+
+        // Compile specialization if not already done
+        if self.module.get_function(&mangled_name).is_none() {
+            // Save current state
+            let prev_subs = std::mem::replace(&mut self.type_substitutions, substitutions.clone());
+            let prev_mode = self.number_mode.clone();
+
+            // Compile the specialized function
+            self.compile_function_decl(&mangled_name, &params, &return_type, &body)?;
+
+            // Restore state
+            self.type_substitutions = prev_subs;
+            self.number_mode = prev_mode;
+        }
+
+        // Call the specialized function
+        let spec_func = self.module.get_function(&mangled_name).ok_or_else(|| {
+            CompileError::error(
+                format!("Failed to compile specialization '{}'", mangled_name),
+                span.clone(),
+            )
+        })?;
+
+        let call_args: Vec<BasicMetadataValueEnum> =
+            compiled_args.iter().map(|(v, _)| (*v).into()).collect();
+
+        let ret = self
+            .builder
+            .build_call(spec_func, &call_args, "generic_call")
+            .unwrap();
+
+        let ret_vt = self
+            .function_return_types
+            .get(&mangled_name)
+            .cloned()
+            .unwrap_or(VarType::Number);
+
+        let ret_val = ret
+            .try_as_basic_value()
+            .left()
+            .unwrap_or_else(|| self.context.f64_type().const_float(0.0).into());
+
+        Ok((ret_val, ret_vt))
+    }
+
+    /// Short suffix for a VarType, used in mangled specialization names.
+    fn var_type_suffix(vt: &VarType) -> &'static str {
+        match vt {
+            VarType::Number => "n",
+            VarType::Integer => "i",
+            VarType::String => "s",
+            VarType::Boolean => "b",
+            VarType::Array => "a",
+            VarType::FunctionPtr { .. } | VarType::Closure { .. } => "f",
+            VarType::Object { .. } => "o",
+            VarType::Union(_) => "u",
+            VarType::Tuple(_) => "t",
+        }
     }
 
     /// Call a closure variable: extract fn_ptr + env_ptr, indirect call with env as first arg.

@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 209 tests passing, 30 pending — 87% of test suite**
+**Current status: 211 tests passing, 28 pending — 88% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -66,8 +66,8 @@ Each requires a new AST node and coordinated changes across parser → checker �
 
 Significant design work. Each could be a multi-session effort.
 
-- [ ] **Generics** — `function identity<T>(x: T): T` *(type parameter substitution throughout pipeline)*
-- [ ] **Generic constraints** — `<T extends { length: number }>`
+- [x] **Generics** — `function identity<T>(x: T): T` *(monomorphization at call sites)*
+- [x] **Generic constraints** — `<T extends { length: number }>`
 - [ ] **`Map`** — `new Map<string, number>()` *(runtime hash map)*
 - [ ] **`Set`** — `new Set([1, 2, 3])` *(runtime hash set)*
 - [ ] **`RegExp`** — `/hello/.test("hello world")` *(link against PCRE or re2)*

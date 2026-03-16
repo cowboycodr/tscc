@@ -22,6 +22,7 @@ pub enum StmtKind {
     },
     FunctionDecl {
         name: String,
+        type_params: Vec<TypeParam>,
         params: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
@@ -149,6 +150,13 @@ pub enum EnumValue {
 pub struct ImportSpecifier {
     pub imported: String,
     pub local: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub constraint: Option<TypeAnnotation>,
     pub span: Span,
 }
 

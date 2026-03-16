@@ -30,6 +30,10 @@ pub struct TypeChecker {
     interface_types: HashMap<String, Type>,
     /// Registered type aliases by name
     type_aliases: HashMap<String, TypeAnnotation>,
+    /// Active type parameter substitutions (for generic function body checking)
+    type_param_types: HashMap<String, Type>,
+    /// Generic function signatures: name -> (type_param_names, param_types, return_type)
+    generic_functions: HashMap<String, (Vec<String>, Vec<Type>, Type)>,
 }
 
 impl TypeChecker {
@@ -43,6 +47,8 @@ impl TypeChecker {
             class_types: HashMap::new(),
             interface_types: HashMap::new(),
             type_aliases: HashMap::new(),
+            type_param_types: HashMap::new(),
+            generic_functions: HashMap::new(),
         };
         checker.push_scope();
         checker.register_builtins();
@@ -172,11 +178,28 @@ impl TypeChecker {
 
             StmtKind::FunctionDecl {
                 name,
+                type_params,
                 params,
                 return_type,
                 body,
                 is_exported,
             } => {
+                let is_generic = !type_params.is_empty();
+
+                // Register type params BEFORE resolving param/return types
+                // so that Named("T") resolves to the constraint type
+                let prev_type_params = self.type_param_types.clone();
+                if is_generic {
+                    for tp in type_params {
+                        let tp_type = tp
+                            .constraint
+                            .as_ref()
+                            .map(|c| self.resolve_type_annotation(c))
+                            .unwrap_or(Type::Unknown);
+                        self.type_param_types.insert(tp.name.clone(), tp_type);
+                    }
+                }
+
                 let param_types: Vec<Type> = params
                     .iter()
                     .map(|p| {
@@ -214,6 +237,16 @@ impl TypeChecker {
 
                 self.define(name.clone(), func_type, true);
 
+                // Register generic function signature for call-site inference
+                if is_generic {
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_functions.insert(
+                        name.clone(),
+                        (tp_names, param_types.clone(), ret_type.clone()),
+                    );
+                }
+
                 self.push_scope();
                 let prev_return_type = self.current_return_type.clone();
                 self.current_return_type = Some(ret_type.clone());
@@ -226,6 +259,7 @@ impl TypeChecker {
                     self.check_statement(stmt)?;
                 }
 
+                self.type_param_types = prev_type_params;
                 self.current_return_type = prev_return_type;
                 self.pop_scope();
                 Ok(())
@@ -893,6 +927,23 @@ impl TypeChecker {
                                 }
                             }
                         }
+                    }
+                }
+
+                // Special case: calls to generic functions — skip strict param assignability
+                if let ExprKind::Identifier(fn_name) = &callee.kind {
+                    if self.generic_functions.contains_key(fn_name.as_str()) {
+                        // Just check that args are valid expressions; constraint
+                        // validation is done at codegen time via monomorphization
+                        for arg in args {
+                            self.check_expr(arg)?;
+                        }
+                        // Return the function's declared return type
+                        let callee_type = self.check_expr(callee)?;
+                        if let Type::Function { return_type, .. } = &callee_type {
+                            return Ok(*return_type.clone());
+                        }
+                        return Ok(Type::Unknown);
                     }
                 }
 
@@ -1717,6 +1768,10 @@ impl TypeChecker {
                     .collect(),
             },
             TypeAnnKind::Named(name) => {
+                // Check active type parameter substitutions first (generics)
+                if let Some(ty) = self.type_param_types.get(name) {
+                    return ty.clone();
+                }
                 // Look up type alias, interface, or class type
                 if let Some(ty) = self.interface_types.get(name) {
                     return ty.clone();

@@ -1740,7 +1740,6 @@ console.log(Direction.Up)
     }
 
     #[test]
-    #[ignore = "generics not implemented"]
     fn generic_function() {
         let src = r#"
 function identity<T>(x: T): T {
@@ -1753,7 +1752,6 @@ console.log(identity("hi"))
     }
 
     #[test]
-    #[ignore = "generics not implemented"]
     fn generic_constraint() {
         let src = r#"
 function getLength<T extends { length: number }>(x: T): number {

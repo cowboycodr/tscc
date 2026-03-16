@@ -148,11 +148,11 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 209 tests passing, 30 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 211 tests passing, 28 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**209 passing** / **30 not yet implemented** — 87% of test suite
+**211 passing** / **28 not yet implemented** — 88% of test suite
 
 ### Literals & Primitives
 
@@ -374,8 +374,8 @@ Early stage. 209 tests passing, 30 pending. The goal is drop-in compatibility wi
 | Type aliases | :white_check_mark: | `type ID = string \| number` |
 | Enums (numeric) | :white_check_mark: | `enum Color { Red, Green }` |
 | Enums (string) | :white_check_mark: | `enum Direction { Up = "UP" }` |
-| Generics | :x: | `function identity<T>(x: T): T` |
-| Generic constraints | :x: | `<T extends { length: number }>` |
+| Generics | :white_check_mark: | `function identity<T>(x: T): T` |
+| Generic constraints | :white_check_mark: | `<T extends { length: number }>` |
 | Tuple types | :white_check_mark: | `[number, string]` |
 | Type assertions | :white_check_mark: | `x as string` |
 | Type narrowing | :white_check_mark: | `if (typeof val === "string")` |

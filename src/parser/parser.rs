@@ -163,6 +163,13 @@ impl Parser {
 
         let name = self.expect_identifier("Expected function name")?;
 
+        // Parse optional type parameters: <T>, <T, U>, <T extends Type>
+        let type_params = if self.check(&Token::Less) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
+
         self.expect(&Token::LeftParen, "Expected '(' after function name")?;
         let params = self.parameter_list()?;
         self.expect(&Token::RightParen, "Expected ')' after parameters")?;
@@ -181,6 +188,7 @@ impl Parser {
         Ok(Statement {
             kind: StmtKind::FunctionDecl {
                 name,
+                type_params,
                 params,
                 return_type,
                 body,
@@ -188,6 +196,38 @@ impl Parser {
             },
             span: self.span_from(&start_span),
         })
+    }
+
+    /// Parse type parameters: `<T>`, `<T, U>`, `<T extends Type>`
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, CompileError> {
+        self.expect(&Token::Less, "Expected '<'")?;
+        let mut type_params = Vec::new();
+
+        loop {
+            let span = self.current_span();
+            let name = self.expect_identifier("Expected type parameter name")?;
+
+            // Check for constraint: T extends Type
+            let constraint = if self.check(&Token::Extends) {
+                self.advance(); // consume "extends"
+                Some(self.type_annotation()?)
+            } else {
+                None
+            };
+
+            type_params.push(TypeParam {
+                name,
+                constraint,
+                span: self.span_from(&span),
+            });
+
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+
+        self.expect(&Token::Greater, "Expected '>' after type parameters")?;
+        Ok(type_params)
     }
 
     fn class_declaration(&mut self) -> Result<Statement, CompileError> {
