@@ -36,6 +36,7 @@ impl Parser {
             Token::Function => self.function_declaration(false),
             Token::Class => self.class_declaration(),
             Token::Interface => self.interface_declaration(),
+            Token::Enum => self.enum_declaration(),
             Token::If => self.if_statement(),
             Token::While => self.while_statement(),
             Token::Do => self.do_while_statement(),
@@ -47,6 +48,18 @@ impl Parser {
             Token::LeftBrace => self.block_statement(),
             Token::Import => self.import_declaration(),
             Token::Export => self.export_declaration(),
+            // type alias: type X = Y (contextual keyword)
+            Token::Identifier(ref name) if name == "type" => {
+                // Peek ahead: if followed by an identifier, it's a type alias
+                if matches!(
+                    self.tokens.get(self.current + 1).map(|t| &t.token),
+                    Some(Token::Identifier(_))
+                ) {
+                    self.type_alias_declaration()
+                } else {
+                    self.expression_statement()
+                }
+            }
             _ => self.expression_statement(),
         }
     }
@@ -150,6 +163,13 @@ impl Parser {
 
         let name = self.expect_identifier("Expected function name")?;
 
+        // Parse optional type parameters: <T>, <T, U>, <T extends Type>
+        let type_params = if self.check(&Token::Less) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
+
         self.expect(&Token::LeftParen, "Expected '(' after function name")?;
         let params = self.parameter_list()?;
         self.expect(&Token::RightParen, "Expected ')' after parameters")?;
@@ -168,6 +188,7 @@ impl Parser {
         Ok(Statement {
             kind: StmtKind::FunctionDecl {
                 name,
+                type_params,
                 params,
                 return_type,
                 body,
@@ -175,6 +196,52 @@ impl Parser {
             },
             span: self.span_from(&start_span),
         })
+    }
+
+    /// Parse type parameters: `<T>`, `<T, U>`, `<T extends Type>`
+    fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, CompileError> {
+        self.expect(&Token::Less, "Expected '<'")?;
+        let mut type_params = Vec::new();
+
+        loop {
+            let span = self.current_span();
+            let name = self.expect_identifier("Expected type parameter name")?;
+
+            // Check for constraint: T extends Type
+            let constraint = if self.check(&Token::Extends) {
+                self.advance(); // consume "extends"
+                Some(self.type_annotation()?)
+            } else {
+                None
+            };
+
+            type_params.push(TypeParam {
+                name,
+                constraint,
+                span: self.span_from(&span),
+            });
+
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+
+        self.expect(&Token::Greater, "Expected '>' after type parameters")?;
+        Ok(type_params)
+    }
+
+    /// Parse type arguments: `<number>`, `<string, number>`
+    fn parse_type_args(&mut self) -> Result<Vec<TypeAnnotation>, CompileError> {
+        self.expect(&Token::Less, "Expected '<'")?;
+        let mut type_args = Vec::new();
+        loop {
+            type_args.push(self.type_annotation()?);
+            if !self.match_token(&Token::Comma) {
+                break;
+            }
+        }
+        self.expect(&Token::Greater, "Expected '>' after type arguments")?;
+        Ok(type_args)
     }
 
     fn class_declaration(&mut self) -> Result<Statement, CompileError> {
@@ -282,6 +349,12 @@ impl Parser {
 
         let mut fields = Vec::new();
         while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            // Skip 'readonly' modifier (parsed and discarded)
+            if let Token::Identifier(ref kw) = self.peek_token() {
+                if kw == "readonly" {
+                    self.advance();
+                }
+            }
             let field_name = self.expect_identifier("Expected field name")?;
             self.expect(&Token::Colon, "Expected ':' after field name")?;
             let type_ann = self.type_annotation()?;
@@ -296,6 +369,84 @@ impl Parser {
 
         Ok(Statement {
             kind: StmtKind::InterfaceDecl { name, fields },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn type_alias_declaration(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'type' identifier
+
+        let name = self.expect_identifier("Expected type alias name")?;
+
+        // Optional type parameters: type IsNumber<T> = ...
+        let type_params = if self.check(&Token::Less) {
+            self.parse_type_params()?
+        } else {
+            Vec::new()
+        };
+
+        self.expect(&Token::Assign, "Expected '=' in type alias")?;
+        let type_ann = self.type_annotation()?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::TypeAlias {
+                name,
+                type_params,
+                type_ann,
+            },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn enum_declaration(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'enum'
+
+        let name = self.expect_identifier("Expected enum name")?;
+        self.expect(&Token::LeftBrace, "Expected '{' before enum body")?;
+
+        let mut members = Vec::new();
+        while !self.check(&Token::RightBrace) && !self.is_at_end() {
+            let member_span = self.current_span();
+            let member_name = self.expect_identifier("Expected enum member name")?;
+
+            let value = if self.match_token(&Token::Assign) {
+                match self.peek_token() {
+                    Token::String(s) => {
+                        let s = s.clone();
+                        self.advance();
+                        Some(EnumValue::String(s))
+                    }
+                    Token::Number(n) => {
+                        let n = n;
+                        self.advance();
+                        Some(EnumValue::Number(n))
+                    }
+                    _ => {
+                        return Err(self.error("Expected string or number value for enum member"));
+                    }
+                }
+            } else {
+                None
+            };
+
+            members.push(EnumMember {
+                name: member_name,
+                value,
+                span: self.span_from(&member_span),
+            });
+
+            // Allow trailing comma
+            self.match_token(&Token::Comma);
+        }
+
+        self.expect(&Token::RightBrace, "Expected '}' after enum body")?;
+        self.consume_semicolon()?;
+
+        Ok(Statement {
+            kind: StmtKind::EnumDecl { name, members },
             span: self.span_from(&start_span),
         })
     }
@@ -647,7 +798,85 @@ impl Parser {
     fn type_annotation(&mut self) -> Result<TypeAnnotation, CompileError> {
         let span = self.current_span();
 
-        // Check for function type: (params) => ReturnType
+        // Parse the first type (handles typeof, keyof, function types,
+        // primitives, identifiers, array suffix, and intersection &)
+        let base = self.type_annotation_base()?;
+
+        // Check for conditional type: CheckType extends ExtendsType ? TrueType : FalseType
+        if self.check(&Token::Extends) {
+            self.advance(); // consume 'extends'
+            let extends_type = self.type_annotation_base()?;
+            self.expect(&Token::Question, "Expected '?' in conditional type")?;
+            let true_type = self.type_annotation()?;
+            self.expect(&Token::Colon, "Expected ':' in conditional type")?;
+            let false_type = self.type_annotation()?;
+            return Ok(TypeAnnotation {
+                kind: TypeAnnKind::Conditional {
+                    check_type: Box::new(base),
+                    extends_type: Box::new(extends_type),
+                    true_type: Box::new(true_type),
+                    false_type: Box::new(false_type),
+                },
+                span: self.span_from(&span),
+            });
+        }
+
+        // Check for union type: Type | Type | ...
+        if self.check(&Token::Pipe) {
+            let mut variants = vec![base];
+            while self.match_token(&Token::Pipe) {
+                variants.push(self.type_annotation_base()?);
+            }
+            return Ok(TypeAnnotation {
+                kind: TypeAnnKind::Union(variants),
+                span: self.span_from(&span),
+            });
+        }
+
+        Ok(base)
+    }
+
+    /// Parse a single type (without union) — handles typeof, keyof, function types,
+    /// primitives, identifiers, array suffix, and intersection &.
+    fn type_annotation_base(&mut self) -> Result<TypeAnnotation, CompileError> {
+        let span = self.current_span();
+
+        // keyof Type
+        if let Token::Identifier(ref kw) = self.peek_token() {
+            if kw == "keyof" {
+                self.advance();
+                let inner = self.type_annotation()?;
+                return Ok(TypeAnnotation {
+                    kind: TypeAnnKind::Keyof(Box::new(inner)),
+                    span: self.span_from(&span),
+                });
+            }
+        }
+
+        // typeof x
+        if self.match_token(&Token::Typeof) {
+            let name = self.expect_identifier("Expected identifier after 'typeof'")?;
+            let mut base = TypeAnnotation {
+                kind: TypeAnnKind::Typeof(name),
+                span: self.span_from(&span),
+            };
+            while self.check(&Token::LeftBracket) {
+                if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket)
+                {
+                    self.advance();
+                    self.advance();
+                    base = TypeAnnotation {
+                        kind: TypeAnnKind::Array(Box::new(base)),
+                        span: self.span_from(&span),
+                    };
+                } else {
+                    break;
+                }
+            }
+            return Ok(base);
+        }
+
+        // Function type
         if self.check(&Token::LeftParen) {
             if let Some(func_type) = self.try_function_type(&span)? {
                 return Ok(func_type);
@@ -697,16 +926,72 @@ impl Parser {
                     span: self.span_from(&span),
                 }
             }
-            Token::LeftBrace => {
-                // Object type: { x: number, y: string }
+            Token::String(s) => {
+                let s = s.clone();
                 self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::StringLiteral(s),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Number(n) => {
+                let n = n;
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::NumberLiteral(n),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::LeftBrace => {
+                self.advance();
+
+                // Skip optional 'readonly' modifier
+                if let Token::Identifier(ref kw) = self.peek_token() {
+                    if kw == "readonly" {
+                        self.advance();
+                    }
+                }
+
+                // Check for mapped type: { [P in keyof T]: T[P] }
+                if self.check(&Token::LeftBracket) {
+                    let saved = self.current;
+                    self.advance(); // consume '['
+                    if let Ok(param) = self.expect_identifier("mapped type param") {
+                        if let Token::Identifier(ref kw) = self.peek_token() {
+                            if kw == "in" {
+                                self.advance(); // consume 'in'
+                                let constraint = self.type_annotation()?;
+                                self.expect(&Token::RightBracket, "Expected ']'")?;
+                                self.expect(&Token::Colon, "Expected ':'")?;
+                                let value_type = self.type_annotation()?;
+                                self.match_token(&Token::Semicolon);
+                                self.expect(&Token::RightBrace, "Expected '}'")?;
+                                return Ok(TypeAnnotation {
+                                    kind: TypeAnnKind::Mapped {
+                                        param,
+                                        constraint: Box::new(constraint),
+                                        value_type: Box::new(value_type),
+                                    },
+                                    span: self.span_from(&span),
+                                });
+                            }
+                        }
+                    }
+                    // Not a mapped type — backtrack
+                    self.current = saved;
+                }
+
                 let mut fields = Vec::new();
                 while !self.check(&Token::RightBrace) && !self.is_at_end() {
+                    if let Token::Identifier(ref kw) = self.peek_token() {
+                        if kw == "readonly" {
+                            self.advance();
+                        }
+                    }
                     let field_name = self.expect_identifier("Expected field name in type")?;
                     self.expect(&Token::Colon, "Expected ':' in object type")?;
                     let field_type = self.type_annotation()?;
                     fields.push((field_name, field_type));
-                    // Allow comma or semicolon as separator
                     if !self.match_token(&Token::Comma) {
                         self.match_token(&Token::Semicolon);
                     }
@@ -714,6 +999,157 @@ impl Parser {
                 self.expect(&Token::RightBrace, "Expected '}' in object type")?;
                 TypeAnnotation {
                     kind: TypeAnnKind::Object { fields },
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Identifier(name) => {
+                let name = name.clone();
+                self.advance();
+
+                // Check for type arguments: IsNumber<number>
+                if self.check(&Token::Less) {
+                    // Speculatively parse type args — save position
+                    let saved = self.current;
+                    if let Ok(type_args) = self.parse_type_args() {
+                        TypeAnnotation {
+                            kind: TypeAnnKind::Generic { name, type_args },
+                            span: self.span_from(&span),
+                        }
+                    } else {
+                        self.current = saved;
+                        TypeAnnotation {
+                            kind: TypeAnnKind::Named(name),
+                            span: self.span_from(&span),
+                        }
+                    }
+                } else {
+                    TypeAnnotation {
+                        kind: TypeAnnKind::Named(name),
+                        span: self.span_from(&span),
+                    }
+                }
+            }
+            Token::LeftBracket => {
+                // Tuple type: [number, string, ...]
+                self.advance(); // consume '['
+                let mut element_types = Vec::new();
+                while !self.check(&Token::RightBracket) && !self.is_at_end() {
+                    element_types.push(self.type_annotation()?);
+                    if !self.match_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Token::RightBracket, "Expected ']' in tuple type")?;
+                TypeAnnotation {
+                    kind: TypeAnnKind::Tuple(element_types),
+                    span: self.span_from(&span),
+                }
+            }
+            _ => {
+                return Err(self.error("Expected type annotation"));
+            }
+        };
+
+        // Array suffix or indexed access type
+        while self.check(&Token::LeftBracket) {
+            if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket) {
+                // Empty brackets: Type[] → array
+                self.advance();
+                self.advance();
+                base = TypeAnnotation {
+                    kind: TypeAnnKind::Array(Box::new(base)),
+                    span: self.span_from(&span),
+                };
+            } else {
+                // Non-empty brackets: T[P] → indexed access type
+                self.advance(); // consume '['
+                let index_type = self.type_annotation()?;
+                self.expect(&Token::RightBracket, "Expected ']'")?;
+                base = TypeAnnotation {
+                    kind: TypeAnnKind::IndexedAccess {
+                        object_type: Box::new(base),
+                        index_type: Box::new(index_type),
+                    },
+                    span: self.span_from(&span),
+                };
+            }
+        }
+
+        // Intersection: Type & Type & ... (binds tighter than union |)
+        if self.check(&Token::Ampersand) {
+            let mut variants = vec![base];
+            while self.match_token(&Token::Ampersand) {
+                variants.push(self.type_annotation_atom()?);
+            }
+            return Ok(TypeAnnotation {
+                kind: TypeAnnKind::Intersection(variants),
+                span: self.span_from(&span),
+            });
+        }
+
+        Ok(base)
+    }
+
+    /// Parse a single atomic type (no union, no intersection) — used by intersection parsing
+    fn type_annotation_atom(&mut self) -> Result<TypeAnnotation, CompileError> {
+        let span = self.current_span();
+
+        let mut base = match self.peek_token() {
+            Token::NumberType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Number,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::StringType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::String,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::BooleanType => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Boolean,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Void => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Void,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Null => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Null,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Undefined => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::Undefined,
+                    span: self.span_from(&span),
+                }
+            }
+            Token::String(s) => {
+                let s = s.clone();
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::StringLiteral(s),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::Number(n) => {
+                let n = n;
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::NumberLiteral(n),
                     span: self.span_from(&span),
                 }
             }
@@ -730,12 +1166,11 @@ impl Parser {
             }
         };
 
-        // Check for array type suffix: Type[]
+        // Array suffix
         while self.check(&Token::LeftBracket) {
-            // Peek ahead to see if it's []
             if self.tokens.get(self.current + 1).map(|t| &t.token) == Some(&Token::RightBracket) {
-                self.advance(); // consume [
-                self.advance(); // consume ]
+                self.advance();
+                self.advance();
                 base = TypeAnnotation {
                     kind: TypeAnnKind::Array(Box::new(base)),
                     span: self.span_from(&span),
@@ -856,7 +1291,48 @@ impl Parser {
             }
         }
 
-        let expr = self.ternary()?;
+        let mut expr = self.ternary()?;
+
+        // Type assertion: expr as Type  /  expr as const
+        while self.check(&Token::As)
+            || matches!(self.peek_token(), Token::Identifier(ref kw) if kw == "satisfies")
+        {
+            if self.match_token(&Token::As) {
+                // as const — parse and discard (no-op at runtime)
+                if self.match_token(&Token::Const) {
+                    continue;
+                }
+                let target_type = self.type_annotation()?;
+                expr = Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        target_type.span.end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::TypeAssertion {
+                        expr: Box::new(expr),
+                        target_type,
+                    },
+                };
+            } else {
+                // satisfies Type
+                self.advance(); // consume 'satisfies' identifier
+                let target_type = self.type_annotation()?;
+                expr = Expr {
+                    span: Span::new(
+                        expr.span.start,
+                        target_type.span.end,
+                        expr.span.line,
+                        expr.span.column,
+                    ),
+                    kind: ExprKind::Satisfies {
+                        expr: Box::new(expr),
+                        target_type,
+                    },
+                };
+            }
+        }
 
         if self.match_token(&Token::Assign) {
             let value = self.assignment()?;

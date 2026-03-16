@@ -22,6 +22,7 @@ pub enum StmtKind {
     },
     FunctionDecl {
         name: String,
+        type_params: Vec<TypeParam>,
         params: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
@@ -90,6 +91,15 @@ pub enum StmtKind {
         initializer: Expr,
         is_const: bool,
     },
+    TypeAlias {
+        name: String,
+        type_params: Vec<TypeParam>,
+        type_ann: TypeAnnotation,
+    },
+    EnumDecl {
+        name: String,
+        members: Vec<EnumMember>,
+    },
     Break,
     Continue,
     Empty,
@@ -125,9 +135,29 @@ pub struct ClassMethod {
 }
 
 #[derive(Debug, Clone)]
+pub struct EnumMember {
+    pub name: String,
+    pub value: Option<EnumValue>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum EnumValue {
+    Number(f64),
+    String(String),
+}
+
+#[derive(Debug, Clone)]
 pub struct ImportSpecifier {
     pub imported: String,
     pub local: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeParam {
+    pub name: String,
+    pub constraint: Option<TypeAnnotation>,
     pub span: Span,
 }
 
@@ -160,6 +190,43 @@ pub enum TypeAnnKind {
     },
     /// A named type reference (e.g., a class or interface name)
     Named(String),
+    /// typeof x — resolved by looking up the variable's type
+    Typeof(String),
+    /// String literal type: "red", "blue", etc.
+    StringLiteral(String),
+    /// Number literal type: 0, 1, 42, etc.
+    NumberLiteral(f64),
+    /// Union type: string | number
+    Union(Vec<TypeAnnotation>),
+    /// Intersection type: Named & Aged
+    Intersection(Vec<TypeAnnotation>),
+    /// keyof Type — resolves to union of string literal keys
+    Keyof(Box<TypeAnnotation>),
+    /// Tuple type: [number, string]
+    Tuple(Vec<TypeAnnotation>),
+    /// Generic named type reference with type arguments: IsNumber<number>
+    Generic {
+        name: String,
+        type_args: Vec<TypeAnnotation>,
+    },
+    /// Conditional type: T extends number ? "yes" : "no"
+    Conditional {
+        check_type: Box<TypeAnnotation>,
+        extends_type: Box<TypeAnnotation>,
+        true_type: Box<TypeAnnotation>,
+        false_type: Box<TypeAnnotation>,
+    },
+    /// Mapped type: { [P in keyof T]: T[P] }
+    Mapped {
+        param: String,
+        constraint: Box<TypeAnnotation>,
+        value_type: Box<TypeAnnotation>,
+    },
+    /// Indexed access type: T[P]
+    IndexedAccess {
+        object_type: Box<TypeAnnotation>,
+        index_type: Box<TypeAnnotation>,
+    },
     /// Function type: (params) => return_type
     FunctionType {
         params: Vec<TypeAnnotation>,
@@ -266,6 +333,16 @@ pub enum ExprKind {
     PrefixUpdate {
         name: String,
         op: UpdateOp,
+    },
+    /// Type assertion: expr as Type (erased at codegen)
+    TypeAssertion {
+        expr: Box<Expr>,
+        target_type: TypeAnnotation,
+    },
+    /// Satisfies operator: expr satisfies Type (erased at codegen)
+    Satisfies {
+        expr: Box<Expr>,
+        target_type: TypeAnnotation,
     },
 }
 

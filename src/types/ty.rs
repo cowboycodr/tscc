@@ -20,6 +20,16 @@ pub enum Type {
         name: String,
         fields: Vec<(String, Type)>,
     },
+    /// A specific string value used as a type (e.g. "red" in `type Color = "red" | "blue"`)
+    StringLiteral(String),
+    /// A specific number value used as a type (e.g. 1 in `type Bit = 0 | 1`)
+    NumberLiteral(String),
+    /// Union type: string | number
+    Union(Vec<Type>),
+    /// Intersection type: Named & Aged (merged fields)
+    Intersection(Vec<Type>),
+    /// Tuple type: [number, string] — heterogeneous fixed-length array
+    Tuple(Vec<Type>),
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -58,6 +68,36 @@ impl std::fmt::Display for Type {
                 write!(f, " }}")
             }
             Type::Class { name, .. } => write!(f, "{}", name),
+            Type::StringLiteral(s) => write!(f, "\"{}\"", s),
+            Type::NumberLiteral(n) => write!(f, "{}", n),
+            Type::Union(types) => {
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                Ok(())
+            }
+            Type::Intersection(types) => {
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " & ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                Ok(())
+            }
+            Type::Tuple(types) => {
+                write!(f, "[")?;
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", t)?;
+                }
+                write!(f, "]")
+            }
             Type::Unknown => write!(f, "unknown"),
         }
     }

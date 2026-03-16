@@ -142,17 +142,17 @@ TypeScript source
     Native binary
 ```
 
-Written in Rust. Single crate. ~9,000 lines of Rust + ~285 lines of C runtime.
+Written in Rust. Single crate. ~12,200 lines of Rust + ~370 lines of C runtime.
 
 The runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It is compiled once at `cargo build` time and embedded directly into the `tscc` binary — no C toolchain is required on the user's machine to compile TypeScript files.
 
 ## Status
 
-Early stage. 195 tests passing, 44 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**195 passing** / **44 not yet implemented** — 82% of test suite
+**213 passing** / **26 not yet implemented** — 89% of test suite
 
 ### Literals & Primitives
 
@@ -370,24 +370,24 @@ Early stage. 195 tests passing, 44 pending. The goal is drop-in compatibility wi
 |---|---|---|
 | Type annotations | :white_check_mark: | `let x: number`, `function f(): string` |
 | Type inference | :white_check_mark: | `let x = 42` (inferred as number) |
-| Union types | :x: | `string \| number` |
-| Type aliases | :x: | `type ID = string \| number` |
-| Enums (numeric) | :x: | `enum Color { Red, Green }` |
-| Enums (string) | :x: | `enum Direction { Up = "UP" }` |
-| Generics | :x: | `function identity<T>(x: T): T` |
-| Generic constraints | :x: | `<T extends { length: number }>` |
-| Tuple types | :x: | `[number, string]` |
-| Type assertions | :x: | `x as string` |
-| Type narrowing | :x: | `if (typeof val === "string")` |
-| String literal types | :x: | `type Dir = "up" \| "down"` |
-| Intersection types | :x: | `Named & Aged` |
-| `readonly` | :x: | `readonly host: string` |
-| `keyof` | :x: | `keyof Point` |
-| Conditional types | :x: | `T extends number ? "yes" : "no"` |
-| Mapped types | :x: | `{ [P in keyof T]: T[P] }` |
-| `typeof` in type position | :x: | `let y: typeof x` |
-| `satisfies` | :x: | `"red" satisfies Colors` |
-| `as const` | :x: | `[1, 2, 3] as const` |
+| Union types | :white_check_mark: | `string \| number` |
+| Type aliases | :white_check_mark: | `type ID = string \| number` |
+| Enums (numeric) | :white_check_mark: | `enum Color { Red, Green }` |
+| Enums (string) | :white_check_mark: | `enum Direction { Up = "UP" }` |
+| Generics | :white_check_mark: | `function identity<T>(x: T): T` |
+| Generic constraints | :white_check_mark: | `<T extends { length: number }>` |
+| Tuple types | :white_check_mark: | `[number, string]` |
+| Type assertions | :white_check_mark: | `x as string` |
+| Type narrowing | :white_check_mark: | `if (typeof val === "string")` |
+| String literal types | :white_check_mark: | `type Dir = "up" \| "down"` |
+| Intersection types | :white_check_mark: | `Named & Aged` |
+| `readonly` | :white_check_mark: | `readonly host: string` |
+| `keyof` | :white_check_mark: | `keyof Point` |
+| Conditional types | :white_check_mark: | `T extends number ? "yes" : "no"` |
+| Mapped types | :white_check_mark: | `{ [P in keyof T]: T[P] }` |
+| `typeof` in type position | :white_check_mark: | `let y: typeof x` |
+| `satisfies` | :white_check_mark: | `"red" satisfies Colors` |
+| `as const` | :white_check_mark: | `[1, 2, 3] as const` |
 
 ### Error Handling & Async
 

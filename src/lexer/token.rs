@@ -28,6 +28,7 @@ pub enum Token {
     Extends,
     Super,
     Interface,
+    Enum,
     Constructor,
 
     // Module keywords
@@ -60,7 +61,9 @@ pub enum Token {
     Greater,
     LessEqual,
     GreaterEqual,
+    Ampersand,
     AmpersandAmpersand,
+    Pipe,
     PipePipe,
     Bang,
     PlusPlus,

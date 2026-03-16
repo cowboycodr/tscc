@@ -159,6 +159,7 @@ pub fn compile_multi_file(
                 return_type,
                 body,
                 is_exported,
+                ..
             } = &stmt.kind
             {
                 if *is_exported {

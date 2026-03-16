@@ -28,6 +28,14 @@ pub struct TypeChecker {
     class_types: HashMap<String, Type>,
     /// Registered interface types by name
     interface_types: HashMap<String, Type>,
+    /// Registered type aliases by name
+    type_aliases: HashMap<String, TypeAnnotation>,
+    /// Active type parameter substitutions (for generic function body checking)
+    type_param_types: HashMap<String, Type>,
+    /// Generic function signatures: name -> (type_param_names, param_types, return_type)
+    generic_functions: HashMap<String, (Vec<String>, Vec<Type>, Type)>,
+    /// Generic type aliases: name -> (type_param_names, body)
+    generic_type_aliases: HashMap<String, (Vec<String>, TypeAnnotation)>,
 }
 
 impl TypeChecker {
@@ -40,6 +48,10 @@ impl TypeChecker {
             current_this_type: None,
             class_types: HashMap::new(),
             interface_types: HashMap::new(),
+            type_aliases: HashMap::new(),
+            type_param_types: HashMap::new(),
+            generic_functions: HashMap::new(),
+            generic_type_aliases: HashMap::new(),
         };
         checker.push_scope();
         checker.register_builtins();
@@ -102,6 +114,37 @@ impl TypeChecker {
                     .map(|ann| self.resolve_type_annotation(ann));
 
                 let init_type = if let Some(init) = initializer {
+                    // Special case: array literal assigned to a tuple type —
+                    // check each element against the tuple element types
+                    if let Some(Type::Tuple(ref tuple_types)) = declared_type {
+                        if let ExprKind::ArrayLiteral { elements } = &init.kind {
+                            if elements.len() != tuple_types.len() {
+                                return Err(CompileError::error(
+                                    format!(
+                                        "Tuple of length {} is not assignable to tuple of length {}",
+                                        elements.len(),
+                                        tuple_types.len()
+                                    ),
+                                    stmt.span.clone(),
+                                ));
+                            }
+                            for (elem, expected) in elements.iter().zip(tuple_types.iter()) {
+                                let elem_type = self.check_expr(elem)?;
+                                if !self.is_assignable(&elem_type, expected) {
+                                    return Err(CompileError::error(
+                                        format!(
+                                            "Type '{}' is not assignable to type '{}'",
+                                            elem_type, expected
+                                        ),
+                                        stmt.span.clone(),
+                                    ));
+                                }
+                            }
+                            // All checks passed — use the declared tuple type
+                            self.define(name.clone(), declared_type.unwrap(), *is_const);
+                            return Ok(());
+                        }
+                    }
                     Some(self.check_expr(init)?)
                 } else {
                     None
@@ -138,11 +181,28 @@ impl TypeChecker {
 
             StmtKind::FunctionDecl {
                 name,
+                type_params,
                 params,
                 return_type,
                 body,
                 is_exported,
             } => {
+                let is_generic = !type_params.is_empty();
+
+                // Register type params BEFORE resolving param/return types
+                // so that Named("T") resolves to the constraint type
+                let prev_type_params = self.type_param_types.clone();
+                if is_generic {
+                    for tp in type_params {
+                        let tp_type = tp
+                            .constraint
+                            .as_ref()
+                            .map(|c| self.resolve_type_annotation(c))
+                            .unwrap_or(Type::Unknown);
+                        self.type_param_types.insert(tp.name.clone(), tp_type);
+                    }
+                }
+
                 let param_types: Vec<Type> = params
                     .iter()
                     .map(|p| {
@@ -180,6 +240,16 @@ impl TypeChecker {
 
                 self.define(name.clone(), func_type, true);
 
+                // Register generic function signature for call-site inference
+                if is_generic {
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_functions.insert(
+                        name.clone(),
+                        (tp_names, param_types.clone(), ret_type.clone()),
+                    );
+                }
+
                 self.push_scope();
                 let prev_return_type = self.current_return_type.clone();
                 self.current_return_type = Some(ret_type.clone());
@@ -192,6 +262,7 @@ impl TypeChecker {
                     self.check_statement(stmt)?;
                 }
 
+                self.type_param_types = prev_type_params;
                 self.current_return_type = prev_return_type;
                 self.pop_scope();
                 Ok(())
@@ -344,19 +415,110 @@ impl TypeChecker {
                 Ok(())
             }
 
+            StmtKind::EnumDecl { name, members } => {
+                // Register enum as an object type with member fields
+                let mut field_types = Vec::new();
+                let mut next_index: f64 = 0.0;
+                for member in members {
+                    let member_type = match &member.value {
+                        Some(EnumValue::String(_)) => Type::String,
+                        Some(EnumValue::Number(_)) => Type::Number,
+                        None => {
+                            next_index += 1.0;
+                            Type::Number
+                        }
+                    };
+                    if let Some(EnumValue::Number(n)) = &member.value {
+                        next_index = n + 1.0;
+                    }
+                    field_types.push((member.name.clone(), member_type));
+                }
+                let enum_type = Type::Object {
+                    fields: field_types,
+                };
+                self.define(name.clone(), enum_type, true);
+                Ok(())
+            }
+
+            StmtKind::TypeAlias {
+                name,
+                type_params,
+                type_ann,
+            } => {
+                // Register the alias for use in resolve_type_annotation
+                self.type_aliases.insert(name.clone(), type_ann.clone());
+                // For non-generic aliases, resolve and register immediately
+                if type_params.is_empty() {
+                    let resolved = self.resolve_type_annotation(type_ann);
+                    self.interface_types.insert(name.clone(), resolved);
+                } else {
+                    // Generic type alias — store type param names for later resolution
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_type_aliases
+                        .insert(name.clone(), (tp_names, type_ann.clone()));
+                }
+                Ok(())
+            }
+
             StmtKind::If {
                 condition,
                 then_branch,
                 else_branch,
             } => {
                 self.check_expr(condition)?;
+
+                // Detect typeof narrowing: typeof x === "type" / typeof x !== "type"
+                let narrowing = Self::detect_typeof_narrowing(condition).and_then(
+                    |(var_name, type_str, is_eq)| {
+                        if let Some(Type::Union(variants)) = self.lookup(&var_name) {
+                            let target = Self::type_string_to_type(&type_str);
+                            let remaining: Vec<Type> = variants
+                                .iter()
+                                .filter(|v| !Self::is_same_type_category(v, &target))
+                                .cloned()
+                                .collect();
+                            Some((var_name, target, remaining, is_eq))
+                        } else {
+                            None
+                        }
+                    },
+                );
+
                 self.push_scope();
+                if let Some((ref var_name, ref target, ref remaining, is_eq)) = narrowing {
+                    // In then-branch: narrow to matched type (=== → target, !== → remaining)
+                    if is_eq {
+                        self.define(var_name.clone(), target.clone(), false);
+                    } else if remaining.len() == 1 {
+                        self.define(var_name.clone(), remaining[0].clone(), false);
+                    } else if !remaining.is_empty() {
+                        self.define(var_name.clone(), Type::Union(remaining.clone()), false);
+                    }
+                }
                 for stmt in then_branch {
                     self.check_statement(stmt)?;
                 }
                 self.pop_scope();
+
                 if let Some(else_stmts) = else_branch {
                     self.push_scope();
+                    if let Some((ref var_name, ref target, ref remaining, is_eq)) = narrowing {
+                        // In else-branch: narrow to the complement
+                        if is_eq {
+                            if remaining.len() == 1 {
+                                self.define(var_name.clone(), remaining[0].clone(), false);
+                            } else if !remaining.is_empty() {
+                                self.define(
+                                    var_name.clone(),
+                                    Type::Union(remaining.clone()),
+                                    false,
+                                );
+                            }
+                        } else {
+                            self.define(var_name.clone(), target.clone(), false);
+                        }
+                    }
                     for stmt in else_stmts {
                         self.check_statement(stmt)?;
                     }
@@ -673,6 +835,25 @@ impl TypeChecker {
                         }
                         Ok(Type::Unknown)
                     }
+                    Type::Tuple(elements) => {
+                        // Tuple indexing with numeric literal: pair[0], pair[1]
+                        if let ExprKind::NumberLiteral(n) = &index.kind {
+                            let idx = *n as usize;
+                            if idx < elements.len() {
+                                return Ok(elements[idx].clone());
+                            }
+                            return Err(CompileError::error(
+                                format!(
+                                    "Tuple index {} out of bounds for tuple of length {}",
+                                    idx,
+                                    elements.len()
+                                ),
+                                expr.span.clone(),
+                            ));
+                        }
+                        // Dynamic index on tuple — return unknown
+                        Ok(Type::Unknown)
+                    }
                     _ => Ok(Type::Unknown),
                 }
             }
@@ -761,6 +942,23 @@ impl TypeChecker {
                                 }
                             }
                         }
+                    }
+                }
+
+                // Special case: calls to generic functions — skip strict param assignability
+                if let ExprKind::Identifier(fn_name) = &callee.kind {
+                    if self.generic_functions.contains_key(fn_name.as_str()) {
+                        // Just check that args are valid expressions; constraint
+                        // validation is done at codegen time via monomorphization
+                        for arg in args {
+                            self.check_expr(arg)?;
+                        }
+                        // Return the function's declared return type
+                        let callee_type = self.check_expr(callee)?;
+                        if let Type::Function { return_type, .. } = &callee_type {
+                            return Ok(*return_type.clone());
+                        }
+                        return Ok(Type::Unknown);
                     }
                 }
 
@@ -1139,6 +1337,33 @@ impl TypeChecker {
                 }
                 Ok(Type::Number)
             }
+
+            ExprKind::TypeAssertion {
+                expr: inner,
+                target_type,
+            } => {
+                // Type-check the inner expression (for side effects / error detection)
+                self.check_expr(inner)?;
+                // Return the asserted type — trust the programmer
+                Ok(self.resolve_type_annotation(target_type))
+            }
+
+            ExprKind::Satisfies {
+                expr: inner,
+                target_type,
+            } => {
+                // Check inner expression and verify it's assignable to target
+                let inner_type = self.check_expr(inner)?;
+                let target = self.resolve_type_annotation(target_type);
+                if !self.is_assignable(&inner_type, &target) {
+                    return Err(CompileError::error(
+                        format!("Type '{}' does not satisfy '{}'", inner_type, target),
+                        expr.span.clone(),
+                    ));
+                }
+                // satisfies returns the original (narrower) type, not the target
+                Ok(inner_type)
+            }
         }
     }
 
@@ -1444,6 +1669,36 @@ impl TypeChecker {
         if from == &Type::Unknown || to == &Type::Unknown {
             return true;
         }
+        // Literal types are subtypes of their primitive types
+        if let Type::StringLiteral(_) = from {
+            if matches!(to, Type::String) {
+                return true;
+            }
+        }
+        if let Type::NumberLiteral(_) = from {
+            if matches!(to, Type::Number) {
+                return true;
+            }
+        }
+        // Primitives accept their literal types as targets too (for widening)
+        if matches!(from, Type::String) {
+            if matches!(to, Type::StringLiteral(_)) {
+                return true;
+            }
+        }
+        if matches!(from, Type::Number) {
+            if matches!(to, Type::NumberLiteral(_)) {
+                return true;
+            }
+        }
+        // A value is assignable TO a union if it's assignable to any variant
+        if let Type::Union(variants) = to {
+            return variants.iter().any(|v| self.is_assignable(from, v));
+        }
+        // A union is assignable FROM if all variants are assignable to the target
+        if let Type::Union(variants) = from {
+            return variants.iter().all(|v| self.is_assignable(v, to));
+        }
         // Object structural compatibility: from has all fields of to
         if let (
             Type::Object {
@@ -1499,6 +1754,16 @@ impl TypeChecker {
             let ret_ok = self.is_assignable(from_ret, to_ret);
             return params_ok && ret_ok;
         }
+        // Tuple structural compatibility: same length, each element assignable
+        if let (Type::Tuple(from_elems), Type::Tuple(to_elems)) = (from, to) {
+            if from_elems.len() != to_elems.len() {
+                return false;
+            }
+            return from_elems
+                .iter()
+                .zip(to_elems.iter())
+                .all(|(f, t)| self.is_assignable(f, t));
+        }
         false
     }
 
@@ -1518,7 +1783,11 @@ impl TypeChecker {
                     .collect(),
             },
             TypeAnnKind::Named(name) => {
-                // Look up interface or class type
+                // Check active type parameter substitutions first (generics)
+                if let Some(ty) = self.type_param_types.get(name) {
+                    return ty.clone();
+                }
+                // Look up type alias, interface, or class type
                 if let Some(ty) = self.interface_types.get(name) {
                     return ty.clone();
                 }
@@ -1526,6 +1795,65 @@ impl TypeChecker {
                     return ty.clone();
                 }
                 Type::Unknown
+            }
+            TypeAnnKind::Typeof(name) => {
+                // Look up the variable's type in scope
+                self.lookup(name).unwrap_or(Type::Unknown)
+            }
+            TypeAnnKind::StringLiteral(s) => Type::StringLiteral(s.clone()),
+            TypeAnnKind::NumberLiteral(n) => Type::NumberLiteral(n.to_string()),
+            TypeAnnKind::Union(variants) => {
+                let types: Vec<Type> = variants
+                    .iter()
+                    .map(|v| self.resolve_type_annotation(v))
+                    .collect();
+                Type::Union(types)
+            }
+            TypeAnnKind::Intersection(variants) => {
+                // Merge object/class fields from all variants
+                let types: Vec<Type> = variants
+                    .iter()
+                    .map(|v| self.resolve_type_annotation(v))
+                    .collect();
+                // Flatten into a single Object type by merging fields
+                let mut merged_fields: Vec<(String, Type)> = Vec::new();
+                for ty in &types {
+                    match ty {
+                        Type::Object { fields } | Type::Class { fields, .. } => {
+                            for (name, field_ty) in fields {
+                                if !merged_fields.iter().any(|(n, _)| n == name) {
+                                    merged_fields.push((name.clone(), field_ty.clone()));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if merged_fields.is_empty() {
+                    Type::Intersection(types)
+                } else {
+                    Type::Object {
+                        fields: merged_fields,
+                    }
+                }
+            }
+            TypeAnnKind::Keyof(inner) => {
+                // Resolve inner type, extract field names as string literal union
+                let inner_type = self.resolve_type_annotation(inner);
+                match &inner_type {
+                    Type::Object { fields } | Type::Class { fields, .. } => {
+                        let literals: Vec<Type> = fields
+                            .iter()
+                            .map(|(name, _)| Type::StringLiteral(name.clone()))
+                            .collect();
+                        if literals.len() == 1 {
+                            literals.into_iter().next().unwrap()
+                        } else {
+                            Type::Union(literals)
+                        }
+                    }
+                    _ => Type::String, // fallback
+                }
             }
             TypeAnnKind::FunctionType {
                 params,
@@ -1537,6 +1865,67 @@ impl TypeChecker {
                     .collect(),
                 return_type: Box::new(self.resolve_type_annotation(return_type)),
             },
+            TypeAnnKind::Tuple(elements) => Type::Tuple(
+                elements
+                    .iter()
+                    .map(|e| self.resolve_type_annotation(e))
+                    .collect(),
+            ),
+            TypeAnnKind::Generic { name, type_args } => {
+                // Resolve generic type alias: IsNumber<number>
+                if let Some((tp_names, body)) = self.generic_type_aliases.get(name).cloned() {
+                    // Resolve type args, then substitute into the body
+                    let mut subs: HashMap<String, Type> = HashMap::new();
+                    for (tp_name, arg) in tp_names.iter().zip(type_args.iter()) {
+                        subs.insert(tp_name.clone(), self.resolve_type_annotation(arg));
+                    }
+                    // Temporarily set type_param_types for the body resolution
+                    // Since resolve_type_annotation takes &self, we need a workaround:
+                    // Build a simple inline resolver for the body using the substitution map
+                    return self.resolve_generic_type_body(&body, &subs);
+                }
+                // Fall back to named type lookup
+                if let Some(ty) = self.interface_types.get(name) {
+                    return ty.clone();
+                }
+                Type::Unknown
+            }
+            TypeAnnKind::Conditional {
+                check_type,
+                extends_type,
+                true_type,
+                false_type,
+            } => {
+                let check = self.resolve_type_annotation(check_type);
+                let extends = self.resolve_type_annotation(extends_type);
+                if self.is_assignable(&check, &extends) {
+                    self.resolve_type_annotation(true_type)
+                } else {
+                    self.resolve_type_annotation(false_type)
+                }
+            }
+            TypeAnnKind::Mapped { .. } => {
+                // Mapped types produce no runtime values — resolve to Unknown
+                Type::Unknown
+            }
+            TypeAnnKind::IndexedAccess {
+                object_type,
+                index_type,
+            } => {
+                let obj = self.resolve_type_annotation(object_type);
+                let idx = self.resolve_type_annotation(index_type);
+                // T[P] where T is an object type and P is a string literal → field type
+                if let Type::Object { ref fields } = obj {
+                    if let Type::StringLiteral(ref key) = idx {
+                        for (name, ty) in fields {
+                            if name == key {
+                                return ty.clone();
+                            }
+                        }
+                    }
+                }
+                Type::Unknown
+            }
         }
     }
 
@@ -1567,5 +1956,94 @@ impl TypeChecker {
             }
         }
         None
+    }
+
+    /// Resolve a type annotation body with type parameter substitutions.
+    /// Used for generic type alias instantiation (e.g., IsNumber<number>).
+    fn resolve_generic_type_body(
+        &self,
+        ann: &TypeAnnotation,
+        subs: &HashMap<String, Type>,
+    ) -> Type {
+        match &ann.kind {
+            TypeAnnKind::Named(name) => {
+                if let Some(ty) = subs.get(name) {
+                    return ty.clone();
+                }
+                self.resolve_type_annotation(ann)
+            }
+            TypeAnnKind::Conditional {
+                check_type,
+                extends_type,
+                true_type,
+                false_type,
+            } => {
+                let check = self.resolve_generic_type_body(check_type, subs);
+                let extends = self.resolve_generic_type_body(extends_type, subs);
+                if self.is_assignable(&check, &extends) {
+                    self.resolve_generic_type_body(true_type, subs)
+                } else {
+                    self.resolve_generic_type_body(false_type, subs)
+                }
+            }
+            // For other kinds, delegate to the normal resolver (subs won't apply)
+            _ => self.resolve_type_annotation(ann),
+        }
+    }
+
+    /// Detect `typeof x === "type"` or `typeof x !== "type"` pattern.
+    /// Returns (variable_name, type_string, is_equality).
+    fn detect_typeof_narrowing(condition: &Expr) -> Option<(String, String, bool)> {
+        if let ExprKind::Binary { left, op, right } = &condition.kind {
+            if matches!(op, BinOp::StrictEqual | BinOp::StrictNotEqual) {
+                let is_eq = *op == BinOp::StrictEqual;
+                // typeof x === "type"
+                if let ExprKind::Typeof { operand } = &left.kind {
+                    if let ExprKind::Identifier(name) = &operand.kind {
+                        if let ExprKind::StringLiteral(type_str) = &right.kind {
+                            return Some((name.clone(), type_str.clone(), is_eq));
+                        }
+                    }
+                }
+                // "type" === typeof x
+                if let ExprKind::Typeof { operand } = &right.kind {
+                    if let ExprKind::Identifier(name) = &operand.kind {
+                        if let ExprKind::StringLiteral(type_str) = &left.kind {
+                            return Some((name.clone(), type_str.clone(), is_eq));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Map a typeof string to a Type.
+    fn type_string_to_type(s: &str) -> Type {
+        match s {
+            "number" => Type::Number,
+            "string" => Type::String,
+            "boolean" => Type::Boolean,
+            "object" => Type::Object { fields: Vec::new() },
+            "function" => Type::Function {
+                params: Vec::new(),
+                return_type: Box::new(Type::Void),
+            },
+            _ => Type::Unknown,
+        }
+    }
+
+    /// Check if a type matches the same category as a target (for narrowing filtering).
+    fn is_same_type_category(ty: &Type, target: &Type) -> bool {
+        matches!(
+            (ty, target),
+            (
+                Type::Number | Type::NumberLiteral(_),
+                Type::Number | Type::NumberLiteral(_)
+            ) | (
+                Type::String | Type::StringLiteral(_),
+                Type::String | Type::StringLiteral(_)
+            ) | (Type::Boolean, Type::Boolean)
+        )
     }
 }

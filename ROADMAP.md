@@ -1,6 +1,6 @@
 # tscc Roadmap
 
-**Current status: 195 tests passing, 44 pending — 82% of test suite**
+**Current status: 213 tests passing, 26 pending — 89% of test suite**
 
 Features are grouped by implementation effort. Items within each tier are roughly ordered by value/effort ratio.
 
@@ -26,12 +26,12 @@ Small, self-contained changes. Each typically touches 1–3 files.
 
 ### Type-Only Features
 These require only parser/checker changes — zero LLVM codegen.
-- [ ] Type aliases — `type ID = string | number`
-- [ ] Type assertions — `x as string` *(parse and discard; return inner expr)*
-- [ ] `satisfies` operator — `"red" satisfies Colors` *(type-check only)*
-- [ ] `as const` — `[1, 2, 3] as const` *(treat as identity)*
-- [ ] `readonly` modifier — `readonly host: string`
-- [ ] `typeof` in type position — `let y: typeof x`
+- [x] Type aliases — `type ID = string | number` *(parser + checker; test blocked on union types)*
+- [x] Type assertions — `x as string` *(parse and discard; return inner expr)*
+- [x] `satisfies` operator — `"red" satisfies Colors` *(type-check only; test blocked on union types)*
+- [x] `as const` — `[1, 2, 3] as const` *(treat as identity)*
+- [x] `readonly` modifier — `readonly host: string`
+- [x] `typeof` in type position — `let y: typeof x`
 
 ### Small Language Features
 - [ ] Function expressions — `let f = function(x) { return x }` *(same as arrow, different keyword)*
@@ -44,9 +44,9 @@ These require only parser/checker changes — zero LLVM codegen.
 
 Each requires a new AST node and coordinated changes across parser → checker → codegen.
 
-- [ ] **Enums (numeric)** — `enum Color { Red, Green, Blue }`
-- [ ] **Enums (string)** — `enum Direction { Up = "UP", Down = "DOWN" }`
-- [ ] **Union types** — `string | number` *(type checker; codegen uses widest type)*
+- [x] **Enums (numeric)** — `enum Color { Red, Green, Blue }`
+- [x] **Enums (string)** — `enum Direction { Up = "UP", Down = "DOWN" }`
+- [x] **Union types** — `string | number` *(type checker; codegen uses widest type)*
 - [ ] **`try`/`catch`** — `try { ... } catch (e) { ... }` *(setjmp-based or LLVM landingpad)*
 - [ ] **`try`/`finally`** — `try { ... } finally { ... }`
 - [ ] **Function hoisting** — calling a function before its declaration *(pre-scan pass in checker)*
@@ -54,11 +54,11 @@ Each requires a new AST node and coordinated changes across parser → checker �
 - [ ] **`import * as`** — `import * as math from "./math"`
 - [ ] **Re-exports** — `export { foo } from "./bar"`
 - [ ] **Labeled statements** — `outer: for (...) { break outer }`
-- [ ] **Tuple types** — `[number, string]` *(fixed-length array with typed positions)*
+- [x] **Tuple types** — `[number, string]` *(fixed-length array with typed positions)*
 - [ ] **`JSON.stringify()`** — `JSON.stringify({ a: 1 })` *(runtime C function)*
-- [ ] **Intersection types** — `Named & Aged`
-- [ ] **String literal types** — `type Dir = "up" | "down"`
-- [ ] **Type narrowing** — `if (typeof val === "string") { ... }`
+- [x] **Intersection types** — `Named & Aged`
+- [x] **String literal types** — `type Dir = "up" | "down"`
+- [x] **Type narrowing** — `if (typeof val === "string") { ... }`
 
 ---
 
@@ -66,14 +66,14 @@ Each requires a new AST node and coordinated changes across parser → checker �
 
 Significant design work. Each could be a multi-session effort.
 
-- [ ] **Generics** — `function identity<T>(x: T): T` *(type parameter substitution throughout pipeline)*
-- [ ] **Generic constraints** — `<T extends { length: number }>`
+- [x] **Generics** — `function identity<T>(x: T): T` *(monomorphization at call sites)*
+- [x] **Generic constraints** — `<T extends { length: number }>`
 - [ ] **`Map`** — `new Map<string, number>()` *(runtime hash map)*
 - [ ] **`Set`** — `new Set([1, 2, 3])` *(runtime hash set)*
 - [ ] **`RegExp`** — `/hello/.test("hello world")` *(link against PCRE or re2)*
-- [ ] **`keyof`** — `keyof Point`
-- [ ] **Conditional types** — `T extends number ? "yes" : "no"`
-- [ ] **Mapped types** — `{ [P in keyof T]: T[P] }`
+- [x] **`keyof`** — `keyof Point`
+- [x] **Conditional types** — `T extends number ? "yes" : "no"`
+- [x] **Mapped types** — `{ [P in keyof T]: T[P] }`
 
 ---
 

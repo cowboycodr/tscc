@@ -153,7 +153,7 @@ impl Scanner {
                 if self.match_char('&') {
                     self.add_token(Token::AmpersandAmpersand);
                 } else {
-                    return Err(self.error("Unexpected character '&'. Did you mean '&&'?"));
+                    self.add_token(Token::Ampersand);
                 }
             }
 
@@ -161,7 +161,7 @@ impl Scanner {
                 if self.match_char('|') {
                     self.add_token(Token::PipePipe);
                 } else {
-                    return Err(self.error("Unexpected character '|'. Did you mean '||'?"));
+                    self.add_token(Token::Pipe);
                 }
             }
 
@@ -303,6 +303,7 @@ impl Scanner {
             "extends" => Token::Extends,
             "super" => Token::Super,
             "interface" => Token::Interface,
+            "enum" => Token::Enum,
             "constructor" => Token::Constructor,
             _ => Token::Identifier(text),
         };

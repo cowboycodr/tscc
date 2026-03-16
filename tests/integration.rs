@@ -1689,7 +1689,6 @@ printPoint({ x: 1, y: 2 })
     // --- Type system features ---
 
     #[test]
-    #[ignore = "union types not implemented"]
     fn union_type() {
         let src = r#"
 function format(val: string | number): string {
@@ -1705,7 +1704,6 @@ console.log(format("hi"))
     }
 
     #[test]
-    #[ignore = "type aliases not implemented"]
     fn type_alias() {
         let src = r#"
 type ID = string | number
@@ -1716,7 +1714,6 @@ console.log(id)
     }
 
     #[test]
-    #[ignore = "enums not implemented"]
     fn enum_basic() {
         let src = r#"
 enum Color {
@@ -1731,7 +1728,6 @@ console.log(Color.Green)
     }
 
     #[test]
-    #[ignore = "enums not implemented"]
     fn enum_string() {
         let src = r#"
 enum Direction {
@@ -1744,7 +1740,6 @@ console.log(Direction.Up)
     }
 
     #[test]
-    #[ignore = "generics not implemented"]
     fn generic_function() {
         let src = r#"
 function identity<T>(x: T): T {
@@ -1757,7 +1752,6 @@ console.log(identity("hi"))
     }
 
     #[test]
-    #[ignore = "generics not implemented"]
     fn generic_constraint() {
         let src = r#"
 function getLength<T extends { length: number }>(x: T): number {
@@ -1770,7 +1764,6 @@ console.log(getLength([1, 2, 3]))
     }
 
     #[test]
-    #[ignore = "tuple types not implemented"]
     fn tuple_type() {
         let src = r#"
 let pair: [number, string] = [1, "one"]
@@ -1780,7 +1773,6 @@ console.log(pair[0], pair[1])
     }
 
     #[test]
-    #[ignore = "type assertions not implemented"]
     fn type_assertion() {
         let src = r#"
 let x: any = "hello"
@@ -2026,7 +2018,6 @@ p.then(v => console.log(v))
     // --- Misc TypeScript features ---
 
     #[test]
-    #[ignore = "type narrowing not implemented"]
     fn type_narrowing() {
         let src = r#"
 function process(val: string | number): void {
@@ -2043,7 +2034,6 @@ process(41)
     }
 
     #[test]
-    #[ignore = "string literal types not implemented"]
     fn string_literal_type() {
         let src = r#"
 type Direction = "up" | "down" | "left" | "right"
@@ -2054,7 +2044,6 @@ console.log(d)
     }
 
     #[test]
-    #[ignore = "intersection types not implemented"]
     fn intersection_type() {
         let src = r#"
 interface Named {
@@ -2071,7 +2060,6 @@ console.log(p.name, p.age)
     }
 
     #[test]
-    #[ignore = "readonly not implemented"]
     fn readonly_property() {
         let src = r#"
 interface Config {
@@ -2085,7 +2073,6 @@ console.log(cfg.host)
     }
 
     #[test]
-    #[ignore = "keyof not implemented"]
     fn keyof_operator() {
         let src = r#"
 interface Point {
@@ -2100,7 +2087,6 @@ console.log(k)
     }
 
     #[test]
-    #[ignore = "conditional types not implemented"]
     fn conditional_type() {
         let src = r#"
 type IsNumber<T> = T extends number ? "yes" : "no"
@@ -2111,7 +2097,6 @@ console.log(x)
     }
 
     #[test]
-    #[ignore = "mapped types not implemented"]
     fn mapped_type() {
         let src = r#"
 type Readonly<T> = {
@@ -2122,7 +2107,6 @@ type Readonly<T> = {
     }
 
     #[test]
-    #[ignore = "typeof in type position not implemented"]
     fn typeof_type_operator() {
         let src = r#"
 let x = 42
@@ -2133,7 +2117,6 @@ console.log(y)
     }
 
     #[test]
-    #[ignore = "satisfies operator not implemented"]
     fn satisfies_operator() {
         let src = r#"
 type Colors = "red" | "green" | "blue"
@@ -2144,7 +2127,6 @@ console.log(c)
     }
 
     #[test]
-    #[ignore = "as const not implemented"]
     fn as_const() {
         let src = r#"
 let x = [1, 2, 3] as const
