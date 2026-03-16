@@ -1158,6 +1158,27 @@ mod globals {
     fn parse_float_integer() {
         assert_eq!(run_ts(r#"console.log(parseFloat("42"))"#), "42\n");
     }
+
+    #[test]
+    fn crypto_random_uuid_length() {
+        // UUID v4 is always exactly 36 characters: 8-4-4-4-12 + 4 hyphens
+        assert_eq!(run_ts("console.log(crypto.randomUUID().length)"), "36\n");
+    }
+
+    #[test]
+    fn crypto_random_uuid_version_nibble() {
+        // The 13th character (index 14, after "xxxxxxxx-xxxx-") is always '4' (version 4)
+        assert_eq!(run_ts("console.log(crypto.randomUUID().charAt(14))"), "4\n");
+    }
+
+    #[test]
+    fn crypto_random_uuid_unique() {
+        // Two calls must produce different values
+        assert_eq!(
+            run_ts("console.log(crypto.randomUUID() === crypto.randomUUID())"),
+            "false\n"
+        );
+    }
 }
 
 // ============================================================

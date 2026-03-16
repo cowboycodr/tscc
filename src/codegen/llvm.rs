@@ -558,6 +558,13 @@ impl<'ctx> Codegen<'ctx> {
             i32_type.fn_type(&[ptr_type.into(), ptr_type.into(), i64_type.into()], false),
             None,
         );
+
+        // tscc_crypto_random_uuid() → {i8*, i64}  (RFC 4122 UUID v4 via CSPRNG)
+        self.module.add_function(
+            "tscc_crypto_random_uuid",
+            self.string_type.fn_type(&[], false),
+            None,
+        );
     }
 
     // --- Integer narrowing analysis ---
@@ -3980,6 +3987,68 @@ impl<'ctx> Codegen<'ctx> {
             return Ok((result, VarType::String));
         }
 
+        // String equality / inequality: compare lengths then bytes with memcmp
+        if matches!(left_vt, VarType::String) && matches!(right_vt, VarType::String) {
+            if matches!(
+                op,
+                BinOp::Equal | BinOp::StrictEqual | BinOp::NotEqual | BinOp::StrictNotEqual
+            ) {
+                let ls = left_val.into_struct_value();
+                let rs = right_val.into_struct_value();
+                let lp = self
+                    .builder
+                    .build_extract_value(ls, 0, "lp")
+                    .unwrap()
+                    .into_pointer_value();
+                let ll = self
+                    .builder
+                    .build_extract_value(ls, 1, "ll")
+                    .unwrap()
+                    .into_int_value();
+                let rp = self
+                    .builder
+                    .build_extract_value(rs, 0, "rp")
+                    .unwrap()
+                    .into_pointer_value();
+                let rl = self
+                    .builder
+                    .build_extract_value(rs, 1, "rl")
+                    .unwrap()
+                    .into_int_value();
+
+                // First compare lengths
+                let len_eq = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, ll, rl, "seq_len")
+                    .unwrap();
+
+                // If lengths match, compare bytes with memcmp
+                let memcmp_fn = self.module.get_function("memcmp").unwrap();
+                let cmp_result = self
+                    .builder
+                    .build_call(memcmp_fn, &[lp.into(), rp.into(), ll.into()], "smemcmp")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+                    .into_int_value();
+                let zero_i32 = self.context.i32_type().const_int(0, false);
+                let bytes_eq = self
+                    .builder
+                    .build_int_compare(IntPredicate::EQ, cmp_result, zero_i32, "seq_bytes")
+                    .unwrap();
+
+                // Both length and bytes must match
+                let str_eq = self.builder.build_and(len_eq, bytes_eq, "seq").unwrap();
+
+                let result = match op {
+                    BinOp::Equal | BinOp::StrictEqual => str_eq.into(),
+                    _ => self.builder.build_not(str_eq, "sne").unwrap().into(),
+                };
+                return Ok((result, VarType::Boolean));
+            }
+        }
+
         // Integer operations (narrowed from f64 → i64)
         if matches!(left_vt, VarType::Integer) && matches!(right_vt, VarType::Integer) {
             let li = left_val.into_int_value();
@@ -4260,6 +4329,30 @@ impl<'ctx> Codegen<'ctx> {
                 // Number static methods
                 if name == "Number" {
                     return self.compile_number_static_call(property, args, function, span);
+                }
+                // crypto.*
+                if name == "crypto" {
+                    if property == "randomUUID" {
+                        if !args.is_empty() {
+                            return Err(CompileError::error(
+                                "crypto.randomUUID() takes no arguments",
+                                span.clone(),
+                            ));
+                        }
+                        let f = self.module.get_function("tscc_crypto_random_uuid").unwrap();
+                        let result = self
+                            .builder
+                            .build_call(f, &[], "uuid")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap();
+                        return Ok((result, VarType::String));
+                    }
+                    return Err(CompileError::error(
+                        format!("crypto.{} is not implemented", property),
+                        span.clone(),
+                    ));
                 }
             }
 

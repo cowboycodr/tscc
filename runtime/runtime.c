@@ -5,6 +5,15 @@
 #include <ctype.h>
 #include <time.h>
 
+/* Platform-specific headers for CSPRNG (used by crypto.randomUUID()) */
+#if defined(_WIN32) || defined(_WIN64)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#elif defined(__linux__)
+#  include <sys/syscall.h>
+#  include <unistd.h>
+#endif
+
 // ============================================================
 // String type
 // ============================================================
@@ -543,4 +552,52 @@ double tscc_parseFloat(char* data, long long len) {
     double val = strtod(p, &endptr);
     if (endptr == p) return NAN;
     return val;
+}
+
+// ============================================================
+// Crypto
+// ============================================================
+
+/* Fill buf with len cryptographically secure random bytes.
+ *
+ * Windows       – BCryptGenRandom via dynamic load (bcrypt.dll, guaranteed
+ *                 present on Vista+); no extra link flags needed.
+ * macOS / BSDs  – arc4random_buf (stdlib.h, already included, no seeding).
+ * Linux 3.17+   – getrandom() syscall (SYS_getrandom).
+ * Other Unix    – /dev/urandom fallback.
+ */
+static void tscc_csprng_fill(unsigned char* buf, size_t len) {
+#if defined(_WIN32) || defined(_WIN64)
+    typedef long (__stdcall *pBCryptGenRandom)(void*, unsigned char*, unsigned long, unsigned long);
+    HMODULE h = LoadLibraryA("bcrypt.dll");
+    if (h) {
+        pBCryptGenRandom fn = (pBCryptGenRandom)GetProcAddress(h, "BCryptGenRandom");
+        if (fn) fn(NULL, buf, (unsigned long)len, 2); /* 2 = BCRYPT_USE_SYSTEM_PREFERRED_RNG */
+        FreeLibrary(h);
+    }
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(buf, len);
+#elif defined(__linux__) && defined(SYS_getrandom)
+    if (syscall(SYS_getrandom, buf, (long)len, 0L) == (long)len) return;
+    /* fallthrough: getrandom unavailable, use /dev/urandom */
+    { FILE* f = fopen("/dev/urandom", "rb"); if (f) { fread(buf, 1, len, f); fclose(f); } }
+#else
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (f) { fread(buf, 1, len, f); fclose(f); }
+#endif
+}
+
+/* crypto.randomUUID() — RFC 4122 UUID v4 */
+MgString tscc_crypto_random_uuid(void) {
+    unsigned char b[16];
+    tscc_csprng_fill(b, 16);
+    b[6] = (b[6] & 0x0f) | 0x40;  /* version 4          */
+    b[8] = (b[8] & 0x3f) | 0x80;  /* variant 10xx (RFC) */
+    char* buf = (char*)malloc(37);
+    snprintf(buf, 37,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+        b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+    MgString s; s.data = buf; s.len = 36;
+    return s;
 }

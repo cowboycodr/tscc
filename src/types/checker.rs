@@ -63,6 +63,8 @@ impl TypeChecker {
         self.define("console".to_string(), Type::Unknown, true);
         // Math (special object)
         self.define("Math".to_string(), Type::Unknown, true);
+        // crypto (Web Crypto API — only randomUUID() implemented)
+        self.define("crypto".to_string(), Type::Unknown, true);
         // Number (special object with static methods)
         self.define("Number".to_string(), Type::Unknown, true);
         // NaN global constant
