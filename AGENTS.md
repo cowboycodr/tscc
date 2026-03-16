@@ -14,9 +14,10 @@ export LIBRARY_PATH="/opt/homebrew/lib:$LIBRARY_PATH"
 ```sh
 cargo build                          # dev build
 cargo build --release                # optimized build
-cargo test                           # all tests (~232 pass, ~16 ignored)
-cargo test test_name                 # single test by name
+cargo test                           # all tests (238 pass, 16 ignored)
+cargo test test_name                 # single test by name substring
 cargo test module::test_name         # e.g. cargo test variables::let_with_number
+cargo test arithmetic::postfix       # e.g. all postfix tests
 cargo test -- --ignored              # run only ignored (unimplemented) tests
 ```
 
@@ -36,17 +37,17 @@ src/
 ├── modules.rs          # Multi-file import resolution, topological sort
 ├── lexer/
 │   ├── token.rs        # Token enum (~90 variants), Span, SpannedToken
-│   └── scanner.rs      # Hand-written character-by-character scanner
+│   └── scanner.rs      # Hand-written character-by-character scanner (~570 lines)
 ├── parser/
-│   ├── ast.rs          # StmtKind, ExprKind, BinOp, TypeAnnotation, etc.
-│   └── parser.rs       # Recursive descent + Pratt precedence climbing
+│   ├── ast.rs          # StmtKind, ExprKind, BinOp, TypeAnnotation, etc. (~410 lines)
+│   └── parser.rs       # Recursive descent + Pratt precedence climbing (~2,420 lines)
 ├── types/
 │   ├── ty.rs           # Type enum: Number, String, Boolean, Array, Function, ...
-│   └── checker.rs      # Structural type checking, scope stack, symbol tables
+│   └── checker.rs      # Structural type checking, scope stack, symbol tables (~2,290 lines)
 └── codegen/
-    └── llvm.rs         # LLVM IR generation via inkwell (~2400 lines, largest file)
+    └── llvm.rs         # LLVM IR generation via inkwell (~7,700 lines, largest file)
 runtime/
-└── runtime.c           # C runtime linked into every binary (print, string, math, arrays)
+└── runtime.c           # C runtime linked into every binary (~546 lines)
 tests/
 └── integration.rs      # End-to-end tests: compile TS source → run binary → check stdout
 ```
@@ -55,9 +56,9 @@ tests/
 
 Every feature touches multiple pipeline stages. Follow this order:
 
-1. **token.rs** — Add new `Token` variant if new syntax
+1. **token.rs** — Add new `Token` variant if new syntax is needed
 2. **scanner.rs** — Recognize the token in `scan_token()` match
-3. **ast.rs** — Add `StmtKind`/`ExprKind` variant (or `BinOp`, etc.)
+3. **ast.rs** — Add `StmtKind`/`ExprKind` variant (or extend an existing one)
 4. **parser.rs** — Parse the syntax; respect precedence chain:
    `assignment → ternary → logical_or → ... → multiplicative → exponentiation → unary → postfix → call → primary`
 5. **checker.rs** — Type-check in `check_statement()` or `check_expr()`
@@ -65,11 +66,11 @@ Every feature touches multiple pipeline stages. Follow this order:
 7. **runtime.c** — Add C functions if needed, then declare them in `declare_runtime_functions()`
 8. **integration.rs** — Add or un-ignore tests
 
-Rust's exhaustive matching will error on any missed match arm — use compiler errors as a checklist.
+Rust's exhaustive matching will flag every missed match arm — use compiler errors as a checklist.
 
 ## Code Style
 
-**Imports** — Three groups, separated by blank lines:
+**Imports** — Three groups separated by blank lines:
 ```rust
 use std::collections::HashMap;        // 1. std
 
@@ -82,53 +83,63 @@ use crate::parser::ast::*;
 **Naming:**
 - Types/enums: `PascalCase` — `Token`, `StmtKind`, `VarType`, `CompileError`
 - Functions/methods: `snake_case` — `compile_expr`, `scan_tokens`, `check_statement`
-- Variables: `snake_case`, short names common — `vt` (var type), `bb` (basic block), `fn_name`
-- Private by default; `pub` only on API boundaries (`lib.rs`, module `mod.rs` re-exports)
+- Variables: `snake_case`, short names common in codegen — `vt` (var type), `bb` (basic block)
+- Private by default; `pub` only on API boundaries (`lib.rs`, module re-exports)
 
 **Error handling:**
 ```rust
-// Create errors with span for source location
+// Always include a Span for source-location display
 Err(CompileError::error("message", expr.span.clone()))
 Err(CompileError::error("msg", span.clone()).with_hint("try this"))
 
-// Propagate with ?; convert with map_err at API boundaries
+// Propagate with ?; map_err at API boundaries only
 let tokens = Scanner::new(src).scan_tokens().map_err(|e| {
     report_error(src, filename, &e);
     format!("Lexer error: {}", e.message)
 })?;
 ```
 
-Every `CompileError` carries a `Span` (start, end, line, column) for source-location error display.
-
-**Match expressions** — Always exhaustive. When adding a new enum variant, fix every match site.
+**Match expressions** — Always exhaustive. Adding a new enum variant must fix every match site.
 
 ## Key Codegen Patterns
 
 **VarType** tracks LLVM representation at compile time:
 - `Number` = f64, `Integer` = i64, `String` = `{i8*, i64}`, `Boolean` = i1
 - `Array` = `{double*, i64, i64}` (data, length, capacity)
-- `FunctionPtr { fn_name }` = opaque ptr (arrow functions)
+- `ObjArray { elem_vt }` = `{void**, i64, i64}` (array of heap-allocated objects)
+- `Map { val_vt }` = opaque pointer to `MgMap` C struct
+- `FunctionPtr { fn_name }` = opaque ptr (arrow functions / closures)
+- `Object { struct_type_name, fields }` = named LLVM struct
+- `Class { name, fields }` = same layout, distinct semantic type
 
 **Scope stack** for variables: `Vec<HashMap<String, (PointerValue, VarType)>>`
 — push on block entry, pop on exit, walk in reverse for lookup.
 
-**Integer narrowing** — Analysis pass (`analyze_integer_functions`) detects functions where all
-number ops are integer-safe (no division, no floats). These compile as i64 instead of f64,
-enabling LLVM to produce faster code (matches native Rust on fib(40)).
+**Integer narrowing** — `analyze_integer_functions()` detects functions where all number ops
+are integer-safe (no division, no float literals). Those compile as i64 not f64, enabling
+LLVM's integer optimizations (matches native Rust on `fib(40)`).
 
 **Loop context stack** — `Vec<LoopContext>` with `exit_bb` and `continue_bb` for break/continue.
-After break/continue, create a dead basic block to absorb unreachable code.
+After break/continue, append a dead basic block to absorb any unreachable instructions.
 
-**Two-pass function compilation** — First pass: declare all functions (so they can call each other).
-Second pass: compile top-level code (main function).
+**Two-pass function compilation** — First pass declares all functions so mutual calls work.
+Second pass compiles top-level statements into `main`.
+
+**compile_update()** — Handles `++`/`--` on any lvalue: `Identifier` (load/inc/dec/store),
+`IndexAccess` on Array (GEP into data pointer), `IndexAccess` on Object (compile-time memcmp
+comparison chain over all struct fields; silent no-op on no match), `Member` (struct_gep).
 
 **Runtime C functions** — Must be declared in both `runtime.c` AND `declare_runtime_functions()`
-in llvm.rs with matching signatures. Struct returns >16 bytes on aarch64 use sret convention;
-prefer passing pointers to structs instead (see `tscc_array_push`).
+in `llvm.rs` with matching signatures. Structs >16 bytes on aarch64 use sret; prefer passing
+pointers instead (see `tscc_array_push`). `memcmp` from libc is also declared for string comparison.
+
+**Class field initializers** — Stored in `class_field_initializers: HashMap<String, Vec<(String, Expr)>>`.
+`run_field_initializers()` emits them (parent-first) at the start of each constructor.
 
 ## Testing Conventions
 
-Tests are end-to-end integration tests in `tests/integration.rs`:
+Tests in `tests/integration.rs` are end-to-end: compile TS source, run binary, check stdout.
+
 ```rust
 #[test]
 fn feature_name() {
@@ -136,41 +147,45 @@ fn feature_name() {
 }
 ```
 
-- `run_ts(source)` — compile + execute, return stdout as String
+- `run_ts(source)` — compile + execute, return stdout as `String`
 - `run_ts_full(source)` — return `(stdout, stderr)` tuple
-- `assert_compile_fails(source)` — verify compilation produces an error
-- Tests run in parallel; each gets a unique temp directory via atomic counter
+- `assert_compile_fails(source)` — assert compilation errors out
+- Tests run in parallel; each gets a unique temp dir via atomic counter
 - Unimplemented features: `#[ignore = "reason"]` in the `not_yet_implemented` module
-- Output format: numbers print as integers when whole (`42`), floats with `%.15g` (`3.14`);
-  booleans as `true`/`false`; arrays as `[ 1, 2, 3 ]`; multiple console.log args space-separated
-- Don't use `r#"..."#` with `\n` — it becomes literal `\n`, not newline. Use regular strings.
+- Output format: whole numbers print as integers (`42`), floats with `%.15g` (`3.14`);
+  booleans as `true`/`false`; arrays as `[ 1, 2, 3 ]`; multiple `console.log` args space-separated
+- Don't use `r#"..."#` strings with `\n` — it becomes a literal backslash-n. Use `"\n"`.
+- Tests are grouped in `mod` blocks by feature area (`arithmetic`, `variables`, `classes`, …)
 
 ## Important Gotchas
 
-- **Semicolons are optional** in tscc (lenient parsing, like TypeScript)
-- **Function hoisting is NOT supported** — type checker doesn't pre-scan declarations
-- **Import aliasing (`as`) works for functions** — `import { add as sum }` correctly registers the alias in codegen (`llvm.rs:1326`). Does NOT yet handle variable or class imports with aliases.
-- `inkwell` `AggregateValueEnum` doesn't impl `Into<BasicValueEnum>` — call `.into_struct_value().into()`
-- Template literals are desugared to string concatenation in the scanner (not a parser feature)
-- LLVM contexts are safe to create per-thread; each test gets its own
-- The C runtime source (`runtime/runtime.c`) is embedded into the binary at compile time via `include_str!()`. During linking, it is written to a temp file, compiled with `cc -O2`, linked, and cleaned up. This means tscc works from any directory without needing the source tree.
-- **Objects are LLVM struct types** — each object shape gets a unique anonymous struct. Property access is `extract_value` at a compile-time index. No runtime hash maps.
-- **Classes compile to struct types** — fields are struct fields, methods are compiled as separate functions with an implicit `self` pointer (first parameter). `new` allocates on the stack, calls the constructor, returns the struct by value.
-- **Inheritance uses struct prefix layout** — child class includes parent fields first, then own fields. If child has no constructor, parent constructor is called automatically.
-- **Interfaces are type-only** — they register a struct layout in codegen (for `type_ann_to_var_type` to resolve Named types) but generate no runtime code.
-- **`this` in methods** is a pointer to the struct, passed as the first parameter. `this.prop` compiles to `struct_gep` + load/store.
-- **Object methods** are compiled as regular LLVM functions with a `self` pointer. Method calls pass the object's alloca as the first argument.
+- **Semicolons are optional** — lenient `consume_semicolon()` never errors on a missing `;`
+- **`async`/`await` are not keywords** — `async` scans as `Identifier("async")` and is silently
+  ignored as a standalone expression statement; `await expr` parses as two statements
+- **Function hoisting is NOT supported** — functions must be declared before use
+- **Import aliasing** — `import { add as sum }` works for functions (`llvm.rs:1326`);
+  not yet implemented for variables or classes
+- `inkwell` `AggregateValueEnum` doesn't impl `Into<BasicValueEnum>` — use `.into_struct_value().into()`
+- **Template literals** are desugared to string concatenation in the scanner, not the parser
+- **Objects are LLVM structs** — property access is `extract_value` at a compile-time index;
+  dynamic string key access generates a `memcmp` comparison chain over all known fields
+- **Classes compile to structs** — methods are separate LLVM functions with an implicit `self`
+  pointer as the first parameter; `new` allocates on the stack
+- **Inheritance uses struct prefix layout** — child fields follow parent fields; if the child
+  has no constructor, the parent constructor is called automatically
+- **`this` in methods** is a pointer passed as the first argument; `this.prop` → `struct_gep` + load/store
+- **The C runtime is embedded** at `cargo build` time via `include_str!()` and compiled on-demand
+  during linking — tscc binaries need no source tree at runtime
 
 ## Known Technical Debt
 
-These are **intentional shortcuts that produce incorrect runtime behaviour** — not missing features, but things that currently compile silently and give wrong results. Each has a ROADMAP entry.
+Behaviours that compile silently but produce incorrect results at runtime:
 
-- **Class field initializers are not compiled** — `class Foo { x = 5 }` parses the `= 5` but throws it away. `ClassField` has no `initializer` field. The field is an uninitialized slot in the LLVM struct at runtime. Fix requires adding `initializer: Option<Expr>` to `ClassField` and emitting assignments at the top of the constructor body.
-
-- **Unknown/unregistered generic types silently resolve to `f64`** — Any type annotation for an unregistered generic (`Map<K,V>`, `Promise<T>`, `Set<T>`, etc.) hits the fallthrough in `type_ann_to_var_type` (`llvm.rs:5613`) and becomes `f64` with no error or warning. Code that uses these types compiles and silently produces garbage. Should emit a hard error instead.
-
-- **`var` is block-scoped, not function-scoped** — tscc treats `var` identically to `let`. JavaScript `var` hoists to function scope; tscc's `var` does not. Code that relies on `var` hoisting or function scoping will silently behave differently.
-
-- **`Type::Unknown` is universally assignable** — In `checker.rs`, `Type::Unknown` (produced by unresolved type references) is accepted as both a valid source and target in every assignability check. This means type errors from unknown types flow through silently rather than surfacing as diagnostics.
-
-- **Postfix/prefix `++`/`--` only work on simple identifiers** — `x[i]++` and `x.prop++` silently drop the operator token. The `postfix()` parser only creates an update node for `ExprKind::Identifier`. Other lvalue targets are parsed correctly but the `++`/`--` is not consumed.
+- **`var` is block-scoped** — tscc treats `var` as `let`; no hoisting, no function scope
+- **Unknown/unregistered generics silently become `f64`** — unresolved `Named` types fall
+  through `type_ann_to_var_type()` (`llvm.rs:6503`) to `VarType::Number` with no diagnostic
+- **`Type::Unknown` is universally assignable** — unresolved type references produce
+  `Type::Unknown` which passes every assignability check, masking real errors
+- **`x[i]++` / `x.prop++` on non-simple targets** — postfix/prefix update is fully supported
+  for `Identifier`, `IndexAccess`, and `Member` targets; more complex lvalue expressions
+  (e.g. `a.b.c++`) are silently treated as non-lvalue and the `++`/`--` is dropped

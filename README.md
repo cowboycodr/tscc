@@ -231,7 +231,7 @@ Early stage. 238 tests passing, 16 pending. The goal is drop-in compatibility wi
 | | `new` + constructor | :white_check_mark: | `new Point(3, 4)` |
 | | Class methods | :white_check_mark: | `p.toString()` |
 | | Class inheritance | :white_check_mark: | `class Dog extends Animal` |
-| | Class field initializers | :warning: | `class Foo { x = 5 }` — parsed, not executed |
+| | Class field initializers | :white_check_mark: | `class Foo { x = 5 }` |
 | | Interfaces | :white_check_mark: | `interface Point { x: number }` |
 | | Interface inheritance | :white_check_mark: | `interface B extends A` |
 | **Type System** | Type annotations & inference | :white_check_mark: | `let x: number`, `let y = 42` |
