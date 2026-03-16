@@ -939,6 +939,20 @@ impl Parser {
             });
         }
 
+        // Type predicate: `param is Type` — treated as boolean at runtime
+        if let TypeAnnKind::Named(_) = &base.kind {
+            if let Token::Identifier(ref kw) = self.peek_token() {
+                if kw == "is" {
+                    self.advance(); // consume 'is'
+                    self.type_annotation()?; // parse and discard the predicate type
+                    return Ok(TypeAnnotation {
+                        kind: TypeAnnKind::Boolean,
+                        span: self.span_from(&span),
+                    });
+                }
+            }
+        }
+
         // Check for union type: Type | Type | ...
         if self.check(&Token::Pipe) {
             let mut variants = vec![base];
