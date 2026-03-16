@@ -142,17 +142,17 @@ TypeScript source
     Native binary
 ```
 
-Written in Rust. Single crate. ~12,200 lines of Rust + ~370 lines of C runtime.
+Written in Rust. Single crate. ~12,600 lines of Rust + ~470 lines of C runtime.
 
 The runtime (`runtime/runtime.c`) provides print functions, string operations, math functions, and array support. It is compiled once at `cargo build` time and embedded directly into the `tscc` binary — no C toolchain is required on the user's machine to compile TypeScript files.
 
 ## Status
 
-Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+Early stage. 223 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
 
 ## TypeScript Feature Coverage
 
-**213 passing** / **26 not yet implemented** — 89% of test suite
+**223 passing** / **16 not yet implemented** — 93% of test suite
 
 ### Literals & Primitives
 
@@ -248,7 +248,7 @@ Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility wi
 | `.startsWith()` | :white_check_mark: | `"hello".startsWith("he")` |
 | `.endsWith()` | :white_check_mark: | `"hello".endsWith("lo")` |
 | `.repeat()` | :white_check_mark: | `"ab".repeat(3)` |
-| `.split()` | :x: | `"a,b,c".split(",")` |
+| `.split()` | :white_check_mark: | `"a,b,c".split(",")` |
 | `.replace()` | :white_check_mark: | `"hello".replace("l", "r")` |
 | `.padStart()` | :white_check_mark: | `"5".padStart(3, "0")` |
 
@@ -269,8 +269,8 @@ Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility wi
 | `do...while` | :white_check_mark: | `do { i++ } while (i < 5)` |
 | `switch`/`case` | :white_check_mark: | `switch (x) { case 1: ... }` |
 | `for...of` | :white_check_mark: | `for (let x of arr)` |
-| `for...in` | :x: | `for (let key in obj)` |
-| Labeled statements | :x: | `outer: for (...)` |
+| `for...in` | :white_check_mark: | `for (let key in obj)` |
+| Labeled statements | :white_check_mark: | `outer: for (...)` |
 
 ### Functions
 
@@ -287,12 +287,12 @@ Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility wi
 | Void functions | :white_check_mark: | `function sayHi(): void` |
 | Arrow (expression) | :white_check_mark: | `let add = (a, b) => a + b` |
 | Arrow (block body) | :white_check_mark: | `let f = (x) => { return x }` |
-| Function hoisting | :x: | calling before declaration |
+| Function hoisting | :white_check_mark: | calling before declaration |
 | Closures | :white_check_mark: | capturing outer variables |
 | Default parameters | :white_check_mark: | `function f(x = 10)` |
 | Rest parameters | :white_check_mark: | `function f(...args: number[])` |
 | Spread syntax | :white_check_mark: | `[...arr, 4, 5]` |
-| Function expressions | :x: | `let f = function() {}` |
+| Function expressions | :white_check_mark: | `let f = function() {}` |
 
 ### Arrays
 
@@ -342,7 +342,7 @@ Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility wi
 | `export function` | :white_check_mark: | `export function square(x) {}` |
 | `import { name }` | :white_check_mark: | `import { square } from "./math"` |
 | Multiple imports | :white_check_mark: | `import { a, b } from "./utils"` |
-| Import aliasing `as` | :x: | `import { add as sum }` |
+| Import aliasing `as` | :white_check_mark: | `import { add as sum }` |
 | Default export | :x: | `export default 42` |
 | `import * as` | :x: | `import * as math from "./math"` |
 | Re-exports | :x: | `export { foo } from "./bar"` |
@@ -406,10 +406,10 @@ Early stage. 213 tests passing, 26 pending. The goal is drop-in compatibility wi
 | `Map` | :x: | `new Map()` |
 | `Set` | :x: | `new Set([1, 2, 3])` |
 | `RegExp` | :x: | `/hello/.test("hello world")` |
-| `Number.isInteger()` | :x: | `Number.isInteger(42)` |
-| `Number.isFinite()` | :x: | `Number.isFinite(42)` |
-| `Number.isNaN()` | :x: | `Number.isNaN(NaN)` |
-| `.toFixed()` | :x: | `(3.14).toFixed(2)` |
+| `Number.isInteger()` | :white_check_mark: | `Number.isInteger(42)` |
+| `Number.isFinite()` | :white_check_mark: | `Number.isFinite(42)` |
+| `Number.isNaN()` | :white_check_mark: | `Number.isNaN(NaN)` |
+| `.toFixed()` | :white_check_mark: | `(3.14).toFixed(2)` |
 
 ### Advanced Features
 

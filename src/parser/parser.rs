@@ -60,6 +60,34 @@ impl Parser {
                     self.expression_statement()
                 }
             }
+            // Check for labeled statement: identifier ':' (not a type alias since we checked that above)
+            Token::Identifier(ref name)
+                if !matches!(name.as_str(), "type")
+                    && matches!(
+                        self.tokens.get(self.current + 1).map(|t| &t.token),
+                        Some(Token::Colon)
+                    )
+                    && matches!(
+                        self.tokens.get(self.current + 2).map(|t| &t.token),
+                        Some(Token::For) | Some(Token::While) | Some(Token::Do)
+                    ) =>
+            {
+                let label = self.expect_identifier("Expected label")?;
+                self.advance(); // consume ':'
+                let mut inner = self.statement()?;
+                // Attach label to the inner loop statement
+                // We use a wrapper approach: store the label in the for/while/do-while
+                // by wrapping in a Block with a special label convention
+                // Simpler approach: wrap in a LabeledStatement
+                inner = Statement {
+                    span: inner.span.clone(),
+                    kind: StmtKind::Labeled {
+                        label,
+                        body: Box::new(inner),
+                    },
+                };
+                Ok(inner)
+            }
             _ => self.expression_statement(),
         }
     }
@@ -544,8 +572,13 @@ impl Parser {
         let condition = self.expression()?;
         self.expect(&Token::RightParen, "Expected ')' after if condition")?;
 
-        self.expect(&Token::LeftBrace, "Expected '{' after if condition")?;
-        let then_branch = self.block_body()?;
+        let then_branch = if self.check(&Token::LeftBrace) {
+            self.advance();
+            self.block_body()?
+        } else {
+            // Single-statement if body (no braces)
+            vec![self.statement()?]
+        };
 
         let else_branch = if self.match_token(&Token::Else) {
             if self.check(&Token::If) {
@@ -611,15 +644,22 @@ impl Parser {
 
         self.expect(&Token::LeftParen, "Expected '(' after 'for'")?;
 
-        // Detect `for (let/const/var x of iterable)`
+        // Detect `for (let/const/var x of iterable)` or `for (let/const/var x in obj)`
         if matches!(self.peek_token(), Token::Let | Token::Const | Token::Var) {
-            // Peek: tokens[current] = let/const, tokens[current+1] = ident, tokens[current+2] = of
+            // Peek: tokens[current] = let/const, tokens[current+1] = ident, tokens[current+2] = of/in
             let is_for_of = matches!(
                 self.tokens.get(self.current + 1).map(|t| &t.token),
                 Some(Token::Identifier(_))
             ) && matches!(
                 self.tokens.get(self.current + 2).map(|t| &t.token),
                 Some(Token::Of)
+            );
+            let is_for_in = matches!(
+                self.tokens.get(self.current + 1).map(|t| &t.token),
+                Some(Token::Identifier(_))
+            ) && matches!(
+                self.tokens.get(self.current + 2).map(|t| &t.token),
+                Some(Token::In)
             );
             if is_for_of {
                 self.advance(); // consume let/const/var
@@ -633,6 +673,23 @@ impl Parser {
                     kind: StmtKind::ForOf {
                         var_name,
                         iterable,
+                        body,
+                    },
+                    span: self.span_from(&start_span),
+                });
+            }
+            if is_for_in {
+                self.advance(); // consume let/const/var
+                let var_name = self.expect_identifier("Expected variable name in for-in")?;
+                self.advance(); // consume 'in'
+                let object = self.expression()?;
+                self.expect(&Token::RightParen, "Expected ')' after for-in object")?;
+                self.expect(&Token::LeftBrace, "Expected '{' after for-in header")?;
+                let body = self.block_body()?;
+                return Ok(Statement {
+                    kind: StmtKind::ForIn {
+                        var_name,
+                        object,
                         body,
                     },
                     span: self.span_from(&start_span),
@@ -747,9 +804,14 @@ impl Parser {
     fn break_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         self.advance(); // consume 'break'
+        let label = if let Token::Identifier(_) = self.peek_token() {
+            Some(self.expect_identifier("Expected label")?)
+        } else {
+            None
+        };
         self.consume_semicolon()?;
         Ok(Statement {
-            kind: StmtKind::Break,
+            kind: StmtKind::Break { label },
             span: self.span_from(&start_span),
         })
     }
@@ -757,9 +819,14 @@ impl Parser {
     fn continue_statement(&mut self) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         self.advance(); // consume 'continue'
+        let label = if let Token::Identifier(_) = self.peek_token() {
+            Some(self.expect_identifier("Expected label")?)
+        } else {
+            None
+        };
         self.consume_semicolon()?;
         Ok(Statement {
-            kind: StmtKind::Continue,
+            kind: StmtKind::Continue { label },
             span: self.span_from(&start_span),
         })
     }
@@ -957,8 +1024,8 @@ impl Parser {
                     let saved = self.current;
                     self.advance(); // consume '['
                     if let Ok(param) = self.expect_identifier("mapped type param") {
-                        if let Token::Identifier(ref kw) = self.peek_token() {
-                            if kw == "in" {
+                        if self.check(&Token::In) {
+                            {
                                 self.advance(); // consume 'in'
                                 let constraint = self.type_annotation()?;
                                 self.expect(&Token::RightBracket, "Expected ']'")?;
@@ -1890,6 +1957,35 @@ impl Parser {
                 )?;
                 Ok(Expr {
                     kind: ExprKind::NewExpr { class_name, args },
+                    span: self.span_from(&span),
+                })
+            }
+            Token::Function => {
+                // Function expression: function(params): RetType { body }
+                // Desugared to an arrow function
+                self.advance(); // consume 'function'
+                                // Optional function name (ignored for now — anonymous or named expression)
+                if let Token::Identifier(_) = self.peek_token() {
+                    if !self.check(&Token::LeftParen) {
+                        self.advance(); // consume optional name
+                    }
+                }
+                self.expect(&Token::LeftParen, "Expected '(' after 'function'")?;
+                let params = self.parameter_list()?;
+                self.expect(&Token::RightParen, "Expected ')' after parameters")?;
+                let return_type = if self.match_token(&Token::Colon) {
+                    Some(self.type_annotation()?)
+                } else {
+                    None
+                };
+                self.expect(&Token::LeftBrace, "Expected '{' before function body")?;
+                let body = self.block_body()?;
+                Ok(Expr {
+                    kind: ExprKind::ArrowFunction {
+                        params,
+                        return_type,
+                        body: ArrowBody::Block(body),
+                    },
                     span: self.span_from(&span),
                 })
             }

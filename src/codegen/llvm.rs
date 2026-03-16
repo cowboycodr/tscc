@@ -67,6 +67,8 @@ pub struct Codegen<'ctx> {
     type_aliases_for_codegen: HashMap<String, TypeAnnotation>,
     /// Generic type alias param names: name -> (param_names, body)
     generic_alias_params: HashMap<String, (Vec<String>, TypeAnnotation)>,
+    /// Pending label for the next loop statement (set by Labeled, consumed by loop compilation)
+    pending_loop_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,11 +98,14 @@ enum VarType {
     Union(Vec<VarType>),
     /// Tuple: heterogeneous fixed-length struct
     Tuple(Vec<VarType>),
+    /// String array: array of {char*, i64} strings
+    StringArray,
 }
 
 struct LoopContext<'ctx> {
     exit_bb: BasicBlock<'ctx>,
     continue_bb: BasicBlock<'ctx>,
+    label: Option<String>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -159,6 +164,7 @@ impl<'ctx> Codegen<'ctx> {
             type_substitutions: HashMap::new(),
             type_aliases_for_codegen: HashMap::new(),
             generic_alias_params: HashMap::new(),
+            pending_loop_label: None,
         };
 
         codegen.declare_runtime_functions();
@@ -412,6 +418,60 @@ impl<'ctx> Codegen<'ctx> {
             None,
         );
 
+        // --- String split ---
+        // tscc_string_split(data, len, sep_data, sep_len, *out_data, *out_len)
+        self.module.add_function(
+            "tscc_string_split",
+            void_type.fn_type(
+                &[
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(),
+                    i64_type.into(),
+                    ptr_type.into(), // out_data (MgString**)
+                    ptr_type.into(), // out_len (long long*)
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "tscc_print_string_array",
+            void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+
+        // --- Number methods ---
+        // tscc_number_toFixed(value, digits, *out_data, *out_len)
+        self.module.add_function(
+            "tscc_number_toFixed",
+            void_type.fn_type(
+                &[
+                    f64_type.into(),
+                    f64_type.into(),
+                    ptr_type.into(), // out_data (char**)
+                    ptr_type.into(), // out_len (long long*)
+                ],
+                false,
+            ),
+            None,
+        );
+        self.module.add_function(
+            "tscc_number_isFinite",
+            f64_type.fn_type(&[f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "tscc_number_isInteger",
+            f64_type.fn_type(&[f64_type.into()], false),
+            None,
+        );
+        self.module.add_function(
+            "tscc_number_isNaN",
+            f64_type.fn_type(&[f64_type.into()], false),
+            None,
+        );
+
         // --- Global functions ---
         self.module.add_function(
             "tscc_parseInt",
@@ -522,6 +582,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             // for-of iterates arrays (f64 elements) — not integer-safe
             StmtKind::ForOf { .. } => false,
+            // for-in iterates string keys — not integer-safe
+            StmtKind::ForIn { .. } => false,
             StmtKind::ArrayDestructure { initializer, .. } => {
                 Self::is_expr_integer_safe(initializer, fn_name, known)
             }
@@ -530,8 +592,9 @@ impl<'ctx> Codegen<'ctx> {
             }
             StmtKind::FunctionDecl { .. }
             | StmtKind::Import { .. }
-            | StmtKind::Break
-            | StmtKind::Continue
+            | StmtKind::Break { .. }
+            | StmtKind::Continue { .. }
+            | StmtKind::Labeled { .. }
             | StmtKind::Empty
             | StmtKind::ClassDecl { .. }
             | StmtKind::InterfaceDecl { .. }
@@ -1057,9 +1120,11 @@ impl<'ctx> Codegen<'ctx> {
 
                 self.builder.position_at_end(body_bb);
                 self.push_scope();
+                let loop_label = self.pending_loop_label.take();
                 self.loop_stack.push(LoopContext {
                     exit_bb,
                     continue_bb: cond_bb,
+                    label: loop_label,
                 });
                 for s in body {
                     self.compile_statement(s, function)?;
@@ -1088,9 +1153,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_unconditional_branch(body_bb).unwrap();
                 self.builder.position_at_end(body_bb);
                 self.push_scope();
+                let loop_label = self.pending_loop_label.take();
                 self.loop_stack.push(LoopContext {
                     exit_bb,
                     continue_bb: cond_bb,
+                    label: loop_label,
                 });
                 for s in body {
                     self.compile_statement(s, function)?;
@@ -1148,9 +1215,11 @@ impl<'ctx> Codegen<'ctx> {
                 }
 
                 self.builder.position_at_end(body_bb);
+                let loop_label = self.pending_loop_label.take();
                 self.loop_stack.push(LoopContext {
                     exit_bb,
                     continue_bb: update_bb,
+                    label: loop_label,
                 });
                 for s in body {
                     self.compile_statement(s, function)?;
@@ -1201,7 +1270,37 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
 
-            StmtKind::Import { .. } => Ok(()),
+            StmtKind::Import { specifiers, .. } => {
+                // Register aliases: if `import { add as sum }`, make `sum` resolve to `add`
+                for spec in specifiers {
+                    if spec.local != spec.imported {
+                        if let Some(func) = self.functions.get(&spec.imported).cloned() {
+                            self.functions.insert(spec.local.clone(), func);
+                        }
+                        // Also copy return type and param type metadata
+                        if let Some(rt) = self.function_return_types.get(&spec.imported).cloned() {
+                            self.function_return_types.insert(spec.local.clone(), rt);
+                        }
+                        if let Some(pt) = self.function_param_var_types.get(&spec.imported).cloned()
+                        {
+                            self.function_param_var_types.insert(spec.local.clone(), pt);
+                        }
+                        if let Some(defaults) =
+                            self.function_param_defaults.get(&spec.imported).cloned()
+                        {
+                            self.function_param_defaults
+                                .insert(spec.local.clone(), defaults);
+                        }
+                        if let Some(rest_idx) =
+                            self.function_rest_param_index.get(&spec.imported).cloned()
+                        {
+                            self.function_rest_param_index
+                                .insert(spec.local.clone(), rest_idx);
+                        }
+                    }
+                }
+                Ok(())
+            }
 
             StmtKind::Switch {
                 discriminant,
@@ -1309,9 +1408,11 @@ impl<'ctx> Codegen<'ctx> {
                 }
 
                 // Push a LoopContext so `break` works inside switch
+                let loop_label = self.pending_loop_label.take();
                 self.loop_stack.push(LoopContext {
                     exit_bb,
                     continue_bb: exit_bb, // continue in switch goes to exit (not ideal, but safe)
+                    label: loop_label,
                 });
 
                 // Emit body blocks
@@ -1417,9 +1518,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_store(elem_alloca, elem_val).unwrap();
                 self.set_variable(var_name.clone(), elem_alloca, VarType::Number);
 
+                let loop_label = self.pending_loop_label.take();
                 self.loop_stack.push(LoopContext {
                     exit_bb,
                     continue_bb: update_bb,
+                    label: loop_label,
                 });
                 for s in body {
                     self.compile_statement(s, function)?;
@@ -1450,6 +1553,88 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
                 self.builder.build_store(i_alloca, i_next).unwrap();
                 self.builder.build_unconditional_branch(cond_bb).unwrap();
+
+                self.builder.position_at_end(exit_bb);
+                Ok(())
+            }
+
+            StmtKind::ForIn {
+                var_name,
+                object,
+                body,
+            } => {
+                // For-in iterates over object property keys (strings).
+                // Since object shapes are known at compile time, we unroll:
+                // for each field name, set var_name to that string and execute the body.
+                let (_obj_val, obj_vt) = self.compile_expr(object, function)?;
+
+                let field_names: Vec<String> = match &obj_vt {
+                    VarType::Object { fields, .. } => {
+                        fields.iter().map(|(name, _)| name.clone()).collect()
+                    }
+                    _ => Vec::new(),
+                };
+
+                let exit_bb = self.context.append_basic_block(function, "forin.exit");
+
+                for (i, key) in field_names.iter().enumerate() {
+                    let body_bb = self
+                        .context
+                        .append_basic_block(function, &format!("forin.body.{}", i));
+                    self.builder.build_unconditional_branch(body_bb).unwrap();
+                    self.builder.position_at_end(body_bb);
+
+                    self.push_scope();
+
+                    // Create the key string
+                    let key_val = self.create_string_literal(key);
+                    let key_alloca = self.create_alloca(function, &VarType::String, var_name);
+                    self.builder.build_store(key_alloca, key_val).unwrap();
+                    self.set_variable(var_name.clone(), key_alloca, VarType::String);
+
+                    // continue_bb for break/continue support
+                    let continue_bb = self
+                        .context
+                        .append_basic_block(function, &format!("forin.cont.{}", i));
+
+                    let loop_label = self.pending_loop_label.take();
+                    self.loop_stack.push(LoopContext {
+                        exit_bb,
+                        continue_bb,
+                        label: loop_label,
+                    });
+                    for s in body {
+                        self.compile_statement(s, function)?;
+                    }
+                    self.loop_stack.pop();
+                    self.pop_scope();
+
+                    // If body didn't terminate, branch to continue (next iteration)
+                    if self
+                        .builder
+                        .get_insert_block()
+                        .unwrap()
+                        .get_terminator()
+                        .is_none()
+                    {
+                        self.builder
+                            .build_unconditional_branch(continue_bb)
+                            .unwrap();
+                    }
+
+                    self.builder.position_at_end(continue_bb);
+                }
+
+                // After all iterations, branch to exit
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_none()
+                {
+                    self.builder.build_unconditional_branch(exit_bb).unwrap();
+                }
 
                 self.builder.position_at_end(exit_bb);
                 Ok(())
@@ -1524,8 +1709,16 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
 
-            StmtKind::Break => {
-                if let Some(ctx) = self.loop_stack.last() {
+            StmtKind::Break { ref label } => {
+                let ctx = if let Some(lbl) = label {
+                    self.loop_stack
+                        .iter()
+                        .rev()
+                        .find(|c| c.label.as_deref() == Some(lbl))
+                } else {
+                    self.loop_stack.last()
+                };
+                if let Some(ctx) = ctx {
                     let exit_bb = ctx.exit_bb;
                     self.builder.build_unconditional_branch(exit_bb).unwrap();
                     // Create dead block for any unreachable code after break
@@ -1540,8 +1733,16 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(())
             }
 
-            StmtKind::Continue => {
-                if let Some(ctx) = self.loop_stack.last() {
+            StmtKind::Continue { ref label } => {
+                let ctx = if let Some(lbl) = label {
+                    self.loop_stack
+                        .iter()
+                        .rev()
+                        .find(|c| c.label.as_deref() == Some(lbl))
+                } else {
+                    self.loop_stack.last()
+                };
+                if let Some(ctx) = ctx {
                     let continue_bb = ctx.continue_bb;
                     self.builder
                         .build_unconditional_branch(continue_bb)
@@ -1555,6 +1756,15 @@ impl<'ctx> Codegen<'ctx> {
                         stmt.span.clone(),
                     ));
                 }
+                Ok(())
+            }
+
+            StmtKind::Labeled { label, body } => {
+                // Set pending label; the next loop push will consume it
+                self.pending_loop_label = Some(label.clone());
+                self.compile_statement(body, function)?;
+                // Clear in case the inner statement wasn't a loop
+                self.pending_loop_label = None;
                 Ok(())
             }
 
@@ -2038,6 +2248,19 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             ExprKind::Identifier(name) => {
+                // Built-in global constants
+                if name == "NaN" {
+                    return Ok((
+                        self.context.f64_type().const_float(f64::NAN).into(),
+                        VarType::Number,
+                    ));
+                }
+                if name == "Infinity" {
+                    return Ok((
+                        self.context.f64_type().const_float(f64::INFINITY).into(),
+                        VarType::Number,
+                    ));
+                }
                 let (ptr, vt) = self.get_variable(name).ok_or_else(|| {
                     CompileError::error(format!("Undefined variable '{}'", name), expr.span.clone())
                 })?;
@@ -2846,7 +3069,9 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Number | VarType::Integer => "number",
             VarType::String => "string",
             VarType::Boolean => "boolean",
-            VarType::Array | VarType::Object { .. } | VarType::Tuple(_) => "object",
+            VarType::Array | VarType::StringArray | VarType::Object { .. } | VarType::Tuple(_) => {
+                "object"
+            }
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "function",
             VarType::Union(_) => "object", // fallback for non-identifier unions
         };
@@ -3332,12 +3557,22 @@ impl<'ctx> Codegen<'ctx> {
                 if name == "Math" {
                     return self.compile_math_call(property, args, function, span);
                 }
+                // Number static methods
+                if name == "Number" {
+                    return self.compile_number_static_call(property, args, function, span);
+                }
             }
 
             // String methods: object.method(args)
             let (obj_val, obj_vt) = self.compile_expr(object, function)?;
             if matches!(obj_vt, VarType::String) {
                 return self.compile_string_method(obj_val, property, args, function, span);
+            }
+
+            // Number methods: value.toFixed(digits)
+            if matches!(obj_vt, VarType::Number | VarType::Integer) {
+                return self
+                    .compile_number_method(obj_val, &obj_vt, property, args, function, span);
             }
 
             // Array methods: object.method(args)
@@ -3779,6 +4014,20 @@ impl<'ctx> Codegen<'ctx> {
                         .build_call(f, &[data_ptr.into(), length.into()], "")
                         .unwrap();
                 }
+                VarType::StringArray => {
+                    let data_ptr = self
+                        .builder
+                        .build_extract_value(val.into_struct_value(), 0, "sarr_data")
+                        .unwrap();
+                    let length = self
+                        .builder
+                        .build_extract_value(val.into_struct_value(), 1, "sarr_len")
+                        .unwrap();
+                    let f = self.module.get_function("tscc_print_string_array").unwrap();
+                    self.builder
+                        .build_call(f, &[data_ptr.into(), length.into()], "")
+                        .unwrap();
+                }
                 VarType::FunctionPtr { .. } | VarType::Closure { .. } => {
                     // Print [Function] for function values
                     let s = self.create_string_literal("[Function]");
@@ -4135,8 +4384,199 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
                 Ok((result, VarType::String))
             }
+            "split" => {
+                let (sep, _) = self.compile_expr(&args[0], function)?;
+                let sep_ptr = self
+                    .builder
+                    .build_extract_value(sep.into_struct_value(), 0, "sep_ptr")
+                    .unwrap();
+                let sep_len = self
+                    .builder
+                    .build_extract_value(sep.into_struct_value(), 1, "sep_len")
+                    .unwrap();
+
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+                let i64_type = self.context.i64_type();
+
+                // Allocate out-parameters on stack
+                let out_data = self
+                    .builder
+                    .build_alloca(ptr_type, "split.out_data")
+                    .unwrap();
+                let out_len = self
+                    .builder
+                    .build_alloca(i64_type, "split.out_len")
+                    .unwrap();
+
+                let func = self.module.get_function("tscc_string_split").unwrap();
+                self.builder
+                    .build_call(
+                        func,
+                        &[
+                            ptr.into(),
+                            len.into(),
+                            sep_ptr.into(),
+                            sep_len.into(),
+                            out_data.into(),
+                            out_len.into(),
+                        ],
+                        "",
+                    )
+                    .unwrap();
+
+                // Load results
+                let data_val = self
+                    .builder
+                    .build_load(ptr_type, out_data, "split.data")
+                    .unwrap();
+                let len_val = self
+                    .builder
+                    .build_load(i64_type, out_len, "split.len")
+                    .unwrap();
+
+                // Build a string array struct: { ptr, len, capacity }
+                let arr_struct = self.array_type.const_zero();
+                let arr_struct = self
+                    .builder
+                    .build_insert_value(arr_struct, data_val, 0, "sa.ptr")
+                    .unwrap()
+                    .into_struct_value();
+                let arr_struct = self
+                    .builder
+                    .build_insert_value(arr_struct, len_val, 1, "sa.len")
+                    .unwrap()
+                    .into_struct_value();
+                let arr_struct = self
+                    .builder
+                    .build_insert_value(arr_struct, len_val, 2, "sa.cap")
+                    .unwrap()
+                    .into_struct_value();
+
+                Ok((arr_struct.into(), VarType::StringArray))
+            }
             _ => Err(CompileError::error(
                 format!("Unknown string method '{}'", method),
+                span.clone(),
+            )),
+        }
+    }
+
+    fn compile_number_static_call(
+        &mut self,
+        method: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        match method {
+            "isFinite" | "isInteger" | "isNaN" => {
+                let (arg_val, _) = self.compile_expr(&args[0], function)?;
+                let func_name = format!("tscc_number_{}", method);
+                let func = self.module.get_function(&func_name).unwrap();
+                let result = self
+                    .builder
+                    .build_call(func, &[arg_val.into()], method)
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                // Runtime returns f64 (1.0 or 0.0), convert to boolean
+                let bool_val = self
+                    .builder
+                    .build_float_compare(
+                        FloatPredicate::ONE,
+                        result.into_float_value(),
+                        self.context.f64_type().const_float(0.0),
+                        "tobool",
+                    )
+                    .unwrap();
+                Ok((bool_val.into(), VarType::Boolean))
+            }
+            _ => Err(CompileError::error(
+                format!("Unknown Number method '{}'", method),
+                span.clone(),
+            )),
+        }
+    }
+
+    fn compile_number_method(
+        &mut self,
+        obj_val: BasicValueEnum<'ctx>,
+        obj_vt: &VarType,
+        method: &str,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        match method {
+            "toFixed" => {
+                let (digits, _) = self.compile_expr(&args[0], function)?;
+
+                // If obj is integer, convert to f64 first
+                let num_val = if matches!(obj_vt, VarType::Integer) {
+                    self.builder
+                        .build_signed_int_to_float(
+                            obj_val.into_int_value(),
+                            self.context.f64_type(),
+                            "itof",
+                        )
+                        .unwrap()
+                        .into()
+                } else {
+                    obj_val
+                };
+
+                let ptr_type = self.context.ptr_type(AddressSpace::default());
+                let i64_type = self.context.i64_type();
+
+                let out_data = self
+                    .builder
+                    .build_alloca(ptr_type, "toFixed.out_data")
+                    .unwrap();
+                let out_len = self
+                    .builder
+                    .build_alloca(i64_type, "toFixed.out_len")
+                    .unwrap();
+
+                let func = self.module.get_function("tscc_number_toFixed").unwrap();
+                self.builder
+                    .build_call(
+                        func,
+                        &[
+                            num_val.into(),
+                            digits.into(),
+                            out_data.into(),
+                            out_len.into(),
+                        ],
+                        "",
+                    )
+                    .unwrap();
+
+                let data = self
+                    .builder
+                    .build_load(ptr_type, out_data, "tf.data")
+                    .unwrap();
+                let len = self
+                    .builder
+                    .build_load(i64_type, out_len, "tf.len")
+                    .unwrap();
+
+                let str_struct = self.string_type.const_zero();
+                let str_struct = self
+                    .builder
+                    .build_insert_value(str_struct, data, 0, "tf.s0")
+                    .unwrap()
+                    .into_struct_value();
+                let str_struct = self
+                    .builder
+                    .build_insert_value(str_struct, len, 1, "tf.s1")
+                    .unwrap()
+                    .into_struct_value();
+
+                Ok((str_struct.into(), VarType::String))
+            }
+            _ => Err(CompileError::error(
+                format!("Unknown number method '{}'", method),
                 span.clone(),
             )),
         }
@@ -4832,7 +5272,7 @@ impl<'ctx> Codegen<'ctx> {
                     .left()
                     .unwrap())
             }
-            VarType::Array => {
+            VarType::Array | VarType::StringArray => {
                 // Arrays don't have a to_string yet; return "[object Array]"
                 Ok(self.create_string_literal("[object Array]"))
             }
@@ -4919,7 +5359,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Integer => self.context.i64_type().into(),
             VarType::String => self.string_type.into(),
             VarType::Boolean => self.context.bool_type().into(),
-            VarType::Array => self.array_type.into(),
+            VarType::Array | VarType::StringArray => self.array_type.into(),
             VarType::FunctionPtr { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             VarType::Closure { .. } => self.closure_type.into(),
             VarType::Object {
@@ -5105,7 +5545,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Integer => self.context.i64_type().const_int(0, false).into(),
             VarType::String => self.create_string_literal(""),
             VarType::Boolean => self.context.bool_type().const_int(0, false).into(),
-            VarType::Array => self.array_type.const_zero().into(),
+            VarType::Array | VarType::StringArray => self.array_type.const_zero().into(),
             VarType::FunctionPtr { .. } => self
                 .context
                 .ptr_type(AddressSpace::default())
@@ -5954,7 +6394,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Integer => "i",
             VarType::String => "s",
             VarType::Boolean => "b",
-            VarType::Array => "a",
+            VarType::Array | VarType::StringArray => "a",
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "f",
             VarType::Object { .. } => "o",
             VarType::Union(_) => "u",

@@ -336,6 +336,98 @@ void tscc_eprint_array(double* data, long long length) {
 }
 
 // ============================================================
+// String array support
+// ============================================================
+
+// String array: array of {char*, long long} structs
+// Returns via out-parameters: *out_data = heap-allocated array of MgString, *out_len = count
+void tscc_string_split(char* data, long long len, char* sep_data, long long sep_len,
+                       MgString** out_data, long long* out_len) {
+    if (len == 0) {
+        // Empty string splits to [""]
+        MgString* arr = (MgString*)malloc(sizeof(MgString));
+        arr[0].data = (char*)malloc(1);
+        arr[0].data[0] = '\0';
+        arr[0].len = 0;
+        *out_data = arr;
+        *out_len = 1;
+        return;
+    }
+
+    // Count occurrences first
+    long long count = 1;
+    for (long long i = 0; i <= len - sep_len; i++) {
+        if (memcmp(data + i, sep_data, (size_t)sep_len) == 0) {
+            count++;
+            i += sep_len - 1;
+        }
+    }
+
+    MgString* arr = (MgString*)malloc((size_t)count * sizeof(MgString));
+    long long idx = 0;
+    long long start = 0;
+    for (long long i = 0; i <= len - sep_len; i++) {
+        if (memcmp(data + i, sep_data, (size_t)sep_len) == 0) {
+            long long part_len = i - start;
+            arr[idx].data = (char*)malloc((size_t)(part_len + 1));
+            memcpy(arr[idx].data, data + start, (size_t)part_len);
+            arr[idx].data[part_len] = '\0';
+            arr[idx].len = part_len;
+            idx++;
+            i += sep_len - 1;
+            start = i + 1;
+        }
+    }
+    // Last part
+    long long part_len = len - start;
+    arr[idx].data = (char*)malloc((size_t)(part_len + 1));
+    memcpy(arr[idx].data, data + start, (size_t)part_len);
+    arr[idx].data[part_len] = '\0';
+    arr[idx].len = part_len;
+
+    *out_data = arr;
+    *out_len = count;
+}
+
+void tscc_print_string_array(MgString* data, long long length) {
+    printf("[ ");
+    for (long long i = 0; i < length; i++) {
+        if (i > 0) printf(", ");
+        printf("'");
+        fwrite(data[i].data, 1, (size_t)data[i].len, stdout);
+        printf("'");
+    }
+    printf(" ]");
+}
+
+// ============================================================
+// Number methods
+// ============================================================
+
+void tscc_number_toFixed(double value, double digits, char** out_data, long long* out_len) {
+    int d = (int)digits;
+    if (d < 0) d = 0;
+    if (d > 100) d = 100;
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), "%.*f", d, value);
+    *out_data = (char*)malloc((size_t)(n + 1));
+    memcpy(*out_data, buf, (size_t)(n + 1));
+    *out_len = n;
+}
+
+double tscc_number_isFinite(double value) {
+    return isfinite(value) ? 1.0 : 0.0;
+}
+
+double tscc_number_isInteger(double value) {
+    return (isfinite(value) && floor(value) == value) ? 1.0 : 0.0;
+}
+
+double tscc_number_isNaN(double value) {
+    return isnan(value) ? 1.0 : 0.0;
+}
+
+// ============================================================
 // Global functions
 // ============================================================
 double tscc_parseInt(char* data, long long len) {

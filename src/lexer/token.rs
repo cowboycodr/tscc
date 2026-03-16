@@ -21,6 +21,7 @@ pub enum Token {
     While,
     For,
     Of,
+    In,
     Void,
     Class,
     New,

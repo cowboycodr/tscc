@@ -873,7 +873,6 @@ sayHi()
     }
 
     #[test]
-    #[ignore = "function hoisting not implemented in type checker"]
     fn function_called_before_declaration() {
         // Two-pass compilation handles codegen, but the type checker
         // doesn't scan ahead for function declarations yet
@@ -1200,7 +1199,6 @@ console.log(triple(5))
     }
 
     #[test]
-    #[ignore = "import aliasing not fully working in codegen"]
     fn import_with_alias() {
         let math_ts = r#"
 export function add(a: number, b: number): number {
@@ -1436,7 +1434,6 @@ for (let x of arr) {
     }
 
     #[test]
-    #[ignore = "for-in not implemented"]
     fn for_in() {
         let src = r#"
 let obj = { a: 1, b: 2 }
@@ -1450,7 +1447,6 @@ for (let key in obj) {
     }
 
     #[test]
-    #[ignore = "labeled statements not implemented"]
     fn labeled_break() {
         let src = r#"
 outer: for (let i = 0; i < 3; i++) {
@@ -1489,7 +1485,6 @@ outer: for (let i = 0; i < 3; i++) {
     }
 
     #[test]
-    #[ignore = "split requires string array support"]
     fn string_split() {
         assert_eq!(
             run_ts(r#"console.log("a,b,c".split(","))"#),
@@ -1859,7 +1854,6 @@ console.log(b)
     }
 
     #[test]
-    #[ignore = "function expressions not implemented"]
     fn function_expression() {
         let src = r#"
 let add = function(a: number, b: number): number {
@@ -1992,25 +1986,21 @@ p.then(v => console.log(v))
     // --- Number methods ---
 
     #[test]
-    #[ignore = "Number.isInteger not implemented"]
     fn number_is_integer() {
         assert_eq!(run_ts("console.log(Number.isInteger(42))"), "true\n");
     }
 
     #[test]
-    #[ignore = "Number.isFinite not implemented"]
     fn number_is_finite() {
         assert_eq!(run_ts("console.log(Number.isFinite(42))"), "true\n");
     }
 
     #[test]
-    #[ignore = "Number.isNaN not implemented"]
     fn number_is_nan() {
         assert_eq!(run_ts("console.log(Number.isNaN(NaN))"), "true\n");
     }
 
     #[test]
-    #[ignore = "number toFixed not implemented"]
     fn number_to_fixed() {
         assert_eq!(run_ts("console.log((3.14159).toFixed(2))"), "3.14\n");
     }

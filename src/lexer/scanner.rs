@@ -277,6 +277,7 @@ impl Scanner {
             "while" => Token::While,
             "for" => Token::For,
             "of" => Token::Of,
+            "in" => Token::In,
             "break" => Token::Break,
             "continue" => Token::Continue,
             "do" => Token::Do,

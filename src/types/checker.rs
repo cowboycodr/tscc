@@ -63,6 +63,12 @@ impl TypeChecker {
         self.define("console".to_string(), Type::Unknown, true);
         // Math (special object)
         self.define("Math".to_string(), Type::Unknown, true);
+        // Number (special object with static methods)
+        self.define("Number".to_string(), Type::Unknown, true);
+        // NaN global constant
+        self.define("NaN".to_string(), Type::Number, true);
+        // Infinity global constant
+        self.define("Infinity".to_string(), Type::Number, true);
 
         // Global functions
         self.define(
@@ -92,6 +98,79 @@ impl TypeChecker {
             .collect();
         for (name, ty) in imports {
             self.define(name, ty, true);
+        }
+
+        // Hoist function declarations: pre-scan and register signatures
+        // so functions can be called before their declaration
+        for stmt in &program.statements {
+            if let StmtKind::FunctionDecl {
+                name,
+                type_params,
+                params,
+                return_type,
+                is_exported,
+                ..
+            } = &stmt.kind
+            {
+                let is_generic = !type_params.is_empty();
+
+                let prev_type_params = self.type_param_types.clone();
+                if is_generic {
+                    for tp in type_params {
+                        let tp_type = tp
+                            .constraint
+                            .as_ref()
+                            .map(|c| self.resolve_type_annotation(c))
+                            .unwrap_or(Type::Unknown);
+                        self.type_param_types.insert(tp.name.clone(), tp_type);
+                    }
+                }
+
+                let param_types: Vec<Type> = params
+                    .iter()
+                    .map(|p| {
+                        let ty = p
+                            .type_ann
+                            .as_ref()
+                            .map(|ann| self.resolve_type_annotation(ann))
+                            .unwrap_or(Type::Unknown);
+                        if p.is_rest {
+                            match ty {
+                                Type::Array(_) => ty,
+                                _ => Type::Array(Box::new(Type::Number)),
+                            }
+                        } else {
+                            ty
+                        }
+                    })
+                    .collect();
+
+                let ret_type = return_type
+                    .as_ref()
+                    .map(|ann| self.resolve_type_annotation(ann))
+                    .unwrap_or(Type::Void);
+
+                let func_type = Type::Function {
+                    params: param_types.clone(),
+                    return_type: Box::new(ret_type.clone()),
+                };
+
+                if *is_exported {
+                    self.exported_symbols
+                        .insert(name.clone(), func_type.clone());
+                }
+
+                self.define(name.clone(), func_type, true);
+
+                if is_generic {
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_functions
+                        .insert(name.clone(), (tp_names, param_types, ret_type));
+                }
+
+                self.type_param_types = prev_type_params;
+            }
         }
 
         for stmt in &program.statements {
@@ -678,10 +757,28 @@ impl TypeChecker {
                 Ok(())
             }
 
-            StmtKind::Break | StmtKind::Continue | StmtKind::Empty => {
+            StmtKind::ForIn {
+                var_name,
+                object,
+                body,
+            } => {
+                self.check_expr(object)?;
+                self.push_scope();
+                // for-in iterates over string keys
+                self.define(var_name.clone(), Type::String, false);
+                for stmt in body {
+                    self.check_statement(stmt)?;
+                }
+                self.pop_scope();
+                Ok(())
+            }
+
+            StmtKind::Break { .. } | StmtKind::Continue { .. } | StmtKind::Empty => {
                 // Validation that we're inside a loop could be added here
                 Ok(())
             }
+
+            StmtKind::Labeled { body, .. } => self.check_statement(body),
         }
     }
 
@@ -901,11 +998,19 @@ impl TypeChecker {
                         if name == "Math" {
                             return self.check_math_call(property, args, &expr.span);
                         }
+                        // Number static methods
+                        if name == "Number" {
+                            return self.check_number_static_call(property, args, &expr.span);
+                        }
                     }
                     // String methods called on expressions
                     let obj_type = self.check_expr(object)?;
                     if obj_type == Type::String {
                         return self.check_string_method_call(property, args, &expr.span);
+                    }
+                    // Number methods called on expressions
+                    if obj_type == Type::Number {
+                        return self.check_number_method_call(property, args, &expr.span);
                     }
                     // Array methods called on expressions
                     if let Type::Array(ref elem_type) = obj_type {
@@ -1123,6 +1228,25 @@ impl TypeChecker {
                         "padStart" => {
                             return Ok(Type::Function {
                                 params: vec![Type::Number, Type::String],
+                                return_type: Box::new(Type::String),
+                            });
+                        }
+                        "split" => {
+                            return Ok(Type::Function {
+                                params: vec![Type::String],
+                                return_type: Box::new(Type::Array(Box::new(Type::String))),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Number methods
+                if obj_type == Type::Number {
+                    match property.as_str() {
+                        "toFixed" => {
+                            return Ok(Type::Function {
+                                params: vec![Type::Number],
                                 return_type: Box::new(Type::String),
                             });
                         }
@@ -1469,6 +1593,16 @@ impl TypeChecker {
                 self.check_expr(&args[0])?;
                 Ok(Type::String)
             }
+            "split" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        "split expects 1 argument",
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                Ok(Type::Array(Box::new(Type::String)))
+            }
             "replace" => {
                 if args.len() != 2 {
                     return Err(CompileError::error(
@@ -1507,6 +1641,54 @@ impl TypeChecker {
             }
             _ => Err(CompileError::error(
                 format!("Property '{}' does not exist on type 'string'", method),
+                span.clone(),
+            )),
+        }
+    }
+
+    fn check_number_static_call(
+        &mut self,
+        method: &str,
+        args: &[Expr],
+        span: &Span,
+    ) -> Result<Type, CompileError> {
+        match method {
+            "isFinite" | "isInteger" | "isNaN" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        format!("Number.{} expects 1 argument", method),
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                Ok(Type::Boolean)
+            }
+            _ => Err(CompileError::error(
+                format!("'Number.{}' is not a known Number method", method),
+                span.clone(),
+            )),
+        }
+    }
+
+    fn check_number_method_call(
+        &mut self,
+        method: &str,
+        args: &[Expr],
+        span: &Span,
+    ) -> Result<Type, CompileError> {
+        match method {
+            "toFixed" => {
+                if args.len() != 1 {
+                    return Err(CompileError::error(
+                        "toFixed expects 1 argument",
+                        span.clone(),
+                    ));
+                }
+                self.check_expr(&args[0])?;
+                Ok(Type::String)
+            }
+            _ => Err(CompileError::error(
+                format!("Property '{}' does not exist on type 'number'", method),
                 span.clone(),
             )),
         }

@@ -80,6 +80,11 @@ pub enum StmtKind {
         iterable: Expr,
         body: Vec<Statement>,
     },
+    ForIn {
+        var_name: String,
+        object: Expr,
+        body: Vec<Statement>,
+    },
     ArrayDestructure {
         names: Vec<String>,
         initializer: Expr,
@@ -100,8 +105,16 @@ pub enum StmtKind {
         name: String,
         members: Vec<EnumMember>,
     },
-    Break,
-    Continue,
+    Break {
+        label: Option<String>,
+    },
+    Continue {
+        label: Option<String>,
+    },
+    Labeled {
+        label: String,
+        body: Box<Statement>,
+    },
     Empty,
 }
 
