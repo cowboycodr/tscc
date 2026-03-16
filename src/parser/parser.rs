@@ -878,6 +878,9 @@ impl Parser {
     fn type_annotation(&mut self) -> Result<TypeAnnotation, CompileError> {
         let span = self.current_span();
 
+        // Consume optional leading pipe: `type T = | A | B` is valid TypeScript
+        self.match_token(&Token::Pipe);
+
         // Parse the first type (handles typeof, keyof, function types,
         // primitives, identifiers, array suffix, and intersection &)
         let base = self.type_annotation_base()?;
@@ -1019,6 +1022,20 @@ impl Parser {
                 self.advance();
                 TypeAnnotation {
                     kind: TypeAnnKind::NumberLiteral(n),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::True => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::BooleanLiteral(true),
+                    span: self.span_from(&span),
+                }
+            }
+            Token::False => {
+                self.advance();
+                TypeAnnotation {
+                    kind: TypeAnnKind::BooleanLiteral(false),
                     span: self.span_from(&span),
                 }
             }

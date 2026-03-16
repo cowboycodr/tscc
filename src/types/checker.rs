@@ -2007,6 +2007,7 @@ impl TypeChecker {
             }
             TypeAnnKind::StringLiteral(s) => Type::StringLiteral(s.clone()),
             TypeAnnKind::NumberLiteral(n) => Type::NumberLiteral(n.to_string()),
+            TypeAnnKind::BooleanLiteral(_) => Type::Boolean,
             TypeAnnKind::Union(variants) => {
                 let types: Vec<Type> = variants
                     .iter()

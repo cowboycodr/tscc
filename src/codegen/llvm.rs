@@ -5470,6 +5470,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             TypeAnnKind::StringLiteral(_) => VarType::String,
             TypeAnnKind::NumberLiteral(_) => self.number_mode.clone(),
+            TypeAnnKind::BooleanLiteral(_) => VarType::Boolean,
             TypeAnnKind::Union(variants) => {
                 let var_types: Vec<VarType> = variants
                     .iter()

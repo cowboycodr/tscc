@@ -210,6 +210,8 @@ pub enum TypeAnnKind {
     StringLiteral(String),
     /// Number literal type: 0, 1, 42, etc.
     NumberLiteral(f64),
+    /// Boolean literal type: true, false
+    BooleanLiteral(bool),
     /// Union type: string | number
     Union(Vec<TypeAnnotation>),
     /// Intersection type: Named & Aged
