@@ -177,6 +177,29 @@ fn feature_name() {
 - **The C runtime is embedded** at `cargo build` time via `include_str!()` and compiled on-demand
   during linking — tscc binaries need no source tree at runtime
 
+## Implementation Philosophy
+
+**The goal is TypeScript compatibility, not compilation success.**
+
+A feature is either implemented correctly or it is not implemented. There is no middle ground.
+A half-implementation that silently compiles but produces wrong runtime behaviour is strictly
+worse than a missing feature that produces a clear compile error — it hides real gaps and
+misleads users into thinking their code works when it doesn't.
+
+Concretely:
+- If a built-in (e.g. `Date`, `Promise`, `setTimeout`) cannot be implemented with correct
+  TypeScript semantics, leave it as `:x:` (unimplemented). Do NOT stub it out with a fake
+  version that looks like it works.
+- If a language feature requires other features to work correctly (e.g. `await` requires
+  `Promise` requires `setTimeout` requires an event loop), implement the whole system or
+  none of it. Partial assembly of an interlocking system creates silent bugs.
+- If you are unsure whether an implementation is fully correct, it is not ready to ship.
+  Add it to Known Technical Debt with a clear description of what is wrong.
+- Compiler errors are honest. Wrong output is not.
+
+This means some programs will not compile today. That is fine and expected. The test suite's
+`:x:` entries are a roadmap, not a backlog to clear with shortcuts.
+
 ## Known Technical Debt
 
 Behaviours that compile silently but produce incorrect results at runtime:
