@@ -261,6 +261,8 @@ pub struct Expr {
 #[derive(Debug, Clone)]
 pub struct ObjectProperty {
     pub key: String,
+    /// Computed property key: { [expr]: value } — when set, `key` is empty
+    pub computed_key: Option<Expr>,
     pub value: Expr,
     pub is_method: bool,
     /// True for spread elements: { ...expr } — key is empty when this is set

@@ -69,6 +69,9 @@ pub struct Codegen<'ctx> {
     generic_alias_params: HashMap<String, (Vec<String>, TypeAnnotation)>,
     /// Pending label for the next loop statement (set by Labeled, consumed by loop compilation)
     pending_loop_label: Option<String>,
+    /// String enum member values: enum_name -> (member_name -> string_value)
+    /// Used to resolve computed property keys like [TaskStatus.Todo] → "todo"
+    enum_string_values: HashMap<String, HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +168,7 @@ impl<'ctx> Codegen<'ctx> {
             type_aliases_for_codegen: HashMap::new(),
             generic_alias_params: HashMap::new(),
             pending_loop_label: None,
+            enum_string_values: HashMap::new(),
         };
 
         codegen.declare_runtime_functions();
@@ -889,11 +893,15 @@ impl<'ctx> Codegen<'ctx> {
                 let mut field_values: Vec<(BasicValueEnum<'ctx>, VarType)> = Vec::new();
                 let mut next_index: i64 = 0;
 
+                // Collect string enum values for computed property key resolution
+                let mut string_members: HashMap<String, String> = HashMap::new();
+
                 for member in members {
                     match &member.value {
                         Some(EnumValue::String(s)) => {
                             field_names.push(member.name.clone());
                             field_values.push((self.create_string_literal(s), VarType::String));
+                            string_members.insert(member.name.clone(), s.clone());
                         }
                         Some(EnumValue::Number(n)) => {
                             next_index = *n as i64;
@@ -950,6 +958,11 @@ impl<'ctx> Codegen<'ctx> {
                 // Register in class_struct_types so member access resolution works
                 self.class_struct_types
                     .insert(name.clone(), (struct_type, field_vts, None));
+
+                // Register string enum values for computed property key resolution
+                if !string_members.is_empty() {
+                    self.enum_string_values.insert(name.clone(), string_members);
+                }
 
                 Ok(())
             }
@@ -2539,6 +2552,32 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Try to resolve a computed property key expression to a string at compile time.
+    /// Handles: string enum member access (EnumName.Member → string value), string literals.
+    /// Falls back to a sequential placeholder for non-constant expressions.
+    fn try_resolve_computed_key(&mut self, expr: &Expr, counter: &mut usize) -> String {
+        match &expr.kind {
+            ExprKind::Member { object, property } => {
+                if let ExprKind::Identifier(enum_name) = &object.kind {
+                    if let Some(members) = self.enum_string_values.get(enum_name.as_str()) {
+                        if let Some(val) = members.get(property.as_str()) {
+                            return val.clone();
+                        }
+                    }
+                }
+                let name = format!("__computed_{}__", counter);
+                *counter += 1;
+                name
+            }
+            ExprKind::StringLiteral(s) => s.clone(),
+            _ => {
+                let name = format!("__computed_{}__", counter);
+                *counter += 1;
+                name
+            }
+        }
+    }
+
     fn compile_object_literal(
         &mut self,
         properties: &[ObjectProperty],
@@ -2547,6 +2586,8 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
         // Compile all property values and determine their VarTypes
         let mut field_vals: Vec<(String, BasicValueEnum<'ctx>, VarType)> = Vec::new();
+
+        let mut computed_counter: usize = 0;
 
         // First pass: compile non-method properties to determine field types
         for prop in properties {
@@ -2563,6 +2604,12 @@ impl<'ctx> Codegen<'ctx> {
                         field_vals.push((field_name.clone(), extracted, field_vt.clone()));
                     }
                 }
+            } else if let Some(ref key_expr) = prop.computed_key {
+                // Computed key: { [expr]: value } — resolve key at compile time
+                let key_expr = key_expr.clone();
+                let key = self.try_resolve_computed_key(&key_expr, &mut computed_counter);
+                let (val, vt) = self.compile_expr(&prop.value, function)?;
+                field_vals.push((key, val, vt));
             } else if !prop.is_method {
                 let (val, vt) = self.compile_expr(&prop.value, function)?;
                 field_vals.push((prop.key.clone(), val, vt));

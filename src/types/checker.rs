@@ -853,6 +853,10 @@ impl TypeChecker {
                                 fields.push((name, ty));
                             }
                         }
+                    } else if prop.computed_key.is_some() {
+                        // Computed key: { [expr]: value } — type-check both sides, skip field tracking
+                        self.check_expr(prop.computed_key.as_ref().unwrap())?;
+                        self.check_expr(&prop.value)?;
                     } else if prop.is_method {
                         // For methods, build a function type
                         let param_types: Vec<Type> = prop

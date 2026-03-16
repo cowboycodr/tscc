@@ -2115,8 +2115,29 @@ impl Parser {
                         let spread_expr = self.expression()?;
                         properties.push(ObjectProperty {
                             key: String::new(),
+                            computed_key: None,
                             value: spread_expr,
                             is_spread: true,
+                            is_method: false,
+                            params: Vec::new(),
+                            return_type: None,
+                            span: self.span_from(&prop_span),
+                        });
+                        self.match_token(&Token::Comma);
+                        continue;
+                    }
+
+                    // Computed property key: { [expr]: value }
+                    if self.match_token(&Token::LeftBracket) {
+                        let key_expr = self.expression()?;
+                        self.expect(&Token::RightBracket, "Expected ']' after computed key")?;
+                        self.expect(&Token::Colon, "Expected ':' after computed property key")?;
+                        let value = self.expression()?;
+                        properties.push(ObjectProperty {
+                            key: String::new(),
+                            computed_key: Some(key_expr),
+                            value,
+                            is_spread: false,
                             is_method: false,
                             params: Vec::new(),
                             return_type: None,
@@ -2152,6 +2173,7 @@ impl Parser {
                         };
                         properties.push(ObjectProperty {
                             key,
+                            computed_key: None,
                             value,
                             is_method: true,
                             is_spread: false,
@@ -2167,6 +2189,7 @@ impl Parser {
                         };
                         properties.push(ObjectProperty {
                             key,
+                            computed_key: None,
                             value,
                             is_method: false,
                             is_spread: false,
@@ -2180,6 +2203,7 @@ impl Parser {
                         let value = self.expression()?;
                         properties.push(ObjectProperty {
                             key,
+                            computed_key: None,
                             value,
                             is_method: false,
                             is_spread: false,
