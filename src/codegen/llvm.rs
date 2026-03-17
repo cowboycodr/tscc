@@ -3577,7 +3577,8 @@ impl<'ctx> Codegen<'ctx> {
                 // Find captured variables from outer scopes
                 let captures = self.find_captures(&body_stmts, params);
 
-                // Compile as a closure (all arrows use closure convention)
+                // Compile as a closure (all arrows use closure convention).
+                // No parameter type overrides — types come from annotations or default to Number.
                 self.compile_closure(
                     &fn_name,
                     params,
@@ -3585,6 +3586,7 @@ impl<'ctx> Codegen<'ctx> {
                     &body_stmts,
                     captures,
                     function,
+                    &[],
                 )
             }
 
@@ -4600,27 +4602,45 @@ impl<'ctx> Codegen<'ctx> {
                 .into_pointer_value();
 
             // 2. Emit the resolve shim function (once per call site, uniquely named).
-            //    Signature: void __promise_resolve_N(void* val, void* ctx)
-            //    Body: tscc_promise_resolve(ctx, val)
+            //
+            // The shim follows the STANDARD tscc closure calling convention:
+            //   fn_ptr(env_ptr, ...js_args)
+            //
+            // For Promise<void> (the common case), there are no JS-level arguments.
+            // The shim signature is:
+            //   void __promise_resolve_N(void* env_ptr)
+            //   → tscc_promise_resolve(env_ptr, NULL)
+            //
+            // This makes the resolve closure a ZERO-arg closure so that:
+            //   • Direct calls    resolve() → fn_ptr(env_ptr)         ✓
+            //   • setTimeout      trampoline calls fn_ptr(env_ptr)    ✓
+            //   • compile_closure_call  works with param_types = []   ✓
+            //
+            // NOTE: Resolving with an explicit value (resolve(42)) requires a
+            // different shim that accepts the value type as a second parameter.
+            // That is tracked as Known Technical Debt; it is not needed for
+            // Promise<void> (the task-manager use case).
             let shim_name = format!("__promise_resolve_{}", self.arrow_counter);
             self.arrow_counter += 1;
 
             let void_type = self.context.void_type();
-            let shim_fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+            // Signature: void(ptr env_ptr)  — zero JS arguments.
+            let shim_fn_type = void_type.fn_type(&[ptr_type.into()], false);
             let shim_fn = self.module.add_function(&shim_name, shim_fn_type, None);
             {
                 let shim_bb = self.context.append_basic_block(shim_fn, "entry");
                 let saved_bb = self.builder.get_insert_block();
                 self.builder.position_at_end(shim_bb);
 
-                let val_arg = shim_fn.get_nth_param(0).unwrap().into_pointer_value();
-                let ctx_arg = shim_fn.get_nth_param(1).unwrap().into_pointer_value();
+                let env_arg = shim_fn.get_nth_param(0).unwrap().into_pointer_value();
 
+                // Resolve the promise with a null value (undefined in JavaScript).
+                let null_val = ptr_type.const_null();
                 let resolve_fn = self.module.get_function("tscc_promise_resolve").unwrap();
                 self.builder
                     .build_call(
                         resolve_fn,
-                        &[ctx_arg.into(), val_arg.into()],
+                        &[env_arg.into(), null_val.into()],
                         "resolve_call",
                     )
                     .unwrap();
@@ -4657,15 +4677,58 @@ impl<'ctx> Codegen<'ctx> {
                 .build_store(resolve_alloca, resolve_closure_val)
                 .unwrap();
 
-            // 4. Compile the executor expression — must be an arrow / closure.
-            let (exec_val, exec_vt) = self.compile_expr(&args[0], function)?;
-
-            // The executor has signature: (resolve: (val) => void) => void
-            // Its resolve parameter is a Closure<[Number] -> Number> (Number is the void stand-in).
+            // The resolve parameter type: a zero-arg closure whose fn_ptr takes only the
+            // env_ptr (the promise pointer) and resolves the promise with null/undefined.
+            // param_types = [] because there are no JS-level arguments to resolve().
             let resolve_param_vt = VarType::Closure {
                 fn_name: shim_name.clone(),
-                param_types: vec![VarType::Number],
+                param_types: vec![],
                 return_type: Box::new(VarType::Number),
+            };
+
+            // 4. Compile the executor.
+            //
+            // If the executor is an inline arrow function (the common case:
+            //   `new Promise(resolve => setTimeout(resolve, ms))`),
+            // we compile it directly with `resolve` typed as `VarType::Closure`.
+            // This is necessary because arrow functions infer unannotated parameters
+            // as Number by default — which would make `resolve` inside the body a
+            // useless f64, causing an ABI mismatch when it is later passed to
+            // setTimeout or called directly.
+            //
+            // For other expression kinds (function reference, etc.) we fall back to
+            // `compile_expr` and rely on the caller to have annotated `resolve` correctly.
+            let (exec_val, exec_vt) = if let ExprKind::ArrowFunction {
+                params: exec_params,
+                return_type: exec_ret,
+                body: exec_body,
+                is_async: _,
+            } = &args[0].kind
+            {
+                let exec_fn_name = format!("__arrow_{}", self.arrow_counter);
+                self.arrow_counter += 1;
+                let exec_body_stmts = match exec_body {
+                    ArrowBody::Expr(e) => vec![Statement {
+                        kind: StmtKind::Return {
+                            value: Some(*e.clone()),
+                        },
+                        span: e.span.clone(),
+                    }],
+                    ArrowBody::Block(stmts) => stmts.clone(),
+                };
+                let exec_captures = self.find_captures(&exec_body_stmts, exec_params);
+                // Override the first parameter (resolve) with the correct Closure type.
+                self.compile_closure(
+                    &exec_fn_name,
+                    exec_params,
+                    exec_ret,
+                    &exec_body_stmts,
+                    exec_captures,
+                    function,
+                    &[resolve_param_vt.clone()],
+                )?
+            } else {
+                self.compile_expr(&args[0], function)?
             };
 
             match exec_vt {
@@ -5854,10 +5917,13 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
-        // Global functions: parseInt, parseFloat
+        // Global functions: parseInt, parseFloat, setTimeout
         if let ExprKind::Identifier(name) = &callee.kind {
             if name == "parseInt" || name == "parseFloat" {
                 return self.compile_global_func(name, args, function, span);
+            }
+            if name == "setTimeout" {
+                return self.compile_set_timeout(args, function, span);
             }
 
             // Check if it's a closure variable first
@@ -7813,6 +7879,195 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Compile `setTimeout(callback, delay)`.
+    ///
+    /// JavaScript's `setTimeout` calls `callback()` — zero arguments — after `delay` ms.
+    /// The runtime side (`tscc_set_timeout`) expects `void (*cb)(void*)` plus a single
+    /// `void* arg`.  Because tscc closures have fn_ptrs with signature
+    /// `(env_ptr, ...js_params)`, we cannot pass the closure's fn_ptr directly; we need
+    /// a per-call-site trampoline that:
+    ///
+    ///   1. Receives the heap-allocated closure copy via the `arg` pointer.
+    ///   2. Loads `fn_ptr` and `env_ptr` from the copy.
+    ///   3. Calls `fn_ptr(env_ptr, [zero-default for each JS param])` —
+    ///      this correctly invokes the callback with no JS-level arguments
+    ///      (equivalent to JS's `callback(undefined)`).
+    ///   4. Frees the heap copy to avoid a memory leak.
+    ///
+    /// For zero-arg closures `() => { ... }` (param_types = []), step 3 reduces to
+    /// the normal single-arg closure call `fn_ptr(env_ptr)`.
+    ///
+    /// For the Promise resolve closure produced by `new Promise(resolve => ...)`,
+    /// the fn_ptr has an extra `val` parameter; the zero default makes it resolve
+    /// with `undefined` (null/0), which is the correct TypeScript semantics for
+    /// `setTimeout(resolve, ms)`.
+    fn compile_set_timeout(
+        &mut self,
+        args: &[Expr],
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        if args.len() != 2 {
+            return Err(CompileError::error(
+                format!(
+                    "setTimeout expects 2 arguments (callback, delay), got {}",
+                    args.len()
+                ),
+                span.clone(),
+            ));
+        }
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let i64_type = self.context.i64_type();
+        let void_type = self.context.void_type();
+
+        // ── 1. Compile the callback ──────────────────────────────────────────────
+        let (cb_val, cb_vt) = self.compile_expr(&args[0], function)?;
+
+        // Normalise to a {fn_ptr, env_ptr} closure struct and capture the JS-level
+        // parameter types (needed to build the zero-argument call in the trampoline).
+        let (cb_struct, param_types): (inkwell::values::StructValue<'ctx>, Vec<VarType>) =
+            match cb_vt {
+                VarType::Closure {
+                    ref param_types, ..
+                } => (cb_val.into_struct_value(), param_types.clone()),
+                VarType::FunctionPtr { .. } => {
+                    // Plain function pointer with no captured environment.
+                    // Wrap it in a closure struct with a null env_ptr.
+                    let zero = self.closure_type.const_zero();
+                    let with_fn = self
+                        .builder
+                        .build_insert_value(zero, cb_val.into_pointer_value(), 0, "sTO.fn")
+                        .unwrap()
+                        .into_struct_value();
+                    (with_fn, vec![])
+                }
+                _ => {
+                    return Err(CompileError::error(
+                        "setTimeout: first argument must be a function or closure",
+                        span.clone(),
+                    ));
+                }
+            };
+
+        // ── 2. Compile the delay and convert to i64 ──────────────────────────────
+        let (delay_val, delay_vt) = self.compile_expr(&args[1], function)?;
+        let delay_i64 = match delay_vt {
+            VarType::Integer => delay_val.into_int_value(),
+            _ => self
+                .builder
+                .build_float_to_signed_int(delay_val.into_float_value(), i64_type, "sTO.delay")
+                .unwrap(),
+        };
+
+        // ── 3. Heap-allocate a copy of the closure struct ────────────────────────
+        // The closure type is {ptr fn_ptr, ptr env_ptr} = 16 bytes on every supported
+        // 64-bit target (macOS arm64, Linux x86_64/arm64).
+        let closure_size = i64_type.const_int(16, false);
+        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+            self.module
+                .add_function("malloc", ptr_type.fn_type(&[i64_type.into()], false), None)
+        });
+        let heap_ptr = self
+            .builder
+            .build_call(malloc_fn, &[closure_size.into()], "sTO.heap")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+        // Store the {fn_ptr, env_ptr} struct into the heap allocation.
+        self.builder.build_store(heap_ptr, cb_struct).unwrap();
+
+        // ── 4. Emit the per-call-site trampoline ─────────────────────────────────
+        //
+        //   void __setTimeout_tramp_N(void* arg) {
+        //     fn_ptr  = ((ClosureStruct*)arg)->fn_ptr   // field 0
+        //     env_ptr = ((ClosureStruct*)arg)->env_ptr  // field 1
+        //     fn_ptr(env_ptr, [zero-default for each JS param])
+        //     free(arg)
+        //   }
+        let tramp_name = format!("__setTimeout_tramp_{}", self.arrow_counter);
+        self.arrow_counter += 1;
+
+        let tramp_fn_type = void_type.fn_type(&[ptr_type.into()], false);
+        let tramp_fn = self.module.add_function(&tramp_name, tramp_fn_type, None);
+        {
+            let tramp_bb = self.context.append_basic_block(tramp_fn, "entry");
+            let saved_bb = self.builder.get_insert_block();
+            self.builder.position_at_end(tramp_bb);
+
+            let arg_ptr = tramp_fn.get_nth_param(0).unwrap().into_pointer_value();
+
+            // Load the entire {fn_ptr, env_ptr} closure struct from the heap copy,
+            // then extract the two fields.  Using load+extract_value (rather than
+            // struct-GEP) is the same pattern used by compile_closure_call throughout
+            // the rest of the codegen — simpler and avoids potential GEP type issues.
+            let closure_struct = self
+                .builder
+                .build_load(self.closure_type, arg_ptr, "tramp.closure")
+                .unwrap()
+                .into_struct_value();
+            let cb_fn_ptr = self
+                .builder
+                .build_extract_value(closure_struct, 0, "tramp.fn_ptr")
+                .unwrap()
+                .into_pointer_value();
+            let env_ptr = self
+                .builder
+                .build_extract_value(closure_struct, 1, "tramp.env_ptr")
+                .unwrap();
+
+            // Build the indirect call: fn_ptr(env_ptr, [zero for each JS param]).
+            // param_types = the JS-level parameters of the closure (env_ptr is implicit,
+            // not listed in param_types).
+            let mut llvm_param_types: Vec<BasicMetadataTypeEnum<'ctx>> = vec![ptr_type.into()];
+            let mut call_args: Vec<BasicMetadataValueEnum<'ctx>> = vec![env_ptr.into()];
+            for pt in &param_types {
+                llvm_param_types.push(self.var_type_to_llvm(pt).into());
+                call_args.push(self.default_value(pt).into());
+            }
+            let cb_fn_type = void_type.fn_type(&llvm_param_types, false);
+            self.builder
+                .build_indirect_call(cb_fn_type, cb_fn_ptr, &call_args, "tramp.call")
+                .unwrap();
+
+            // Free the heap copy — avoids a memory leak on every timer fire.
+            let free_fn = self.module.get_function("free").unwrap_or_else(|| {
+                self.module
+                    .add_function("free", void_type.fn_type(&[ptr_type.into()], false), None)
+            });
+            self.builder
+                .build_call(free_fn, &[arg_ptr.into()], "")
+                .unwrap();
+
+            self.builder.build_return(None).unwrap();
+
+            // Restore the caller's insertion point.
+            if let Some(bb) = saved_bb {
+                self.builder.position_at_end(bb);
+            }
+        }
+
+        // ── 5. Call tscc_set_timeout(trampoline, heap_closure_ptr, delay_i64) ────
+        let tramp_fn_ptr = tramp_fn.as_global_value().as_pointer_value();
+        let set_timeout_fn = self.module.get_function("tscc_set_timeout").unwrap();
+        self.builder
+            .build_call(
+                set_timeout_fn,
+                &[tramp_fn_ptr.into(), heap_ptr.into(), delay_i64.into()],
+                "setTimeout",
+            )
+            .unwrap();
+
+        // setTimeout returns a numeric timer ID in JS; return 0 (clearTimeout not yet
+        // implemented so the ID has no use yet).
+        Ok((
+            self.context.f64_type().const_float(0.0).into(),
+            VarType::Number,
+        ))
+    }
+
     fn compile_global_func(
         &mut self,
         name: &str,
@@ -8821,17 +9076,27 @@ impl<'ctx> Codegen<'ctx> {
         body_stmts: &[Statement],
         captures: Vec<(String, PointerValue<'ctx>, VarType)>,
         _caller_function: FunctionValue<'ctx>,
+        // Per-parameter VarType overrides. When non-empty, the VarType at index `i`
+        // replaces the annotation-derived type for parameter `i`. This is used by
+        // `new Promise(executor)` to give the `resolve` parameter its correct closure
+        // type, since the user does not (and cannot) annotate it in the executor body.
+        param_vt_overrides: &[VarType],
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
         // --- Determine parameter types ---
         let param_vts: Vec<VarType> = params
             .iter()
-            .map(|p| {
-                p.type_ann
-                    .as_ref()
-                    .map(|ann| self.type_ann_to_var_type(ann))
-                    .unwrap_or_else(|| self.number_mode.clone())
+            .enumerate()
+            .map(|(i, p)| {
+                if i < param_vt_overrides.len() {
+                    param_vt_overrides[i].clone()
+                } else {
+                    p.type_ann
+                        .as_ref()
+                        .map(|ann| self.type_ann_to_var_type(ann))
+                        .unwrap_or_else(|| self.number_mode.clone())
+                }
             })
             .collect();
 
@@ -8880,6 +9145,11 @@ impl<'ctx> Codegen<'ctx> {
 
         // --- Save and isolate scope ---
         let saved_scopes = std::mem::take(&mut self.variables);
+        // Closures run in their own execution context — clear async state so that
+        // any `return` or `build_return` inside the body doesn't accidentally
+        // resolve an outer async function's promise.
+        let saved_async_promise = self.current_async_promise.take();
+        let saved_async_resolve_vt = self.current_async_resolve_vt.take();
         self.push_scope();
 
         // --- Set up captured variables from env struct ---
@@ -8935,9 +9205,11 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
-        // --- Restore scope ---
+        // --- Restore scope and async context ---
         self.pop_scope();
         self.variables = saved_scopes;
+        self.current_async_promise = saved_async_promise;
+        self.current_async_resolve_vt = saved_async_resolve_vt;
 
         if let Some(bb) = saved_bb {
             self.builder.position_at_end(bb);

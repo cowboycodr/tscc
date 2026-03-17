@@ -1611,6 +1611,64 @@ if (isCircle(s)) {
 }
 
 // ============================================================
+// 16b. TIMERS (setTimeout)
+// ============================================================
+mod timers {
+    use super::*;
+
+    #[test]
+    fn set_timeout_basic() {
+        // Callbacks fire in registration order (equal delay), after synchronous code.
+        let src = r#"
+setTimeout(() => console.log("timer"), 0)
+console.log("sync")
+"#;
+        assert_eq!(run_ts(src), "sync\ntimer\n");
+    }
+
+    #[test]
+    fn set_timeout_ordering() {
+        // Lower delay fires first.
+        let src = r#"
+setTimeout(() => console.log("second"), 20)
+setTimeout(() => console.log("first"), 0)
+console.log("sync")
+"#;
+        assert_eq!(run_ts(src), "sync\nfirst\nsecond\n");
+    }
+
+    #[test]
+    fn set_timeout_with_capture() {
+        // Closure captures outer variable.
+        let src = r#"
+let msg = "captured"
+setTimeout(() => console.log(msg), 0)
+console.log("sync")
+"#;
+        assert_eq!(run_ts(src), "sync\ncaptured\n");
+    }
+
+    #[test]
+    fn promise_void_via_set_timeout() {
+        // new Promise(resolve => setTimeout(resolve, ms)) — the resolve closure
+        // is a zero-arg closure that resolves with undefined.
+        // await suspends until the timer fires.
+        let src = r#"
+async function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+async function run(): Promise<void> {
+  console.log("before")
+  await delay(0)
+  console.log("after")
+}
+run()
+"#;
+        assert_eq!(run_ts(src), "before\nafter\n");
+    }
+}
+
+// ============================================================
 // 16. DATE
 // ============================================================
 mod date {
