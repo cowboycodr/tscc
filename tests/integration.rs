@@ -3000,6 +3000,53 @@ console.log(Direction.Up)
         assert_eq!(run_ts(src), "UP\n");
     }
 
+    // String enum used as a field type in an interface/struct.
+    // Verifies that type_ann_to_var_type resolves Named("Status") → VarType::String,
+    // so the struct layout is correct and field access returns a string, not a float.
+    #[test]
+    fn string_enum_as_struct_field_type() {
+        let src = "
+enum Status {
+  Active = \"active\",
+  Inactive = \"inactive\"
+}
+interface Item {
+  name: string
+  status: Status
+}
+const item: Item = { name: \"foo\", status: Status.Active }
+console.log(item.status)
+console.log(item.name)
+";
+        assert_eq!(run_ts(src), "active\nfoo\n");
+    }
+
+    // String enum field used as a dynamic object key for indexing (obj[enum_field]++).
+    // Exercises the full chain: string enum → VarType::String field → dynamic key lookup.
+    #[test]
+    fn string_enum_field_as_dynamic_key() {
+        let src = "
+enum Kind {
+  A = \"a\",
+  B = \"b\"
+}
+interface Thing {
+  kind: Kind
+  value: number
+}
+const counts = { a: 0, b: 0 }
+const t1: Thing = { kind: Kind.A, value: 1 }
+const t2: Thing = { kind: Kind.B, value: 2 }
+const t3: Thing = { kind: Kind.A, value: 3 }
+counts[t1.kind]++
+counts[t2.kind]++
+counts[t3.kind]++
+console.log(counts.a)
+console.log(counts.b)
+";
+        assert_eq!(run_ts(src), "2\n1\n");
+    }
+
     #[test]
     fn generic_function() {
         let src = r#"

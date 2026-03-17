@@ -972,6 +972,26 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
         }
+        // Pre-register string enums so that type_ann_to_var_type can resolve Named("EnumName")
+        // to VarType::String when computing interface/class struct layouts below.
+        // Numeric enums are not pre-registered here; they fall through to VarType::Number
+        // in type_ann_to_var_type, which is correct (numeric enum values are numbers).
+        for stmt in &program.statements {
+            if let StmtKind::EnumDecl { name, members } = &stmt.kind {
+                let mut string_members: HashMap<String, String> = HashMap::new();
+                let mut is_string_enum = false;
+                for member in members {
+                    if let Some(crate::parser::ast::EnumValue::String(s)) = &member.value {
+                        string_members.insert(member.name.clone(), s.clone());
+                        is_string_enum = true;
+                    }
+                }
+                if is_string_enum {
+                    self.enum_string_values.insert(name.clone(), string_members);
+                }
+            }
+        }
+
         for stmt in &program.statements {
             match &stmt.kind {
                 StmtKind::InterfaceDecl {
@@ -8415,6 +8435,11 @@ impl<'ctx> Codegen<'ctx> {
                 // Resolve non-generic type aliases (e.g. `type Result = A | B`)
                 if let Some(alias_ann) = self.type_aliases_for_codegen.get(name).cloned() {
                     return self.type_ann_to_var_type(&alias_ann);
+                }
+                // String enums: all member values are strings, so the type is VarType::String.
+                // Numeric enums are not in enum_string_values and fall through to Number below.
+                if self.enum_string_values.contains_key(name.as_str()) {
+                    return VarType::String;
                 }
                 // Unknown named type — treat as number for now
                 self.number_mode.clone()
