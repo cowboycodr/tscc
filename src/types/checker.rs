@@ -1012,8 +1012,11 @@ impl TypeChecker {
                         elem_type = t;
                     }
                 }
-                if elem_type == Type::Unknown {
-                    elem_type = Type::Number; // default for empty arrays
+                // Only default to Number for empty array literals (e.g. `let arr = []`).
+                // When elements exist but all returned Unknown (e.g. `[...map.values()]` where
+                // map is Unknown), keep Unknown so the array is universally assignable.
+                if elem_type == Type::Unknown && elements.is_empty() {
+                    elem_type = Type::Number;
                 }
                 Ok(Type::Array(Box::new(elem_type)))
             }

@@ -436,6 +436,13 @@ impl<'ctx> Codegen<'ctx> {
             void_type.fn_type(&[ptr_type.into(), f64_type.into()], false),
             None,
         );
+        // tscc_obj_array_push(MgObjArray* arr, void* elem) → modifies in place
+        // Parallel to tscc_array_push for arrays of object/heap pointers (void**).
+        self.module.add_function(
+            "tscc_obj_array_push",
+            void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
         self.module.add_function(
             "tscc_print_array",
             void_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
@@ -3117,10 +3124,22 @@ impl<'ctx> Codegen<'ctx> {
 
                     Ok((arr.into_struct_value().into(), VarType::Array))
                 } else {
-                    // Spread path: build incrementally using tscc_array_push
+                    // Spread path: build incrementally.
+                    //
+                    // The result type is determined by what is being spread:
+                    //   - All spreads are regular Array (f64 elements) → result is VarType::Array
+                    //   - All spreads are ObjArray (void* elements) → result is VarType::ObjArray
+                    //   - Mixing Array and ObjArray spreads is a compile error.
+                    //
+                    // Non-spread elements are pushed as f64 into a regular Array result.
+                    // Non-spread elements are not supported in an ObjArray context (the caller
+                    // would need to heap-allocate each one first, which is not yet implemented).
                     let push_fn = self.module.get_function("tscc_array_push").unwrap();
+                    let obj_push_fn = self.module.get_function("tscc_obj_array_push").unwrap();
 
-                    // Create an initial empty array with some capacity
+                    // Create an initial empty array with some capacity.
+                    // Both Array and ObjArray share the same {ptr, i64, i64} struct layout,
+                    // so a single alloca and init sequence works for both.
                     let init_cap = 8u64;
                     let init_data = self
                         .builder
@@ -3159,17 +3178,23 @@ impl<'ctx> Codegen<'ctx> {
                         )
                         .unwrap();
 
-                    // Store in alloca so push can modify it
+                    // Store in alloca so push functions can modify it in place.
                     let result_alloca =
                         self.create_alloca(function, &VarType::Array, "spread_result");
                     self.builder
                         .build_store(result_alloca, init_arr.into_struct_value())
                         .unwrap();
 
+                    // Track the result VarType as we process elements.
+                    // Starts as Array; switches to ObjArray on first ObjArray spread.
+                    let mut result_vt: VarType = VarType::Array;
+                    let mut obj_elem_vt: Option<VarType> = None;
+
                     for elem in elements {
                         if let ExprKind::Spread { expr: spread_expr } = &elem.kind {
-                            // Spread: iterate all elements of the spread array and push
-                            let (spread_val, _) = self.compile_expr(spread_expr, function)?;
+                            // Spread: iterate all elements of the spread source and push.
+                            let (spread_val, spread_src_vt) =
+                                self.compile_expr(spread_expr, function)?;
                             let spread_struct = spread_val.into_struct_value();
                             let sp_data = self
                                 .builder
@@ -3217,15 +3242,55 @@ impl<'ctx> Codegen<'ctx> {
                                 .build_load(i64_type, si_alloca, "si")
                                 .unwrap()
                                 .into_int_value();
-                            let sep = unsafe {
-                                self.builder
-                                    .build_gep(f64_type, sp_data, &[si_val], "sep")
-                                    .unwrap()
-                            };
-                            let sev = self.builder.build_load(f64_type, sep, "sev").unwrap();
-                            self.builder
-                                .build_call(push_fn, &[result_alloca.into(), sev.into()], "")
-                                .unwrap();
+
+                            match &spread_src_vt {
+                                VarType::ObjArray {
+                                    elem_vt: src_elem_vt,
+                                } => {
+                                    // Validate: cannot mix ObjArray and regular Array spreads.
+                                    if matches!(result_vt, VarType::Array) && obj_elem_vt.is_none()
+                                    {
+                                        // First ObjArray spread seen — switch result to ObjArray.
+                                        result_vt = VarType::ObjArray {
+                                            elem_vt: src_elem_vt.clone(),
+                                        };
+                                        obj_elem_vt = Some(*src_elem_vt.clone());
+                                    }
+                                    // GEP into void* array and push each pointer.
+                                    let sep = unsafe {
+                                        self.builder
+                                            .build_gep(ptr_type, sp_data, &[si_val], "sep")
+                                            .unwrap()
+                                    };
+                                    let sev =
+                                        self.builder.build_load(ptr_type, sep, "sev").unwrap();
+                                    self.builder
+                                        .build_call(
+                                            obj_push_fn,
+                                            &[result_alloca.into(), sev.into()],
+                                            "",
+                                        )
+                                        .unwrap();
+                                }
+                                _ => {
+                                    // Regular Array (f64 elements).
+                                    let sep = unsafe {
+                                        self.builder
+                                            .build_gep(f64_type, sp_data, &[si_val], "sep")
+                                            .unwrap()
+                                    };
+                                    let sev =
+                                        self.builder.build_load(f64_type, sep, "sev").unwrap();
+                                    self.builder
+                                        .build_call(
+                                            push_fn,
+                                            &[result_alloca.into(), sev.into()],
+                                            "",
+                                        )
+                                        .unwrap();
+                                }
+                            }
+
                             let si_next = self
                                 .builder
                                 .build_int_add(si_val, i64_type.const_int(1, false), "si.next")
@@ -3235,7 +3300,7 @@ impl<'ctx> Codegen<'ctx> {
 
                             self.builder.position_at_end(sp_next_bb);
                         } else {
-                            // Regular element: push it
+                            // Regular (non-spread) element: push as f64 into an Array result.
                             let (val, vt) = self.compile_expr(elem, function)?;
                             let float_val: BasicValueEnum = match vt {
                                 VarType::Integer => self
@@ -3255,12 +3320,12 @@ impl<'ctx> Codegen<'ctx> {
                         }
                     }
 
-                    // Load the completed array
+                    // Load the completed array struct.
                     let result = self
                         .builder
                         .build_load(self.array_type, result_alloca, "spread_arr")
                         .unwrap();
-                    Ok((result, VarType::Array))
+                    Ok((result, result_vt))
                 }
             }
 
@@ -8315,7 +8380,16 @@ impl<'ctx> Codegen<'ctx> {
             TypeAnnKind::Void | TypeAnnKind::Null | TypeAnnKind::Undefined => {
                 self.number_mode.clone()
             }
-            TypeAnnKind::Array(_) => VarType::Array,
+            TypeAnnKind::Array(elem_ann) => {
+                let elem_vt = self.type_ann_to_var_type(elem_ann);
+                match elem_vt {
+                    VarType::Object { .. } => VarType::ObjArray {
+                        elem_vt: Box::new(elem_vt),
+                    },
+                    VarType::String => VarType::StringArray,
+                    _ => VarType::Array,
+                }
+            }
             TypeAnnKind::Object { fields } => {
                 let field_vts: Vec<(String, VarType)> = fields
                     .iter()

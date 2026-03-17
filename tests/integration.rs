@@ -2593,6 +2593,75 @@ for (const p of people) {
         assert_eq!(run_ts(src), "alice\nbob\n");
     }
 
+    // for...of over an object array populated via Map + spread.
+    // This exercises the ObjArray spread path (tscc_obj_array_push) and
+    // the TypeAnnKind::Array → ObjArray dispatch in type_ann_to_var_type.
+    #[test]
+    fn for_of_object_array_via_map_spread() {
+        let src = "
+interface Point {
+  x: number
+  y: number
+}
+function makePoints(): Point[] {
+  const m: Map<string, Point> = new Map()
+  m.set(\"a\", { x: 1, y: 2 })
+  m.set(\"b\", { x: 3, y: 4 })
+  return [...m.values()]
+}
+function sumCoords(pts: Point[]): number {
+  let total = 0
+  for (const p of pts) {
+    total = total + p.x + p.y
+  }
+  return total
+}
+console.log(sumCoords(makePoints()))
+";
+        assert_eq!(run_ts(src), "10\n");
+    }
+
+    // Dynamic object key update: obj[stringExpr]++ where the key is a runtime string variable.
+    // This exercises the compile_update Object IndexAccess path with a dynamic string key.
+    #[test]
+    fn dynamic_object_key_increment() {
+        let src = "
+const counts = { todo: 0, done: 0, other: 0 }
+let k = \"todo\"
+counts[k]++
+counts[k]++
+k = \"done\"
+counts[k]++
+console.log(counts.todo)
+console.log(counts.done)
+console.log(counts.other)
+";
+        assert_eq!(run_ts(src), "2\n1\n0\n");
+    }
+
+    // Typed array parameter: function receives T[] and iterates over it.
+    // Verifies that TypeAnnKind::Array(Object) resolves to ObjArray and
+    // that for...of correctly binds element fields.
+    #[test]
+    fn typed_object_array_parameter() {
+        let src = "
+interface Item {
+  name: string
+  value: number
+}
+function printItems(items: Item[]): void {
+  for (const it of items) {
+    console.log(it.value)
+  }
+}
+const m: Map<string, Item> = new Map()
+m.set(\"x\", { name: \"x\", value: 10 })
+m.set(\"y\", { name: \"y\", value: 20 })
+printItems([...m.values()])
+";
+        assert_eq!(run_ts(src), "10\n20\n");
+    }
+
     #[test]
     fn for_in() {
         let src = r#"

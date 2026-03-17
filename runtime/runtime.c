@@ -345,6 +345,23 @@ void tscc_array_push(MgArray* arr, double value) {
     arr->data[arr->length++] = value;
 }
 
+// Object-array: same layout as MgArray but data is void** (pointers to heap objects).
+// This is a parallel to tscc_array_push for arrays of object references.
+typedef struct {
+    void** data;
+    long long length;
+    long long capacity;
+} MgObjArray;
+
+void tscc_obj_array_push(MgObjArray* arr, void* elem) {
+    if (arr->length >= arr->capacity) {
+        arr->capacity = arr->capacity < 4 ? 4 : arr->capacity * 2;
+        arr->data = (void**)realloc(arr->data, sizeof(void*) * (size_t)arr->capacity);
+        if (!arr->data) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+    }
+    arr->data[arr->length++] = elem;
+}
+
 void tscc_print_array(double* data, long long length) {
     printf("[ ");
     for (long long i = 0; i < length; i++) {
