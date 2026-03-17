@@ -1855,17 +1855,17 @@ impl<'ctx> Codegen<'ctx> {
 
             StmtKind::ForOf {
                 var_name,
+                is_const: _,
                 iterable,
                 body,
             } => {
                 let i64_type = self.context.i64_type();
-                let f64_type = self.context.f64_type();
 
-                // Compile the iterable to get an array struct value
-                let (arr_val, _arr_vt) = self.compile_expr(iterable, function)?;
+                // Compile the iterable to get an array struct value and its element type.
+                let (arr_val, arr_vt) = self.compile_expr(iterable, function)?;
                 let arr_struct = arr_val.into_struct_value();
 
-                // Extract data pointer and length (fixed before loop)
+                // Extract data pointer and length (both fixed before the loop begins).
                 let data_ptr = self
                     .builder
                     .build_extract_value(arr_struct, 0, "forof.data")
@@ -1877,7 +1877,7 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap()
                     .into_int_value();
 
-                // Loop counter alloca
+                // Loop counter alloca (i64).
                 let i_alloca = self.create_alloca(function, &VarType::Integer, "forof.i");
                 self.builder
                     .build_store(i_alloca, i64_type.const_int(0, false))
@@ -1905,7 +1905,7 @@ impl<'ctx> Codegen<'ctx> {
                     .build_conditional_branch(cond, body_bb, exit_bb)
                     .unwrap();
 
-                // Body: load arr[i], bind to var_name
+                // Body: load arr[i] and bind to var_name.
                 self.builder.position_at_end(body_bb);
                 self.push_scope();
 
@@ -1914,19 +1914,77 @@ impl<'ctx> Codegen<'ctx> {
                     .build_load(i64_type, i_alloca, "i")
                     .unwrap()
                     .into_int_value();
-                let elem_ptr = unsafe {
-                    self.builder
-                        .build_gep(f64_type, data_ptr, &[i_val], "forof.elem_ptr")
-                        .unwrap()
-                };
-                let elem_val = self
-                    .builder
-                    .build_load(f64_type, elem_ptr, "forof.elem")
-                    .unwrap();
 
-                let elem_alloca = self.create_alloca(function, &VarType::Number, var_name);
-                self.builder.build_store(elem_alloca, elem_val).unwrap();
-                self.set_variable(var_name.clone(), elem_alloca, VarType::Number);
+                // Dispatch on the array's element type so that for...of works correctly
+                // for number arrays (f64), string arrays (MgString structs), and object
+                // arrays (void* pointers to heap-allocated typed values).
+                match arr_vt {
+                    VarType::Array => {
+                        // Number (f64) elements stored inline.
+                        let f64_type = self.context.f64_type();
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_gep(f64_type, data_ptr, &[i_val], "forof.elem_ptr")
+                                .unwrap()
+                        };
+                        let elem_val = self
+                            .builder
+                            .build_load(f64_type, elem_ptr, "forof.elem")
+                            .unwrap();
+                        let elem_alloca = self.create_alloca(function, &VarType::Number, var_name);
+                        self.builder.build_store(elem_alloca, elem_val).unwrap();
+                        self.set_variable(var_name.clone(), elem_alloca, VarType::Number);
+                    }
+                    VarType::StringArray => {
+                        // MgString ({i8*, i64}) structs stored inline in the data buffer.
+                        let string_type = self.string_type;
+                        let elem_ptr = unsafe {
+                            self.builder
+                                .build_gep(string_type, data_ptr, &[i_val], "forof.elem_ptr")
+                                .unwrap()
+                        };
+                        let elem_val = self
+                            .builder
+                            .build_load(string_type, elem_ptr, "forof.elem")
+                            .unwrap();
+                        let elem_alloca = self.create_alloca(function, &VarType::String, var_name);
+                        self.builder.build_store(elem_alloca, elem_val).unwrap();
+                        self.set_variable(var_name.clone(), elem_alloca, VarType::String);
+                    }
+                    VarType::ObjArray { elem_vt } => {
+                        // void* pointers to heap-allocated typed values.
+                        // Layout: data[i] is a void* pointing to the actual element on the heap.
+                        let elem_vt = *elem_vt;
+                        let ptr_type = self.context.ptr_type(AddressSpace::default());
+                        let elem_llvm = self.var_type_to_llvm(&elem_vt);
+                        // GEP into the void* array to get &data[i] (a void**)
+                        let elem_ptr_ptr = unsafe {
+                            self.builder
+                                .build_gep(ptr_type, data_ptr, &[i_val], "forof.epp")
+                                .unwrap()
+                        };
+                        // Load the void* at data[i] — this is the pointer to the element.
+                        let elem_ptr = self
+                            .builder
+                            .build_load(ptr_type, elem_ptr_ptr, "forof.ep")
+                            .unwrap()
+                            .into_pointer_value();
+                        // Load the element value through the pointer.
+                        let elem_val = self
+                            .builder
+                            .build_load(elem_llvm, elem_ptr, "forof.elem")
+                            .unwrap();
+                        let elem_alloca = self.create_alloca(function, &elem_vt, var_name);
+                        self.builder.build_store(elem_alloca, elem_val).unwrap();
+                        self.set_variable(var_name.clone(), elem_alloca, elem_vt);
+                    }
+                    _ => {
+                        return Err(CompileError::error(
+                            format!("for...of requires an array type; got {:?}", arr_vt),
+                            stmt.span.clone(),
+                        ));
+                    }
+                }
 
                 let loop_label = self.pending_loop_label.take();
                 self.loop_stack.push(LoopContext {

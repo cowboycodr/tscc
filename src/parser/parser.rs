@@ -845,6 +845,7 @@ impl Parser {
                 Some(Token::In)
             );
             if is_for_of {
+                let is_const = matches!(self.peek_token(), Token::Const);
                 self.advance(); // consume let/const/var
                 let var_name = self.expect_identifier("Expected variable name in for-of")?;
                 self.advance(); // consume 'of'
@@ -855,6 +856,7 @@ impl Parser {
                 return Ok(Statement {
                     kind: StmtKind::ForOf {
                         var_name,
+                        is_const,
                         iterable,
                         body,
                     },

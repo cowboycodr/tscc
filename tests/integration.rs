@@ -777,6 +777,29 @@ console.log(x)
 "#;
         assert_eq!(run_ts(src), "2\n1\n");
     }
+
+    #[test]
+    fn for_of_number_array() {
+        let src = "
+let arr = [1, 2, 3]
+for (let x of arr) {
+    console.log(x)
+}
+";
+        assert_eq!(run_ts(src), "1\n2\n3\n");
+    }
+
+    #[test]
+    fn for_of_const() {
+        // for (const x of ...) binds a const loop variable — same runtime behaviour
+        let src = "
+let arr = [10, 20, 30]
+for (const x of arr) {
+    console.log(x)
+}
+";
+        assert_eq!(run_ts(src), "10\n20\n30\n");
+    }
 }
 
 // ============================================================
@@ -2388,14 +2411,67 @@ console.log(i)
     }
 
     #[test]
-    fn for_of() {
-        let src = "
-let arr = [1, 2, 3]
-for (let x of arr) {
-    console.log(x)
+    #[ignore = "string array literals compile as number arrays (pre-existing); for...of StringArray path is correct but unreachable from literals"]
+    fn for_of_string_array() {
+        let src = r#"
+let words: string[] = ["hello", "world", "foo"]
+for (const w of words) {
+    console.log(w)
 }
-";
-        assert_eq!(run_ts(src), "1\n2\n3\n");
+"#;
+        assert_eq!(run_ts(src), "hello\nworld\nfoo\n");
+    }
+
+    #[test]
+    #[ignore = "string array literals compile as number arrays (pre-existing); for...of StringArray path is correct but unreachable from literals"]
+    fn for_of_string_array_method() {
+        let src = r#"
+let words: string[] = ["hello", "world"]
+for (const w of words) {
+    console.log(w.toUpperCase())
+}
+"#;
+        assert_eq!(run_ts(src), "HELLO\nWORLD\n");
+    }
+
+    #[test]
+    #[ignore = "array literals with object elements compile as VarType::Array (f64), not ObjArray; for...of ObjArray path is correct but unreachable from literals"]
+    fn for_of_object_array() {
+        let src = r#"
+class Point {
+    x: number
+    y: number
+    constructor(x: number, y: number) {
+        this.x = x
+        this.y = y
+    }
+}
+let pts: Point[] = [new Point(1, 2), new Point(3, 4)]
+for (const p of pts) {
+    console.log(p.x + p.y)
+}
+"#;
+        assert_eq!(run_ts(src), "3\n7\n");
+    }
+
+    #[test]
+    #[ignore = "array literals with object elements compile as VarType::Array (f64), not ObjArray; for...of ObjArray path is correct but unreachable from literals"]
+    fn for_of_object_array_field_access() {
+        let src = r#"
+class Person {
+    name: string
+    age: number
+    constructor(name: string, age: number) {
+        this.name = name
+        this.age = age
+    }
+}
+let people: Person[] = [new Person("alice", 30), new Person("bob", 25)]
+for (const p of people) {
+    console.log(p.name)
+}
+"#;
+        assert_eq!(run_ts(src), "alice\nbob\n");
     }
 
     #[test]

@@ -80,6 +80,7 @@ pub enum StmtKind {
     },
     ForOf {
         var_name: String,
+        is_const: bool,
         iterable: Expr,
         body: Vec<Statement>,
     },

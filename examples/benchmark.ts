@@ -10,4 +10,4 @@ function fib(n: number): number {
     return fib(n - 1) + fib(n - 2)
 }
 
-console.log(fib(40))
+console.log(fib(50))

@@ -797,13 +797,22 @@ impl TypeChecker {
 
             StmtKind::ForOf {
                 var_name,
+                is_const,
                 iterable,
                 body,
             } => {
-                self.check_expr(iterable)?;
+                let iterable_type = self.check_expr(iterable)?;
                 self.push_scope();
-                // Element type is Number (arrays hold f64)
-                self.define(var_name.clone(), Type::Number, false);
+                // Infer the element type from the array type.
+                // Type::Unknown is propagated as-is (already a type resolution failure elsewhere).
+                // Non-array iterables degrade to Unknown rather than erroring here, because
+                // the type checker may not yet know the full type of every expression.
+                let elem_type = match iterable_type {
+                    Type::Array(elem) => *elem,
+                    Type::Unknown => Type::Unknown,
+                    _ => Type::Unknown,
+                };
+                self.define(var_name.clone(), elem_type, *is_const);
                 for stmt in body {
                     self.check_statement(stmt)?;
                 }
