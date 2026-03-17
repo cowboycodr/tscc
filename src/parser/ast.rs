@@ -33,6 +33,9 @@ pub enum StmtKind {
         name: String,
         type_params: Vec<TypeParam>,
         parent: Option<String>,
+        /// Type arguments passed to the parent class, e.g. `extends Repo<Task>` → `[Task]`.
+        /// Empty when there is no parent or the parent has no type args.
+        parent_type_args: Vec<TypeAnnotation>,
         fields: Vec<ClassField>,
         constructor: Option<ClassConstructor>,
         methods: Vec<ClassMethod>,

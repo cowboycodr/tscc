@@ -432,6 +432,7 @@ impl TypeChecker {
                 name,
                 type_params: _,
                 parent,
+                parent_type_args: _,
                 fields,
                 constructor,
                 methods,

@@ -2893,6 +2893,90 @@ console.log(d.speak())
         assert_eq!(run_ts(src), "Rex barks\n");
     }
 
+    // Concrete class instantiated inside a function body.
+    // Previously failed because classes were registered in the main loop (third pass)
+    // AFTER function bodies were compiled in the second pass.
+    #[test]
+    fn class_instantiated_inside_function() {
+        let src = "
+class Counter {
+  value: number
+  constructor(start: number) {
+    this.value = start
+  }
+  increment(): void {
+    this.value = this.value + 1
+  }
+  get(): number {
+    return this.value
+  }
+}
+function makeCounter(start: number): number {
+  const c = new Counter(start)
+  c.increment()
+  c.increment()
+  return c.get()
+}
+console.log(makeCounter(10))
+";
+        assert_eq!(run_ts(src), "12\n");
+    }
+
+    // Concrete class extending a generic class, calling an inherited method.
+    // Verifies generic class template storage, first-pass layout registration with
+    // type substitution, and monomorphized parent method compilation.
+    #[test]
+    fn class_extends_generic_parent() {
+        let src = "
+class Container<T> {
+  items: Map<string, T> = new Map()
+  add(key: string, item: T): void {
+    this.items.set(key, item)
+  }
+  size(): number {
+    return this.items.size
+  }
+}
+class NumberBox extends Container<number> {
+  addMultiple(key: string, a: number, b: number): void {
+    this.add(key, a + b)
+  }
+}
+const box = new NumberBox()
+box.add(\"a\", 10)
+box.add(\"b\", 20)
+box.addMultiple(\"c\", 5, 25)
+console.log(box.size())
+";
+        assert_eq!(run_ts(src), "3\n");
+    }
+
+    // Generic parent's inherited method called through the subclass instance.
+    // Verifies the monomorphized function name dispatch works end-to-end.
+    #[test]
+    fn generic_parent_method_dispatch() {
+        let src = "
+class Repo<T> {
+  items: Map<string, T> = new Map()
+  set(id: string, item: T): void {
+    this.items.set(id, item)
+  }
+  count(): number {
+    return this.items.size
+  }
+}
+class UserRepo extends Repo<number> {}
+function fill(r: UserRepo): void {
+  r.set(\"x\", 1)
+  r.set(\"y\", 2)
+  console.log(r.count())
+}
+const repo = new UserRepo()
+fill(repo)
+";
+        assert_eq!(run_ts(src), "2\n");
+    }
+
     // --- Interfaces ---
 
     #[test]

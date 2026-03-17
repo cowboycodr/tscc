@@ -417,15 +417,16 @@ impl Parser {
             vec![]
         };
 
-        let parent = if self.match_token(&Token::Extends) {
+        let (parent, parent_type_args) = if self.match_token(&Token::Extends) {
             let parent_name = self.expect_identifier("Expected parent class name")?;
-            // Discard type args: class Child extends Parent<T>
-            if self.check(&Token::Less) {
-                self.parse_type_args()?;
-            }
-            Some(parent_name)
+            let type_args = if self.check(&Token::Less) {
+                self.parse_type_args()?
+            } else {
+                vec![]
+            };
+            (Some(parent_name), type_args)
         } else {
-            None
+            (None, vec![])
         };
 
         self.expect(&Token::LeftBrace, "Expected '{' before class body")?;
@@ -528,6 +529,7 @@ impl Parser {
                 name,
                 type_params,
                 parent,
+                parent_type_args,
                 fields,
                 constructor,
                 methods,

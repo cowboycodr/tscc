@@ -63,6 +63,20 @@ pub struct Codegen<'ctx> {
             Vec<Statement>,
         ),
     >,
+    /// Generic class templates: class_name -> (type_param_names, fields, methods, constructor,
+    ///                                          parent_name, parent_type_args)
+    /// Populated in the pre-pass so that concrete subclasses can monomorphize them.
+    generic_class_templates: HashMap<
+        String,
+        (
+            Vec<String>,
+            Vec<ClassField>,
+            Vec<ClassMethod>,
+            Option<ClassConstructor>,
+            Option<String>,
+            Vec<TypeAnnotation>,
+        ),
+    >,
     /// Active type parameter substitutions for monomorphization
     type_substitutions: HashMap<String, VarType>,
     /// Type alias bodies for codegen resolution
@@ -186,6 +200,7 @@ impl<'ctx> Codegen<'ctx> {
             function_rest_param_index: HashMap::new(),
             function_param_var_types: HashMap::new(),
             generic_templates: HashMap::new(),
+            generic_class_templates: HashMap::new(),
             type_substitutions: HashMap::new(),
             type_aliases_for_codegen: HashMap::new(),
             generic_alias_params: HashMap::new(),
@@ -992,6 +1007,40 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
+        // Pre-pass: store generic class templates so that the first-pass can monomorphize
+        // them when computing concrete subclass struct layouts.
+        for stmt in &program.statements {
+            if let StmtKind::ClassDecl {
+                name,
+                type_params,
+                parent,
+                parent_type_args,
+                fields,
+                constructor,
+                methods,
+            } = &stmt.kind
+            {
+                if !type_params.is_empty() {
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_class_templates.insert(
+                        name.clone(),
+                        (
+                            tp_names,
+                            fields.clone(),
+                            methods.clone(),
+                            constructor.clone(),
+                            parent.clone(),
+                            parent_type_args.clone(),
+                        ),
+                    );
+                }
+            }
+        }
+
+        // First pass: register struct layouts for interfaces and concrete classes so that
+        // type_ann_to_var_type resolves Named("ClassName") and compile_new_expr finds the
+        // class before function bodies compiled in the second pass reference it.
         for stmt in &program.statements {
             match &stmt.kind {
                 StmtKind::InterfaceDecl {
@@ -1026,6 +1075,234 @@ impl<'ctx> Codegen<'ctx> {
                     self.class_struct_types
                         .insert(name.clone(), (struct_type, field_vts, None));
                 }
+
+                // Concrete classes: pre-register their struct layout (field VarTypes + LLVM
+                // struct type).  Generic classes were stored as templates above; skip them.
+                StmtKind::ClassDecl {
+                    name,
+                    type_params,
+                    parent,
+                    parent_type_args,
+                    fields,
+                    methods,
+                    constructor,
+                } if type_params.is_empty() => {
+                    let mut all_fields: Vec<(String, VarType)> = Vec::new();
+
+                    // effective_parent is the name used for class_struct_types and
+                    // run_field_initializers. For a generic parent it is the mangled virtual
+                    // name (e.g. "Container__Number"); for a concrete parent it is the raw name.
+                    let mut effective_parent: Option<String> = parent.clone();
+
+                    if let Some(parent_name) = parent {
+                        // Concrete registered parent
+                        if let Some((_, pf, _)) = self.class_struct_types.get(parent_name).cloned()
+                        {
+                            all_fields.extend(pf);
+                        }
+                        // Generic parent — monomorphize with supplied type args
+                        else if let Some((tp_names, p_fields, p_methods, _, _, _)) =
+                            self.generic_class_templates.get(parent_name).cloned()
+                        {
+                            let subs: Vec<(String, VarType)> = tp_names
+                                .iter()
+                                .zip(parent_type_args.iter())
+                                .map(|(tp, ann)| {
+                                    let vt = self.type_ann_to_var_type(ann);
+                                    (tp.clone(), vt)
+                                })
+                                .collect();
+                            let type_mangle = subs
+                                .first()
+                                .map(|(_, vt)| Self::mangle_vt(vt))
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            let virtual_parent_name = format!("{}__{}", parent_name, type_mangle);
+                            effective_parent = Some(virtual_parent_name.clone());
+
+                            let saved_subs = std::mem::take(&mut self.type_substitutions);
+                            for (tp, vt) in &subs {
+                                self.type_substitutions.insert(tp.clone(), vt.clone());
+                            }
+
+                            let mut parent_fields: Vec<(String, VarType)> = Vec::new();
+                            for field in &p_fields {
+                                let vt = field
+                                    .type_ann
+                                    .as_ref()
+                                    .map(|ann| self.type_ann_to_var_type(ann))
+                                    .unwrap_or(VarType::Number);
+                                parent_fields.retain(|(n, _)| n != &field.name);
+                                parent_fields.push((field.name.clone(), vt));
+                            }
+                            for method in &p_methods {
+                                let mono_name =
+                                    format!("{}__{}__{}", parent_name, type_mangle, method.name);
+                                parent_fields.retain(|(n, _)| n != &method.name);
+                                parent_fields.push((
+                                    method.name.clone(),
+                                    VarType::FunctionPtr { fn_name: mono_name },
+                                ));
+                            }
+                            self.type_substitutions = saved_subs;
+
+                            all_fields.extend(parent_fields.clone());
+
+                            // Register virtual monomorphized parent in class_struct_types so
+                            // run_field_initializers can recursively find and run its
+                            // field initializers.
+                            if !self.class_struct_types.contains_key(&virtual_parent_name) {
+                                let pf_llvm: Vec<BasicTypeEnum> = parent_fields
+                                    .iter()
+                                    .map(|(_, vt)| self.var_type_to_llvm(vt))
+                                    .collect();
+                                let ps_type = self.context.struct_type(&pf_llvm, false);
+                                self.class_struct_types.insert(
+                                    virtual_parent_name.clone(),
+                                    (ps_type, parent_fields, None),
+                                );
+                                // Register parent field initializers under the virtual name.
+                                let parent_inits: Vec<(String, Expr)> = p_fields
+                                    .iter()
+                                    .filter_map(|f| {
+                                        f.initializer.as_ref().map(|e| (f.name.clone(), e.clone()))
+                                    })
+                                    .collect();
+                                if !parent_inits.is_empty() {
+                                    self.class_field_initializers
+                                        .insert(virtual_parent_name, parent_inits);
+                                }
+                            }
+                        }
+                    }
+
+                    for field in fields.iter() {
+                        let vt = field
+                            .type_ann
+                            .as_ref()
+                            .map(|ann| self.type_ann_to_var_type(ann))
+                            .unwrap_or(VarType::Number);
+                        all_fields.retain(|(n, _)| n != &field.name);
+                        all_fields.push((field.name.clone(), vt));
+                    }
+                    for method in methods.iter() {
+                        let method_fn_name = format!("{}_{}", name, method.name);
+                        all_fields.retain(|(n, _)| n != &method.name);
+                        all_fields.push((
+                            method.name.clone(),
+                            VarType::FunctionPtr {
+                                fn_name: method_fn_name,
+                            },
+                        ));
+                    }
+
+                    let field_llvm_types: Vec<BasicTypeEnum> = all_fields
+                        .iter()
+                        .map(|(_, vt)| self.var_type_to_llvm(vt))
+                        .collect();
+                    let struct_type = self.context.struct_type(&field_llvm_types, false);
+                    self.class_struct_types
+                        .insert(name.clone(), (struct_type, all_fields, effective_parent));
+
+                    // Pre-declare constructor and own method LLVM functions so that calls
+                    // from function bodies compiled in the second pass can find them in
+                    // self.functions.  Bodies are compiled later by compile_class_decl in
+                    // the main loop; module.add_function is idempotent (returns the existing
+                    // declaration when the name+type already exists).
+                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+                    if let Some(ctor) = constructor {
+                        let ctor_name = format!("{}_constructor", name);
+                        let mut ctor_param_types: Vec<BasicMetadataTypeEnum> =
+                            vec![ptr_type.into()];
+                        for param in &ctor.params {
+                            let vt = param
+                                .type_ann
+                                .as_ref()
+                                .map(|ann| self.type_ann_to_var_type(ann))
+                                .unwrap_or(VarType::Number);
+                            ctor_param_types.push(self.var_type_to_llvm(&vt).into());
+                        }
+                        let ctor_fn_type =
+                            self.context.void_type().fn_type(&ctor_param_types, false);
+                        let ctor_fn = self.module.add_function(&ctor_name, ctor_fn_type, None);
+                        self.functions.insert(ctor_name, ctor_fn);
+                    }
+
+                    for method in methods.iter() {
+                        let method_fn_name = format!("{}_{}", name, method.name);
+                        let mut mp_types: Vec<BasicMetadataTypeEnum> = vec![ptr_type.into()];
+                        for param in &method.params {
+                            let vt = param
+                                .type_ann
+                                .as_ref()
+                                .map(|ann| self.type_ann_to_var_type(ann))
+                                .unwrap_or(VarType::Number);
+                            mp_types.push(self.var_type_to_llvm(&vt).into());
+                        }
+                        let ret_vt = method
+                            .return_type
+                            .as_ref()
+                            .map(|ann| self.type_ann_to_var_type(ann))
+                            .unwrap_or(VarType::Number);
+                        let ret_llvm = self.var_type_to_llvm(&ret_vt);
+                        let mfn_type = ret_llvm.fn_type(&mp_types, false);
+                        let mfn = self.module.add_function(&method_fn_name, mfn_type, None);
+                        self.functions.insert(method_fn_name, mfn);
+                    }
+
+                    // Pre-declare monomorphized parent methods (generic parent case).
+                    // These are also pre-declared so method calls from the second pass work.
+                    if let Some(parent_name) = parent {
+                        if let Some((tp_names, _, p_methods, _, _, _)) =
+                            self.generic_class_templates.get(parent_name).cloned()
+                        {
+                            let subs: Vec<(String, VarType)> = tp_names
+                                .iter()
+                                .zip(parent_type_args.iter())
+                                .map(|(tp, ann)| {
+                                    let vt = self.type_ann_to_var_type(ann);
+                                    (tp.clone(), vt)
+                                })
+                                .collect();
+                            let type_mangle = subs
+                                .first()
+                                .map(|(_, vt)| Self::mangle_vt(vt))
+                                .unwrap_or_else(|| "Unknown".to_string());
+
+                            let saved_subs = std::mem::take(&mut self.type_substitutions);
+                            for (tp, vt) in &subs {
+                                self.type_substitutions.insert(tp.clone(), vt.clone());
+                            }
+                            for method in &p_methods {
+                                let mono_name =
+                                    format!("{}__{}__{}", parent_name, type_mangle, method.name);
+                                if !self.functions.contains_key(&mono_name) {
+                                    let mut mp_types: Vec<BasicMetadataTypeEnum> =
+                                        vec![ptr_type.into()];
+                                    for param in &method.params {
+                                        let vt = param
+                                            .type_ann
+                                            .as_ref()
+                                            .map(|ann| self.type_ann_to_var_type(ann))
+                                            .unwrap_or(VarType::Number);
+                                        mp_types.push(self.var_type_to_llvm(&vt).into());
+                                    }
+                                    let ret_vt = method
+                                        .return_type
+                                        .as_ref()
+                                        .map(|ann| self.type_ann_to_var_type(ann))
+                                        .unwrap_or(VarType::Number);
+                                    let ret_llvm = self.var_type_to_llvm(&ret_vt);
+                                    let mfn_type = ret_llvm.fn_type(&mp_types, false);
+                                    let mfn = self.module.add_function(&mono_name, mfn_type, None);
+                                    self.functions.insert(mono_name, mfn);
+                                }
+                            }
+                            self.type_substitutions = saved_subs;
+                        }
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -1183,12 +1460,27 @@ impl<'ctx> Codegen<'ctx> {
 
             StmtKind::ClassDecl {
                 name,
-                type_params: _,
+                type_params,
                 parent,
+                parent_type_args,
                 fields,
                 constructor,
                 methods,
-            } => self.compile_class_decl(name, parent, fields, constructor, methods, function),
+            } => {
+                if !type_params.is_empty() {
+                    // Generic class — stored as template; compiled on demand when subclassed.
+                    return Ok(());
+                }
+                self.compile_class_decl(
+                    name,
+                    parent,
+                    parent_type_args,
+                    fields,
+                    constructor,
+                    methods,
+                    function,
+                )
+            }
 
             StmtKind::InterfaceDecl {
                 name,
@@ -4971,10 +5263,29 @@ impl<'ctx> Codegen<'ctx> {
         Ok((struct_val.into(), tuple_vt))
     }
 
+    /// Produce a short mangle string for a VarType, used to form unique monomorphized
+    /// LLVM function names when a generic parent class is instantiated concretely.
+    /// E.g. VarType::Object { struct_type_name: "Task" } → "Task"
+    fn mangle_vt(vt: &VarType) -> String {
+        match vt {
+            VarType::Object {
+                struct_type_name, ..
+            } => struct_type_name.clone(),
+            VarType::String => "String".to_string(),
+            VarType::Number | VarType::Integer => "Number".to_string(),
+            VarType::Boolean => "Boolean".to_string(),
+            VarType::Array => "Array".to_string(),
+            VarType::ObjArray { elem_vt } => format!("ObjArray_{}", Self::mangle_vt(elem_vt)),
+            VarType::Map { val_vt } => format!("Map_{}", Self::mangle_vt(val_vt)),
+            _ => "Unknown".to_string(),
+        }
+    }
+
     fn compile_class_decl(
         &mut self,
         name: &str,
         parent: &Option<String>,
+        parent_type_args: &[TypeAnnotation],
         fields: &[ClassField],
         constructor: &Option<ClassConstructor>,
         methods: &[ClassMethod],
@@ -4982,12 +5293,105 @@ impl<'ctx> Codegen<'ctx> {
     ) -> Result<(), CompileError> {
         let _ = function; // Class decl doesn't use the current function directly
 
-        // Collect all fields (parent first, then own)
+        // Collect all fields (parent first, then own).
+        // The first-pass already registered the struct layout; we re-derive it here so the
+        // method bodies compile with the correct `obj_vt` (including inherited fields).
         let mut all_fields: Vec<(String, VarType)> = Vec::new();
 
+        // Tracks monomorphized parent methods we need to compile after collecting fields.
+        // Vec<(monomorphized_fn_name, ClassMethod, type_substitutions_to_apply)>
+        let mut pending_parent_methods: Vec<(String, ClassMethod, Vec<(String, VarType)>)> =
+            Vec::new();
+
+        // effective_parent: name used in class_struct_types parent link and
+        // run_field_initializers traversal. Concrete parent → same name; generic parent
+        // → virtual mangled name (e.g. "Container__Number") so field initializers work.
+        let mut effective_parent: Option<String> = parent.clone();
+
         if let Some(parent_name) = parent {
+            // Case A: parent is a concrete registered class (no generics).
             if let Some((_, parent_fields, _)) = self.class_struct_types.get(parent_name) {
                 all_fields.extend(parent_fields.clone());
+            }
+            // Case B: parent is a generic class — monomorphize with the supplied type args.
+            else if let Some((tp_names, p_fields, p_methods, _p_ctor, _pp, _pp_args)) =
+                self.generic_class_templates.get(parent_name).cloned()
+            {
+                // Build type substitution map: T → concrete VarType
+                let subs: Vec<(String, VarType)> = tp_names
+                    .iter()
+                    .zip(parent_type_args.iter())
+                    .map(|(tp, ann)| {
+                        let vt = self.type_ann_to_var_type(ann);
+                        (tp.clone(), vt)
+                    })
+                    .collect();
+
+                let type_mangle = subs
+                    .first()
+                    .map(|(_, vt)| Self::mangle_vt(vt))
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let virtual_parent_name = format!("{}__{}", parent_name, type_mangle);
+                effective_parent = Some(virtual_parent_name.clone());
+
+                // Apply substitutions while computing parent field VarTypes.
+                let saved_subs = std::mem::take(&mut self.type_substitutions);
+                for (tp, vt) in &subs {
+                    self.type_substitutions.insert(tp.clone(), vt.clone());
+                }
+
+                let mut parent_fields: Vec<(String, VarType)> = Vec::new();
+                for field in &p_fields {
+                    let vt = field
+                        .type_ann
+                        .as_ref()
+                        .map(|ann| self.type_ann_to_var_type(ann))
+                        .unwrap_or(VarType::Number);
+                    parent_fields.retain(|(n, _)| n != &field.name);
+                    parent_fields.push((field.name.clone(), vt));
+                }
+                for method in &p_methods {
+                    let mono_name = format!("{}__{}__{}", parent_name, type_mangle, method.name);
+                    parent_fields.retain(|(n, _)| n != &method.name);
+                    parent_fields.push((
+                        method.name.clone(),
+                        VarType::FunctionPtr {
+                            fn_name: mono_name.clone(),
+                        },
+                    ));
+                    // Queue method for compilation if not yet defined (no body).
+                    let already_defined = self
+                        .module
+                        .get_function(&mono_name)
+                        .map(|f| f.count_basic_blocks() > 0)
+                        .unwrap_or(false);
+                    if !already_defined {
+                        pending_parent_methods.push((mono_name, method.clone(), subs.clone()));
+                    }
+                }
+                self.type_substitutions = saved_subs;
+
+                all_fields.extend(parent_fields.clone());
+
+                // Register virtual monomorphized parent in class_struct_types so
+                // run_field_initializers can find and run its field initializers.
+                if !self.class_struct_types.contains_key(&virtual_parent_name) {
+                    let pf_llvm: Vec<BasicTypeEnum> = parent_fields
+                        .iter()
+                        .map(|(_, vt)| self.var_type_to_llvm(vt))
+                        .collect();
+                    let ps_type = self.context.struct_type(&pf_llvm, false);
+                    self.class_struct_types
+                        .insert(virtual_parent_name.clone(), (ps_type, parent_fields, None));
+                    let parent_inits: Vec<(String, Expr)> = p_fields
+                        .iter()
+                        .filter_map(|f| f.initializer.as_ref().map(|e| (f.name.clone(), e.clone())))
+                        .collect();
+                    if !parent_inits.is_empty() {
+                        self.class_field_initializers
+                            .insert(virtual_parent_name, parent_inits);
+                    }
+                }
             }
         }
 
@@ -5024,7 +5428,7 @@ impl<'ctx> Codegen<'ctx> {
 
         self.class_struct_types.insert(
             name.to_string(),
-            (struct_type, all_fields.clone(), parent.clone()),
+            (struct_type, all_fields.clone(), effective_parent),
         );
 
         // Collect field initializers for use in compile_new_expr
@@ -5041,6 +5445,12 @@ impl<'ctx> Codegen<'ctx> {
             struct_type_name: name.to_string(),
             fields: all_fields.clone(),
         };
+
+        // Class methods/constructors always use Number mode for type annotations
+        // (never integer-narrowed). Save and reset here so that function signatures
+        // computed below match what the first-pass pre-declarations used.
+        let saved_class_mode = self.number_mode.clone();
+        self.number_mode = VarType::Number;
 
         // Compile constructor
         if let Some(ctor) = constructor {
@@ -5059,7 +5469,12 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             let fn_type = self.context.void_type().fn_type(&param_types, false);
-            let ctor_fn = self.module.add_function(&ctor_name, fn_type, None);
+            // Use pre-declared function if it already exists (from first-pass pre-declaration),
+            // otherwise declare it now.
+            let ctor_fn = self
+                .module
+                .get_function(&ctor_name)
+                .unwrap_or_else(|| self.module.add_function(&ctor_name, fn_type, None));
 
             // Add nounwind attribute
             let nounwind_kind = Attribute::get_named_enum_kind_id("nounwind");
@@ -5141,7 +5556,11 @@ impl<'ctx> Codegen<'ctx> {
 
             let ret_type = self.var_type_to_llvm(&ret_vt);
             let fn_type = ret_type.fn_type(&param_types, false);
-            let method_fn = self.module.add_function(&method_fn_name, fn_type, None);
+            // Use pre-declared function if it already exists (from first-pass pre-declaration).
+            let method_fn = self
+                .module
+                .get_function(&method_fn_name)
+                .unwrap_or_else(|| self.module.add_function(&method_fn_name, fn_type, None));
 
             let nounwind_kind = Attribute::get_named_enum_kind_id("nounwind");
             let nounwind = self.context.create_enum_attribute(nounwind_kind, 0);
@@ -5167,10 +5586,6 @@ impl<'ctx> Codegen<'ctx> {
                 self.set_variable(param.name.clone(), alloca, vt);
             }
 
-            let saved_mode = self.number_mode.clone();
-            // Methods are not integer-narrowed
-            self.number_mode = VarType::Number;
-
             for stmt in &method.body {
                 self.compile_statement(stmt, method_fn)?;
             }
@@ -5187,7 +5602,6 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_return(Some(&default_ret)).unwrap();
             }
 
-            self.number_mode = saved_mode;
             self.pop_scope();
             self.current_this = prev_this;
 
@@ -5195,6 +5609,105 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(bb);
             }
         }
+
+        // Compile monomorphized parent methods (generic parent instantiated with concrete types).
+        // Each pending entry holds: (monomorphized_fn_name, method_ast, type_substitutions).
+        // We compile these as if they were methods of this concrete class, with `this` typed
+        // as the subclass instance so they can access all fields.
+        for (mono_name, method, subs) in pending_parent_methods {
+            let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+            // Set up type substitutions for the method's type parameter references.
+            let saved_subs = std::mem::take(&mut self.type_substitutions);
+            for (tp, vt) in &subs {
+                self.type_substitutions.insert(tp.clone(), vt.clone());
+            }
+
+            let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_type.into()];
+            let mut param_vts: Vec<VarType> = Vec::new();
+            for param in &method.params {
+                let vt = param
+                    .type_ann
+                    .as_ref()
+                    .map(|ann| self.type_ann_to_var_type(ann))
+                    .unwrap_or(VarType::Number);
+                param_types.push(self.var_type_to_llvm(&vt).into());
+                param_vts.push(vt);
+            }
+
+            let ret_vt = method
+                .return_type
+                .as_ref()
+                .map(|ann| self.type_ann_to_var_type(ann))
+                .unwrap_or(VarType::Number);
+
+            self.type_substitutions = saved_subs;
+
+            let ret_type = self.var_type_to_llvm(&ret_vt);
+            let fn_type = ret_type.fn_type(&param_types, false);
+            // Use pre-declared function if it already exists (from first-pass pre-declaration).
+            let method_fn = self
+                .module
+                .get_function(&mono_name)
+                .unwrap_or_else(|| self.module.add_function(&mono_name, fn_type, None));
+
+            let nounwind_kind = Attribute::get_named_enum_kind_id("nounwind");
+            let nounwind = self.context.create_enum_attribute(nounwind_kind, 0);
+            method_fn.add_attribute(AttributeLoc::Function, nounwind);
+
+            self.functions.insert(mono_name.clone(), method_fn);
+
+            let entry = self.context.append_basic_block(method_fn, "entry");
+            let saved_block = self.builder.get_insert_block();
+            self.builder.position_at_end(entry);
+
+            let this_ptr = method_fn.get_nth_param(0).unwrap().into_pointer_value();
+            let prev_this = self.current_this.clone();
+            // Use the subclass's obj_vt for `this` so all inherited fields are accessible.
+            self.current_this = Some((this_ptr, obj_vt.clone()));
+
+            self.push_scope();
+
+            // Re-apply substitutions for compiling the method body.
+            let saved_subs = std::mem::take(&mut self.type_substitutions);
+            for (tp, vt) in &subs {
+                self.type_substitutions.insert(tp.clone(), vt.clone());
+            }
+
+            for (i, param) in method.params.iter().enumerate() {
+                let vt = param_vts[i].clone();
+                let param_val = method_fn.get_nth_param((i + 1) as u32).unwrap();
+                let alloca = self.create_alloca(method_fn, &vt, &param.name);
+                self.builder.build_store(alloca, param_val).unwrap();
+                self.set_variable(param.name.clone(), alloca, vt);
+            }
+
+            for stmt in &method.body {
+                self.compile_statement(stmt, method_fn)?;
+            }
+
+            if self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_terminator()
+                .is_none()
+            {
+                let default_ret = self.default_value(&ret_vt);
+                self.builder.build_return(Some(&default_ret)).unwrap();
+            }
+
+            self.type_substitutions = saved_subs;
+            self.pop_scope();
+            self.current_this = prev_this;
+
+            if let Some(bb) = saved_block {
+                self.builder.position_at_end(bb);
+            }
+        }
+
+        // Restore number_mode now that all class compilation is done.
+        self.number_mode = saved_class_mode;
 
         Ok(())
     }
