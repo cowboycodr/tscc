@@ -1076,14 +1076,20 @@ impl Parser {
             });
         }
 
-        // Type predicate: `param is Type` — treated as boolean at runtime
-        if let TypeAnnKind::Named(_) = &base.kind {
+        // Type predicate: `param is Type`
+        // The base is the parameter name as a Named type annotation.
+        // We preserve the predicate type so the checker can use it for narrowing.
+        if let TypeAnnKind::Named(param_name) = &base.kind {
+            let param_name = param_name.clone();
             if let Token::Identifier(ref kw) = self.peek_token() {
                 if kw == "is" {
                     self.advance(); // consume 'is'
-                    self.type_annotation()?; // parse and discard the predicate type
+                    let predicate_type = self.type_annotation()?;
                     return Ok(TypeAnnotation {
-                        kind: TypeAnnKind::Boolean,
+                        kind: TypeAnnKind::TypePredicate {
+                            param: param_name,
+                            ty: Box::new(predicate_type),
+                        },
                         span: self.span_from(&span),
                     });
                 }

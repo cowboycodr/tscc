@@ -36,6 +36,10 @@ pub struct TypeChecker {
     generic_functions: HashMap<String, (Vec<String>, Vec<Type>, Type)>,
     /// Generic type aliases: name -> (type_param_names, body)
     generic_type_aliases: HashMap<String, (Vec<String>, TypeAnnotation)>,
+    /// Type predicate functions: fn_name → (param_name, narrowed_type).
+    /// Populated when a function with `param is T` return annotation is declared.
+    /// Used to narrow the argument type in `if (fn(x))` conditions.
+    type_predicates: HashMap<String, (String, Type)>,
 }
 
 impl TypeChecker {
@@ -52,6 +56,7 @@ impl TypeChecker {
             type_param_types: HashMap::new(),
             generic_functions: HashMap::new(),
             generic_type_aliases: HashMap::new(),
+            type_predicates: HashMap::new(),
         };
         checker.push_scope();
         checker.register_builtins();
@@ -393,6 +398,18 @@ impl TypeChecker {
                     );
                 }
 
+                // Register type predicate so the If-statement checker can apply narrowing.
+                // We resolve the predicate type NOW, while type_param_types still has the
+                // function's type params active (T → Unknown when unconstrained).
+                // Unknown fields act as wildcards in the structural matching below.
+                if let Some(ret_ann) = return_type.as_ref() {
+                    if let TypeAnnKind::TypePredicate { param, ty } = &ret_ann.kind {
+                        let narrowed = self.resolve_type_annotation(ty);
+                        self.type_predicates
+                            .insert(name.clone(), (param.clone(), narrowed));
+                    }
+                }
+
                 self.push_scope();
                 let prev_return_type = self.current_return_type.clone();
                 self.current_return_type = Some(ret_type.clone());
@@ -652,6 +669,45 @@ impl TypeChecker {
                     },
                 );
 
+                // Detect type predicate narrowing: fn_name(x) where fn_name is registered
+                // as a type predicate.  Returns (arg_name, narrowed_type, else_type).
+                let pred_narrowing: Option<(String, Type, Type)> =
+                    Self::detect_predicate_call(condition).and_then(|(fn_name, arg_name)| {
+                        let (_, narrowed_ty) = self.type_predicates.get(&fn_name)?.clone();
+                        let arg_type = self.lookup(&arg_name)?;
+                        match arg_type {
+                            Type::Union(variants) => {
+                                let matching: Vec<Type> = variants
+                                    .iter()
+                                    .filter(|v| Self::is_predicate_compatible(v, &narrowed_ty))
+                                    .cloned()
+                                    .collect();
+                                let non_matching: Vec<Type> = variants
+                                    .iter()
+                                    .filter(|v| !Self::is_predicate_compatible(v, &narrowed_ty))
+                                    .cloned()
+                                    .collect();
+                                if matching.is_empty() {
+                                    return None; // predicate doesn't narrow anything
+                                }
+                                let narrowed = if matching.len() == 1 {
+                                    matching.into_iter().next().unwrap()
+                                } else {
+                                    Type::Union(matching)
+                                };
+                                let remaining = if non_matching.len() == 1 {
+                                    non_matching.into_iter().next().unwrap()
+                                } else if non_matching.is_empty() {
+                                    Type::Unknown
+                                } else {
+                                    Type::Union(non_matching)
+                                };
+                                Some((arg_name, narrowed, remaining))
+                            }
+                            _ => None,
+                        }
+                    });
+
                 self.push_scope();
                 if let Some((ref var_name, ref target, ref remaining, is_eq)) = narrowing {
                     // In then-branch: narrow to matched type (=== → target, !== → remaining)
@@ -662,6 +718,10 @@ impl TypeChecker {
                     } else if !remaining.is_empty() {
                         self.define(var_name.clone(), Type::Union(remaining.clone()), false);
                     }
+                }
+                // Type predicate: in then-branch shadow arg with the narrowed type.
+                if let Some((ref var_name, ref narrowed, _)) = pred_narrowing {
+                    self.define(var_name.clone(), narrowed.clone(), false);
                 }
                 for stmt in then_branch {
                     self.check_statement(stmt)?;
@@ -684,6 +744,12 @@ impl TypeChecker {
                             }
                         } else {
                             self.define(var_name.clone(), target.clone(), false);
+                        }
+                    }
+                    // Type predicate: in else-branch shadow arg with non-matching types.
+                    if let Some((ref var_name, _, ref remaining)) = pred_narrowing {
+                        if !matches!(remaining, Type::Unknown) {
+                            self.define(var_name.clone(), remaining.clone(), false);
                         }
                     }
                     for stmt in else_stmts {
@@ -2143,6 +2209,17 @@ impl TypeChecker {
                 return true;
             }
         }
+        // Boolean literal is a subtype of Boolean
+        if let Type::BooleanLiteral(_) = from {
+            if matches!(to, Type::Boolean) {
+                return true;
+            }
+        }
+        if matches!(from, Type::Boolean) {
+            if matches!(to, Type::BooleanLiteral(_)) {
+                return true;
+            }
+        }
         // Primitives accept their literal types as targets too (for widening)
         if matches!(from, Type::String) {
             if matches!(to, Type::StringLiteral(_)) {
@@ -2285,7 +2362,7 @@ impl TypeChecker {
             }
             TypeAnnKind::StringLiteral(s) => Type::StringLiteral(s.clone()),
             TypeAnnKind::NumberLiteral(n) => Type::NumberLiteral(n.to_string()),
-            TypeAnnKind::BooleanLiteral(_) => Type::Boolean,
+            TypeAnnKind::BooleanLiteral(b) => Type::BooleanLiteral(*b),
             TypeAnnKind::Union(variants) => {
                 let types: Vec<Type> = variants
                     .iter()
@@ -2418,6 +2495,8 @@ impl TypeChecker {
                 }
                 Type::Unknown
             }
+            // Type predicates return bool at runtime; narrowing is type-level only.
+            TypeAnnKind::TypePredicate { .. } => Type::Boolean,
         }
     }
 
@@ -2483,6 +2562,67 @@ impl TypeChecker {
         }
     }
 
+    /// Detect `fn_name(arg_identifier)` call pattern in a condition expression.
+    /// Returns `(fn_name, arg_name)` when the condition is a single-argument call
+    /// where both callee and argument are plain identifiers — the shape used by
+    /// type predicate guards: `if (isSuccess(update)) { ... }`.
+    fn detect_predicate_call(condition: &Expr) -> Option<(String, String)> {
+        if let ExprKind::Call { callee, args } = &condition.kind {
+            if let ExprKind::Identifier(fn_name) = &callee.kind {
+                if args.len() == 1 {
+                    if let ExprKind::Identifier(arg_name) = &args[0].kind {
+                        return Some((fn_name.clone(), arg_name.clone()));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check whether a type (typically one union variant) is structurally compatible
+    /// with a resolved predicate type.
+    ///
+    /// Fields in the predicate whose type is `Type::Unknown` are treated as wildcards —
+    /// this handles unresolved generic type parameters (e.g. `data: T` where T → Unknown).
+    ///
+    /// For non-wildcard predicate fields we require:
+    ///   1. The variant has a field with the same name.
+    ///   2. If the predicate field type is a literal type (StringLiteral, NumberLiteral,
+    ///      BooleanLiteral), the variant's field must have the SAME literal type — this
+    ///      is what makes `{ success: true; ... }` distinguish from `{ success: false; ... }`
+    ///      in a discriminated union.
+    ///   3. Otherwise, just check that the field exists (broad structural match).
+    fn is_predicate_compatible(variant: &Type, predicate: &Type) -> bool {
+        let pred_fields = match predicate {
+            Type::Object { fields } => fields,
+            _ => return false,
+        };
+        let variant_fields = match variant {
+            Type::Object { fields } | Type::Class { fields, .. } => fields,
+            _ => return false,
+        };
+        pred_fields.iter().all(|(pred_name, pred_ty)| {
+            if *pred_ty == Type::Unknown {
+                return true; // wildcard: matches any type in this field position
+            }
+            // For literal discriminant types, require an exact type match on that field.
+            let is_literal = matches!(
+                pred_ty,
+                Type::StringLiteral(_) | Type::NumberLiteral(_) | Type::BooleanLiteral(_)
+            );
+            if is_literal {
+                variant_fields
+                    .iter()
+                    .any(|(vf_name, vf_ty)| vf_name == pred_name && vf_ty == pred_ty)
+            } else {
+                // Non-literal: just require the field to be present.
+                variant_fields
+                    .iter()
+                    .any(|(vf_name, _)| vf_name == pred_name)
+            }
+        })
+    }
+
     /// Detect `typeof x === "type"` or `typeof x !== "type"` pattern.
     /// Returns (variable_name, type_string, is_equality).
     fn detect_typeof_narrowing(condition: &Expr) -> Option<(String, String, bool)> {
@@ -2535,7 +2675,10 @@ impl TypeChecker {
             ) | (
                 Type::String | Type::StringLiteral(_),
                 Type::String | Type::StringLiteral(_)
-            ) | (Type::Boolean, Type::Boolean)
+            ) | (
+                Type::Boolean | Type::BooleanLiteral(_),
+                Type::Boolean | Type::BooleanLiteral(_)
+            )
         )
     }
 }

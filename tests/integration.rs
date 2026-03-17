@@ -1547,6 +1547,67 @@ console.log(r2.error)
 "#;
         assert_eq!(run_ts(src), "true\n5\nfalse\ndivision by zero\n");
     }
+
+    #[test]
+    fn type_predicate_basic() {
+        // A function returning `x is T` acts as a type guard: the type checker
+        // narrows the argument in the if-true branch.
+        let src = r#"
+type Result = { success: true; data: number } | { success: false; error: string }
+
+function isSuccess(result: Result): result is { success: true; data: number } {
+  return (result as any).success === true
+}
+
+let r: Result = { success: true, data: 42, error: "" }
+if (isSuccess(r)) {
+  console.log(r.data)
+}
+"#;
+        assert_eq!(run_ts(src), "42\n");
+    }
+
+    #[test]
+    fn type_predicate_generic() {
+        // Generic type predicate `result is { success: true; data: T }` —
+        // T resolves to Unknown at registration time (wildcard), so structural
+        // matching falls back to field-name presence for the `data` field.
+        let src = r#"
+type Result<T> =
+  | { success: true; data: T }
+  | { success: false; error: string }
+
+function isSuccess<T>(result: Result<T>): result is { success: true; data: T } {
+  return true
+}
+
+let r: Result<number> = { success: true, data: 99, error: "" }
+if (isSuccess(r)) {
+  console.log(r.data)
+}
+"#;
+        assert_eq!(run_ts(src), "99\n");
+    }
+
+    #[test]
+    fn type_predicate_else_branch() {
+        // The else branch narrows to the non-matching union variants.
+        let src = r#"
+type Shape = { kind: string; radius: number } | { kind: string; width: number; height: number }
+
+function isCircle(s: Shape): s is { kind: string; radius: number } {
+  return true
+}
+
+let s: Shape = { kind: "circle", radius: 5, width: 0, height: 0 }
+if (isCircle(s)) {
+  console.log(s.radius)
+} else {
+  console.log(s.width)
+}
+"#;
+        assert_eq!(run_ts(src), "5\n");
+    }
 }
 
 // ============================================================

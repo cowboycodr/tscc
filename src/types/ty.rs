@@ -24,6 +24,8 @@ pub enum Type {
     StringLiteral(String),
     /// A specific number value used as a type (e.g. 1 in `type Bit = 0 | 1`)
     NumberLiteral(String),
+    /// A specific boolean value used as a type (e.g. `true` in `{ success: true }`)
+    BooleanLiteral(bool),
     /// Union type: string | number
     Union(Vec<Type>),
     /// Intersection type: Named & Aged (merged fields)
@@ -72,6 +74,7 @@ impl std::fmt::Display for Type {
             Type::Class { name, .. } => write!(f, "{}", name),
             Type::StringLiteral(s) => write!(f, "\"{}\"", s),
             Type::NumberLiteral(n) => write!(f, "{}", n),
+            Type::BooleanLiteral(b) => write!(f, "{}", b),
             Type::Union(types) => {
                 for (i, t) in types.iter().enumerate() {
                     if i > 0 {

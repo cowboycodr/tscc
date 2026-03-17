@@ -261,6 +261,12 @@ pub enum TypeAnnKind {
         params: Vec<TypeAnnotation>,
         return_type: Box<TypeAnnotation>,
     },
+    /// Type predicate: `param is Type` — narrows the argument type in conditionals.
+    /// At runtime the function returns bool; the narrowing is purely type-level.
+    TypePredicate {
+        param: String,
+        ty: Box<TypeAnnotation>,
+    },
 }
 
 #[derive(Debug, Clone)]

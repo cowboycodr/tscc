@@ -8263,6 +8263,8 @@ impl<'ctx> Codegen<'ctx> {
                 // Indexed access types are type-only — fallback
                 self.number_mode.clone()
             }
+            // Type predicates declare a function that returns bool at runtime.
+            TypeAnnKind::TypePredicate { .. } => VarType::Boolean,
         }
     }
 
