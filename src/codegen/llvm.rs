@@ -565,6 +565,54 @@ impl<'ctx> Codegen<'ctx> {
             self.string_type.fn_type(&[], false),
             None,
         );
+
+        // --- Date functions ---
+        // tscc_date_now() → i64  (ms since Unix epoch)
+        self.module
+            .add_function("tscc_date_now", i64_type.fn_type(&[], false), None);
+        // tscc_date_get_time(ms) → i64
+        self.module.add_function(
+            "tscc_date_get_time",
+            i64_type.fn_type(&[i64_type.into()], false),
+            None,
+        );
+        // local-time getters: all (ms: i64) → i64
+        for name in &[
+            "tscc_date_get_full_year",
+            "tscc_date_get_month",
+            "tscc_date_get_date",
+            "tscc_date_get_hours",
+            "tscc_date_get_minutes",
+            "tscc_date_get_seconds",
+            "tscc_date_get_milliseconds",
+            "tscc_date_get_utc_full_year",
+            "tscc_date_get_utc_month",
+            "tscc_date_get_utc_date",
+            "tscc_date_get_utc_hours",
+            "tscc_date_get_utc_minutes",
+            "tscc_date_get_utc_seconds",
+            "tscc_date_get_utc_milliseconds",
+        ] {
+            self.module
+                .add_function(name, i64_type.fn_type(&[i64_type.into()], false), None);
+        }
+        // tscc_date_to_iso_string(ms) → {i8*, i64}
+        self.module.add_function(
+            "tscc_date_to_iso_string",
+            self.string_type.fn_type(&[i64_type.into()], false),
+            None,
+        );
+
+        // Pre-register Date struct: { i64 } — stores ms since epoch
+        let date_struct_type = self.context.struct_type(&[i64_type.into()], false);
+        self.class_struct_types.insert(
+            "Date".to_string(),
+            (
+                date_struct_type,
+                vec![("__ms".to_string(), VarType::Integer)],
+                None,
+            ),
+        );
     }
 
     // --- Integer narrowing analysis ---
@@ -3389,6 +3437,75 @@ impl<'ctx> Codegen<'ctx> {
         function: FunctionValue<'ctx>,
         span: &Span,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        // new Date() / new Date(ms) — built-in
+        if class_name == "Date" {
+            let i64_type = self.context.i64_type();
+            let ms_val: BasicValueEnum<'ctx> = match args.len() {
+                0 => {
+                    // new Date() — current time
+                    let now_fn = self.module.get_function("tscc_date_now").unwrap();
+                    self.builder
+                        .build_call(now_fn, &[], "date_now")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .left()
+                        .unwrap()
+                }
+                1 => {
+                    // new Date(ms) — check the arg type
+                    let (arg_val, arg_vt) = self.compile_expr(&args[0], function)?;
+                    match &args[0].kind {
+                        ExprKind::StringLiteral(_) => {
+                            return Err(CompileError::error(
+                                "new Date(string) is not implemented; use new Date() or new Date(milliseconds)",
+                                span.clone(),
+                            ));
+                        }
+                        _ => {}
+                    }
+                    // Coerce number → i64
+                    match arg_vt {
+                        VarType::Integer => arg_val,
+                        VarType::Number => self
+                            .builder
+                            .build_float_to_signed_int(
+                                arg_val.into_float_value(),
+                                i64_type,
+                                "ms_i64",
+                            )
+                            .unwrap()
+                            .into(),
+                        _ => {
+                            return Err(CompileError::error(
+                                "new Date() argument must be a number (milliseconds since epoch)",
+                                span.clone(),
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(CompileError::error(
+                        "new Date() takes 0 or 1 arguments",
+                        span.clone(),
+                    ));
+                }
+            };
+            // Build { i64 } struct and insert the ms value
+            let (date_struct_type, field_info, _) =
+                self.class_struct_types.get("Date").cloned().unwrap();
+            let mut struct_val = date_struct_type.const_zero();
+            struct_val = self
+                .builder
+                .build_insert_value(struct_val, ms_val, 0, "date_struct")
+                .unwrap()
+                .into_struct_value();
+            let date_vt = VarType::Object {
+                struct_type_name: "Date".to_string(),
+                fields: field_info,
+            };
+            return Ok((struct_val.into(), date_vt));
+        }
+
         // new Map() — call tscc_map_alloc()
         if class_name == "Map" {
             let alloc_fn = self.module.get_function("tscc_map_alloc").unwrap();
@@ -4330,6 +4447,40 @@ impl<'ctx> Codegen<'ctx> {
                 if name == "Number" {
                     return self.compile_number_static_call(property, args, function, span);
                 }
+                // Date.now() — static method
+                if name == "Date" {
+                    if property == "now" {
+                        if !args.is_empty() {
+                            return Err(CompileError::error(
+                                "Date.now() takes no arguments",
+                                span.clone(),
+                            ));
+                        }
+                        let f = self.module.get_function("tscc_date_now").unwrap();
+                        let i64_result = self
+                            .builder
+                            .build_call(f, &[], "date_now")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .left()
+                            .unwrap()
+                            .into_int_value();
+                        let f64_result = self
+                            .builder
+                            .build_signed_int_to_float(
+                                i64_result,
+                                self.context.f64_type(),
+                                "date_now_f64",
+                            )
+                            .unwrap();
+                        return Ok((f64_result.into(), VarType::Number));
+                    }
+                    return Err(CompileError::error(
+                        format!("Date.{} is not implemented", property),
+                        span.clone(),
+                    ));
+                }
+
                 // crypto.*
                 if name == "crypto" {
                     if property == "randomUUID" {
@@ -4385,6 +4536,17 @@ impl<'ctx> Codegen<'ctx> {
                 let val_vt = val_vt.clone();
                 return self
                     .compile_map_method(object, obj_val, &val_vt, property, args, function, span);
+            }
+
+            // Date instance method calls
+            if let VarType::Object {
+                ref struct_type_name,
+                ..
+            } = obj_vt
+            {
+                if struct_type_name == "Date" {
+                    return self.compile_date_method(obj_val, property, args, span);
+                }
             }
 
             // Object/class method calls
@@ -5405,6 +5567,81 @@ impl<'ctx> Codegen<'ctx> {
             BasicTypeEnum::ArrayType(t) => t.size_of().expect("array should be sized"),
             BasicTypeEnum::VectorType(t) => t.size_of().expect("vector should be sized"),
         }
+    }
+
+    /// Compile a method call on a Date instance.
+    /// `obj_val` is the Date struct value `{ i64 }`.
+    fn compile_date_method(
+        &mut self,
+        obj_val: BasicValueEnum<'ctx>,
+        property: &str,
+        args: &[Expr],
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        if !args.is_empty() && property != "setTime" {
+            // All getter methods take no arguments
+            return Err(CompileError::error(
+                format!("Date.{}() takes no arguments", property),
+                span.clone(),
+            ));
+        }
+
+        // Extract ms (field 0) from the struct value
+        let ms_val = self
+            .builder
+            .build_extract_value(obj_val.into_struct_value(), 0, "date_ms")
+            .unwrap();
+
+        let fn_name = match property {
+            "getTime" => "tscc_date_get_time",
+            "getFullYear" => "tscc_date_get_full_year",
+            "getMonth" => "tscc_date_get_month",
+            "getDate" => "tscc_date_get_date",
+            "getHours" => "tscc_date_get_hours",
+            "getMinutes" => "tscc_date_get_minutes",
+            "getSeconds" => "tscc_date_get_seconds",
+            "getMilliseconds" => "tscc_date_get_milliseconds",
+            "getUTCFullYear" => "tscc_date_get_utc_full_year",
+            "getUTCMonth" => "tscc_date_get_utc_month",
+            "getUTCDate" => "tscc_date_get_utc_date",
+            "getUTCHours" => "tscc_date_get_utc_hours",
+            "getUTCMinutes" => "tscc_date_get_utc_minutes",
+            "getUTCSeconds" => "tscc_date_get_utc_seconds",
+            "getUTCMilliseconds" => "tscc_date_get_utc_milliseconds",
+            "toISOString" => {
+                let f = self.module.get_function("tscc_date_to_iso_string").unwrap();
+                let result = self
+                    .builder
+                    .build_call(f, &[ms_val.into()], "date_iso")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                return Ok((result, VarType::String));
+            }
+            other => {
+                return Err(CompileError::error(
+                    format!("Date.{}() is not implemented", other),
+                    span.clone(),
+                ));
+            }
+        };
+
+        let f = self.module.get_function(fn_name).unwrap();
+        let i64_result = self
+            .builder
+            .build_call(f, &[ms_val.into()], "date_result")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_int_value();
+        // Convert i64 → f64 so Date methods return `number` (matching JavaScript semantics)
+        let f64_result = self
+            .builder
+            .build_signed_int_to_float(i64_result, self.context.f64_type(), "date_num")
+            .unwrap();
+        Ok((f64_result.into(), VarType::Number))
     }
 
     fn compile_map_method(

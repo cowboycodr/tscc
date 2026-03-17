@@ -521,6 +521,84 @@ void** tscc_map_values_alloc(MgMap* m, long long* out_count) {
 }
 
 // ============================================================
+// Date
+// ============================================================
+
+/* Returns milliseconds since Unix epoch (UTC). */
+long long tscc_date_now(void) {
+    struct timespec ts;
+#if defined(_WIN32) || defined(_WIN64)
+    /* Windows: use GetSystemTimeAsFileTime for ms precision */
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    long long t = ((long long)ft.dwHighDateTime << 32) | (long long)ft.dwLowDateTime;
+    /* Convert Windows epoch (1601-01-01) to Unix epoch (1970-01-01): 116444736000000000 100-ns ticks */
+    t -= 116444736000000000LL;
+    return t / 10000LL;  /* 100-ns to ms */
+#elif defined(_POSIX_C_SOURCE) || defined(__APPLE__) || defined(__linux__)
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
+#else
+    return (long long)time(NULL) * 1000LL;
+#endif
+}
+
+/* getTime() — same as the stored ms value. */
+long long tscc_date_get_time(long long ms) { return ms; }
+
+/* Local-time getters — decompose ms via localtime. */
+static struct tm tscc_ms_to_local(long long ms) {
+    time_t sec = (time_t)(ms / 1000);
+    struct tm t;
+#if defined(_WIN32) || defined(_WIN64)
+    localtime_s(&t, &sec);
+#else
+    localtime_r(&sec, &t);
+#endif
+    return t;
+}
+
+/* UTC getters — decompose ms via gmtime. */
+static struct tm tscc_ms_to_utc(long long ms) {
+    time_t sec = (time_t)(ms / 1000);
+    struct tm t;
+#if defined(_WIN32) || defined(_WIN64)
+    gmtime_s(&t, &sec);
+#else
+    gmtime_r(&sec, &t);
+#endif
+    return t;
+}
+
+long long tscc_date_get_full_year(long long ms)     { return (long long)(tscc_ms_to_local(ms).tm_year + 1900); }
+long long tscc_date_get_month(long long ms)         { return (long long)tscc_ms_to_local(ms).tm_mon; }   /* 0-indexed */
+long long tscc_date_get_date(long long ms)          { return (long long)tscc_ms_to_local(ms).tm_mday; }  /* 1-indexed */
+long long tscc_date_get_hours(long long ms)         { return (long long)tscc_ms_to_local(ms).tm_hour; }
+long long tscc_date_get_minutes(long long ms)       { return (long long)tscc_ms_to_local(ms).tm_min; }
+long long tscc_date_get_seconds(long long ms)       { return (long long)tscc_ms_to_local(ms).tm_sec; }
+long long tscc_date_get_milliseconds(long long ms)  { return ms % 1000LL; }
+
+long long tscc_date_get_utc_full_year(long long ms)    { return (long long)(tscc_ms_to_utc(ms).tm_year + 1900); }
+long long tscc_date_get_utc_month(long long ms)        { return (long long)tscc_ms_to_utc(ms).tm_mon; }
+long long tscc_date_get_utc_date(long long ms)         { return (long long)tscc_ms_to_utc(ms).tm_mday; }
+long long tscc_date_get_utc_hours(long long ms)        { return (long long)tscc_ms_to_utc(ms).tm_hour; }
+long long tscc_date_get_utc_minutes(long long ms)      { return (long long)tscc_ms_to_utc(ms).tm_min; }
+long long tscc_date_get_utc_seconds(long long ms)      { return (long long)tscc_ms_to_utc(ms).tm_sec; }
+long long tscc_date_get_utc_milliseconds(long long ms) { return ms % 1000LL; }
+
+/* toISOString() — "YYYY-MM-DDTHH:MM:SS.mmmZ" (always UTC, 24 chars) */
+MgString tscc_date_to_iso_string(long long ms) {
+    struct tm t = tscc_ms_to_utc(ms);
+    int millis = (int)(ms < 0 ? (1000 + ms % 1000) % 1000 : ms % 1000);
+    char* buf = (char*)malloc(25);
+    snprintf(buf, 25, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+             t.tm_hour, t.tm_min, t.tm_sec, millis);
+    MgString s; s.data = buf; s.len = 24;
+    return s;
+}
+
+// ============================================================
 // Global functions
 // ============================================================
 double tscc_parseInt(char* data, long long len) {

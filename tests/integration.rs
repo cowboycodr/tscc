@@ -1463,7 +1463,97 @@ console.log(s.get(\"x\"))
 }
 
 // ============================================================
-// 15. NOT YET IMPLEMENTED — TypeScript Coverage Gap
+// 15. DATE
+// ============================================================
+mod date {
+    use super::*;
+
+    #[test]
+    fn date_now_returns_number() {
+        // Date.now() should return a positive integer (ms since epoch)
+        let src = "
+const t = Date.now()
+console.log(t > 0)
+";
+        assert_eq!(run_ts(src), "true\n");
+    }
+
+    #[test]
+    fn date_new_no_args() {
+        // new Date() should not crash; getTime() should be > 0
+        let src = "
+const d = new Date()
+console.log(d.getTime() > 0)
+";
+        assert_eq!(run_ts(src), "true\n");
+    }
+
+    #[test]
+    fn date_new_from_ms() {
+        // new Date(0) is the Unix epoch; getTime() should return 0
+        let src = "
+const d = new Date(0)
+console.log(d.getTime())
+";
+        assert_eq!(run_ts(src), "0\n");
+    }
+
+    #[test]
+    fn date_get_full_year() {
+        // 2025-03-16T00:00:00Z = ms = 1742083200000
+        let src = "
+const d = new Date(1742083200000)
+console.log(d.getUTCFullYear())
+console.log(d.getUTCMonth())
+console.log(d.getUTCDate())
+";
+        assert_eq!(run_ts(src), "2025\n2\n16\n");
+    }
+
+    #[test]
+    fn date_get_utc_time_components() {
+        // 2000-01-01T11:30:45.678Z = ms = 946726245678
+        let src = "
+const d = new Date(946726245678)
+console.log(d.getUTCFullYear())
+console.log(d.getUTCMonth())
+console.log(d.getUTCDate())
+console.log(d.getUTCHours())
+console.log(d.getUTCMinutes())
+console.log(d.getUTCSeconds())
+console.log(d.getUTCMilliseconds())
+";
+        assert_eq!(run_ts(src), "2000\n0\n1\n11\n30\n45\n678\n");
+    }
+
+    #[test]
+    fn date_to_iso_string() {
+        // 2000-01-01T11:30:45.678Z = ms = 946726245678
+        let src = r#"
+const d = new Date(946726245678)
+console.log(d.toISOString())
+"#;
+        assert_eq!(run_ts(src), "2000-01-01T11:30:45.678Z\n");
+    }
+
+    #[test]
+    fn date_string_arg_compile_error() {
+        assert_compile_fails("const d = new Date(\"2024-01-01\")");
+    }
+
+    #[test]
+    fn date_type_annotation() {
+        // createdAt: Date type annotation should be accepted
+        let src = "
+const d: Date = new Date(0)
+console.log(d.getTime())
+";
+        assert_eq!(run_ts(src), "0\n");
+    }
+}
+
+// ============================================================
+// 16. NOT YET IMPLEMENTED — TypeScript Coverage Gap
 //
 // Each #[ignore] test represents a TypeScript feature that tscc
 // does not yet support. The total ignored count = coverage gap.

@@ -65,6 +65,15 @@ impl TypeChecker {
         self.define("Math".to_string(), Type::Unknown, true);
         // crypto (Web Crypto API — only randomUUID() implemented)
         self.define("crypto".to_string(), Type::Unknown, true);
+        // Date — built-in class (backed by a ms-since-epoch i64)
+        self.define("Date".to_string(), Type::Unknown, true);
+        self.class_types.insert(
+            "Date".to_string(),
+            Type::Class {
+                name: "Date".to_string(),
+                fields: vec![],
+            },
+        );
         // Number (special object with static methods)
         self.define("Number".to_string(), Type::Unknown, true);
         // NaN global constant
@@ -1302,6 +1311,42 @@ impl TypeChecker {
                     }
                 }
 
+                // Date instance methods
+                if let Type::Class { name, .. } = &obj_type {
+                    if name == "Date" {
+                        match property.as_str() {
+                            "getTime" | "getFullYear" | "getMonth" | "getDate" | "getHours"
+                            | "getMinutes" | "getSeconds" | "getMilliseconds"
+                            | "getUTCFullYear" | "getUTCMonth" | "getUTCDate" | "getUTCHours"
+                            | "getUTCMinutes" | "getUTCSeconds" | "getUTCMilliseconds" => {
+                                return Ok(Type::Function {
+                                    params: vec![],
+                                    return_type: Box::new(Type::Number),
+                                });
+                            }
+                            "toISOString" => {
+                                return Ok(Type::Function {
+                                    params: vec![],
+                                    return_type: Box::new(Type::String),
+                                });
+                            }
+                            other => {
+                                return Err(CompileError::error(
+                                    format!("Date.{}() is not implemented", other),
+                                    expr.span.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Date.now() static — also handle as member on Date identifier
+                if let ExprKind::Identifier(name) = &object.kind {
+                    if name == "Date" && property == "now" {
+                        return Ok(Type::Number);
+                    }
+                }
+
                 // Unknown type (e.g. Map) — return Unknown for any property access
                 if obj_type == Type::Unknown {
                     return Ok(Type::Unknown);
@@ -1417,6 +1462,23 @@ impl TypeChecker {
                         self.check_expr(arg)?;
                     }
                     return Ok(Type::Unknown);
+                }
+
+                // new Date() / new Date(ms) — built-in
+                if class_name == "Date" {
+                    for arg in args {
+                        let arg_type = self.check_expr(arg)?;
+                        if matches!(arg_type, Type::String | Type::StringLiteral(_)) {
+                            return Err(CompileError::error(
+                                "new Date(string) is not implemented; use new Date() or new Date(milliseconds)",
+                                expr.span.clone(),
+                            ));
+                        }
+                    }
+                    return Ok(Type::Class {
+                        name: "Date".to_string(),
+                        fields: vec![],
+                    });
                 }
 
                 let class_type = self.class_types.get(class_name).cloned().ok_or_else(|| {
