@@ -296,104 +296,98 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Parity Test Suite
 
-The parity suite (`mod parity` in `tests/integration.rs`) tracks output correctness against Node.js.
-Each test asserts the exact output Node.js produces. Tests marked **ignored** compile successfully today but produce wrong output — they auto-pass once the underlying bug is fixed.
+Tracks output correctness against Node.js. Each test asserts the exact output Node.js produces.
 
-Run the full parity backlog: `cargo test parity -- --ignored`
+:white_check_mark: = matches Node.js exactly &nbsp; :warning: = compiles but wrong output (auto-passes when fixed)
 
-### Passing parity tests (correct Node.js output confirmed)
+Run the full backlog: `cargo test parity -- --ignored`
 
-| Area | Test | Expected output |
-|---|---|---|
-| **console.log** | multiple args space-separated | `1 hi true` |
-| | number array format | `[ 1, 2, 3 ]` |
-| | object with number values | `{ x: 1, y: 2 }` |
-| | boolean in console.log | `true` / `false` |
-| **typeof** | `typeof 42` | `"number"` |
-| | `typeof "hello"` | `"string"` |
-| | `typeof true` | `"boolean"` |
-| | `typeof {}` | `"object"` |
-| | `typeof [1,2,3]` | `"object"` |
-| **Number formatting** | negative float `-3.14` | `-3.14` |
-| | integer division `10 / 2` | `5` |
-| | non-integer division `7 / 2` | `3.5` |
-| **String coercions** | `"" + true` | `"true"` |
-| | `"" + false` | `"false"` |
-| | `"val=" + 42` | `"val=42"` |
-| | `"val=" + 3.14` | `"val=3.14"` |
-| **Equality** | `1 === 1` | `true` |
-| | `"a" === "a"` | `true` |
-| | `true === true` | `true` |
-| **Math** | `Math.floor(1.9)` | `1` |
-| | `Math.floor(-1.5)` | `-2` |
-| | `Math.ceil(1.1)` | `2` |
-| | `Math.ceil(-1.5)` | `-1` |
-| | `Math.round(0.5)` | `1` |
-| | `Math.abs(-5)` | `5` |
-| | `Math.max(3, 7)` | `7` |
-| | `Math.min(3, 7)` | `3` |
-| | `Math.pow(2, 10)` | `1024` |
-| | `Math.sqrt(9)` | `3` |
-| **Arrays** | `[1, 2, 3]` | `[ 1, 2, 3 ]` |
-| | `[42]` | `[ 42 ]` |
-| | array length after push | `4` |
-| **Objects** | `{ x: 1, y: 2 }` | `{ x: 1, y: 2 }` |
-| | `{ flag: true }` | `{ flag: true }` |
-
-### Ignored parity tests (compile OK, wrong output — backlog)
-
-| Area | Test | tscc output | Expected |
+| Area | Test | Expected output | Status |
 |---|---|---|---|
-| **console.log** | `console.log(null)` | `0` | `null` |
-| | `console.log(undefined)` | `0` | `undefined` |
-| | `console.log(NaN)` | `nan` | `NaN` |
-| | `console.log(Infinity)` | `inf` | `Infinity` |
-| | `console.log(-Infinity)` | `-inf` | `-Infinity` |
-| | `console.log(-0)` | `0` | `-0` |
-| | `console.log([])` | `[  ]` | `[]` |
-| | `console.log({})` | `{  }` | `{}` |
-| | `console.log(["a","b","c"])` | garbage IEEE754 | `[ 'a', 'b', 'c' ]` |
-| | `console.log([[1,2],[3,4]])` | garbage pointers | `[ [ 1, 2 ], [ 3, 4 ] ]` |
-| | `console.log({a:{b:1}})` | `{ a: [complex] }` | `{ a: { b: 1 } }` |
-| | `console.log({name:"alice"})` | `{ name: alice }` | `{ name: 'alice' }` |
-| **Class printing** | `console.log(new Point(3,4))` | `{ x: 3, y: 4 }` | `Point { x: 3, y: 4 }` |
-| | class with string field | unquoted value | `Person { name: 'Alice' }` |
-| | inherited class instance | no class name | `Dog { name: 'Rex' }` |
-| | class with mixed fields | no class name, no quotes | `Item { id: 1, label: 'foo', active: true }` |
-| **typeof** | `typeof null` | `"number"` | `"object"` |
-| | `typeof undefined` | `"number"` | `"undefined"` |
-| | `typeof (() => {})` | `"object"` | `"function"` |
-| | `typeof function` | `"object"` | `"function"` |
-| **Number formatting** | `0.1 + 0.2` | `0.3` | `0.30000000000000004` |
-| | `1 / 0` | `inf` | `Infinity` |
-| | `-1 / 0` | `-inf` | `-Infinity` |
-| | `NaN === NaN` | `true` | `false` |
-| | `9007199254740992` | scientific notation | `9007199254740992` |
-| **String coercions** | `"" + null` | `0` | `null` |
-| | `"" + undefined` | `0` | `undefined` |
-| | `"" + NaN` | `nan` | `NaN` |
-| | `"" + Infinity` | `inf` | `Infinity` |
-| **Equality** | `NaN === NaN` | `true` | `false` |
-| | `null === undefined` | `true` | `false` |
-| | `null == undefined` | `false` | `true` |
-| | `0 == ""` | `false` | `true` |
-| **Math** | `Math.round(-0.5)` | `-1` | `0` |
-| | `Math.trunc(1.9)` | compile error / missing | `1` |
-| | `Math.trunc(-1.9)` | compile error / missing | `-1` |
-| | `Math.sign(5)` | missing | `1` |
-| | `Math.sign(-5)` | missing | `-1` |
-| | `Math.sign(0)` | missing | `0` |
-| | `Math.log2(8)` | missing | `3` |
-| | `Math.log10(1000)` | missing | `3` |
-| | `Math.hypot(3,4)` | missing | `5` |
-| | `Math.clz32(1)` | missing | `31` |
-| **Arrays** | `console.log([])` | `[  ]` | `[]` |
-| | `console.log(["a","b","c"])` | garbage | `[ 'a', 'b', 'c' ]` |
-| | `console.log([[1,2],[3,4]])` | garbage | `[ [ 1, 2 ], [ 3, 4 ] ]` |
-| | `console.log([true,false,true])` | unknown | `[ true, false, true ]` |
-| **Objects** | `console.log({})` | `{  }` | `{}` |
-| | `console.log({name:"hello"})` | unquoted value | `{ name: 'hello' }` |
-| | `console.log({a:{b:1}})` | `{ a: [complex] }` | `{ a: { b: 1 } }` |
+| **console.log** | multiple args: `console.log(1, "hi", true)` | `1 hi true` | :white_check_mark: |
+| | number array: `console.log([1, 2, 3])` | `[ 1, 2, 3 ]` | :white_check_mark: |
+| | object with numbers: `console.log({ x: 1, y: 2 })` | `{ x: 1, y: 2 }` | :white_check_mark: |
+| | booleans: `console.log(true)` | `true` / `false` | :white_check_mark: |
+| | `console.log(null)` | `null` | :warning: prints `0` |
+| | `console.log(undefined)` | `undefined` | :warning: prints `0` |
+| | `console.log(NaN)` | `NaN` | :warning: prints `nan` |
+| | `console.log(Infinity)` | `Infinity` | :warning: prints `inf` |
+| | `console.log(-Infinity)` | `-Infinity` | :warning: prints `-inf` |
+| | `console.log(-0)` | `-0` | :warning: prints `0` |
+| | `console.log([])` | `[]` | :warning: prints `[  ]` |
+| | `console.log({})` | `{}` | :warning: prints `{  }` |
+| | `console.log(["a","b","c"])` | `[ 'a', 'b', 'c' ]` | :warning: prints garbage IEEE754 |
+| | `console.log([[1,2],[3,4]])` | `[ [ 1, 2 ], [ 3, 4 ] ]` | :warning: prints garbage pointers |
+| | `console.log({a:{b:1}})` | `{ a: { b: 1 } }` | :warning: prints `{ a: [complex] }` |
+| | `console.log({name:"alice"})` | `{ name: 'alice' }` | :warning: value unquoted |
+| **Class printing** | `console.log(new Point(3,4))` | `Point { x: 3, y: 4 }` | :warning: no class name prefix |
+| | class with string field | `Person { name: 'Alice' }` | :warning: no name, unquoted |
+| | inherited class | `Dog { name: 'Rex' }` | :warning: no class name |
+| | class with mixed fields | `Item { id: 1, label: 'foo', active: true }` | :warning: no name, unquoted |
+| **typeof** | `typeof 42` | `"number"` | :white_check_mark: |
+| | `typeof "hello"` | `"string"` | :white_check_mark: |
+| | `typeof true` | `"boolean"` | :white_check_mark: |
+| | `typeof {}` | `"object"` | :white_check_mark: |
+| | `typeof [1,2,3]` | `"object"` | :white_check_mark: |
+| | `typeof null` | `"object"` | :warning: returns `"number"` |
+| | `typeof undefined` | `"undefined"` | :warning: returns `"number"` |
+| | `typeof (() => {})` | `"function"` | :warning: returns `"object"` |
+| | `typeof function` | `"function"` | :warning: returns `"object"` |
+| **Number formatting** | `console.log(-3.14)` | `-3.14` | :white_check_mark: |
+| | `console.log(10 / 2)` | `5` | :white_check_mark: |
+| | `console.log(7 / 2)` | `3.5` | :white_check_mark: |
+| | `console.log(0.1 + 0.2)` | `0.30000000000000004` | :warning: prints `0.3` |
+| | `console.log(1 / 0)` | `Infinity` | :warning: prints `inf` |
+| | `console.log(-1 / 0)` | `-Infinity` | :warning: prints `-inf` |
+| | `console.log(NaN === NaN)` | `false` | :warning: returns `true` |
+| | `console.log(9007199254740992)` | `9007199254740992` | :warning: scientific notation |
+| **String coercions** | `"" + true` | `true` | :white_check_mark: |
+| | `"" + false` | `false` | :white_check_mark: |
+| | `"val=" + 42` | `val=42` | :white_check_mark: |
+| | `"val=" + 3.14` | `val=3.14` | :white_check_mark: |
+| | `"" + null` | `null` | :warning: yields `0` |
+| | `"" + undefined` | `undefined` | :warning: yields `0` |
+| | `"" + NaN` | `NaN` | :warning: yields `nan` |
+| | `"" + Infinity` | `Infinity` | :warning: yields `inf` |
+| **Equality** | `1 === 1` | `true` | :white_check_mark: |
+| | `"a" === "a"` | `true` | :white_check_mark: |
+| | `true === true` | `true` | :white_check_mark: |
+| | `NaN === NaN` | `false` | :warning: returns `true` |
+| | `null === undefined` | `false` | :warning: returns `true` |
+| | `null == undefined` | `true` | :warning: loose equality not implemented |
+| | `0 == ""` | `true` | :warning: loose equality not implemented |
+| **Math** | `Math.floor(1.9)` | `1` | :white_check_mark: |
+| | `Math.floor(-1.5)` | `-2` | :white_check_mark: |
+| | `Math.ceil(1.1)` | `2` | :white_check_mark: |
+| | `Math.ceil(-1.5)` | `-1` | :white_check_mark: |
+| | `Math.round(0.5)` | `1` | :white_check_mark: |
+| | `Math.abs(-5)` | `5` | :white_check_mark: |
+| | `Math.max(3, 7)` | `7` | :white_check_mark: |
+| | `Math.min(3, 7)` | `3` | :white_check_mark: |
+| | `Math.pow(2, 10)` | `1024` | :white_check_mark: |
+| | `Math.sqrt(9)` | `3` | :white_check_mark: |
+| | `Math.round(-0.5)` | `0` | :warning: returns `-1` |
+| | `Math.trunc(1.9)` | `1` | :warning: not implemented |
+| | `Math.trunc(-1.9)` | `-1` | :warning: not implemented |
+| | `Math.sign(5)` | `1` | :warning: not implemented |
+| | `Math.sign(-5)` | `-1` | :warning: not implemented |
+| | `Math.sign(0)` | `0` | :warning: not implemented |
+| | `Math.log2(8)` | `3` | :warning: not implemented |
+| | `Math.log10(1000)` | `3` | :warning: not implemented |
+| | `Math.hypot(3, 4)` | `5` | :warning: not implemented |
+| | `Math.clz32(1)` | `31` | :warning: not implemented |
+| **Arrays** | `console.log([1, 2, 3])` | `[ 1, 2, 3 ]` | :white_check_mark: |
+| | `console.log([42])` | `[ 42 ]` | :white_check_mark: |
+| | array length after push | `4` | :white_check_mark: |
+| | `console.log([])` | `[]` | :warning: prints `[  ]` |
+| | `console.log(["a","b","c"])` | `[ 'a', 'b', 'c' ]` | :warning: garbage output |
+| | `console.log([[1,2],[3,4]])` | `[ [ 1, 2 ], [ 3, 4 ] ]` | :warning: garbage output |
+| | `console.log([true,false,true])` | `[ true, false, true ]` | :warning: unverified |
+| **Objects** | `console.log({ x: 1, y: 2 })` | `{ x: 1, y: 2 }` | :white_check_mark: |
+| | `console.log({ flag: true })` | `{ flag: true }` | :white_check_mark: |
+| | `console.log({})` | `{}` | :warning: prints `{  }` |
+| | `console.log({ name: "hello" })` | `{ name: 'hello' }` | :warning: value unquoted |
+| | `console.log({ a: { b: 1 } })` | `{ a: { b: 1 } }` | :warning: prints `{ a: [complex] }` |
 
 ## License
 
