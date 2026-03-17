@@ -1463,7 +1463,71 @@ console.log(s.get(\"x\"))
 }
 
 // ============================================================
-// 15. DATE
+// 15. DISCRIMINATED UNIONS
+// ============================================================
+mod discriminated_unions {
+    use super::*;
+
+    #[test]
+    fn shared_property_access() {
+        // Accessing a property present in ALL union variants is valid TypeScript
+        let src = r#"
+type Result = { success: boolean; value: number } | { success: boolean; error: string }
+function check(r: Result): boolean {
+  return r.success
+}
+console.log(check({ success: true, value: 42, error: "" }))
+console.log(check({ success: false, value: 0, error: "oops" }))
+"#;
+        assert_eq!(run_ts(src), "true\nfalse\n");
+    }
+
+    #[test]
+    fn discriminated_union_widening() {
+        // Object literals returned as a union type are widened to the merged struct.
+        // Both return sites produce different fields; the merged struct holds all.
+        let src = r#"
+type Result = { ok: boolean; val: number; err: string }
+function make_ok(n: number): Result {
+  return { ok: true, val: n, err: "" }
+}
+function make_err(msg: string): Result {
+  return { ok: false, val: 0, err: msg }
+}
+const r1 = make_ok(99)
+const r2 = make_err("bad")
+console.log(r1.ok)
+console.log(r1.val)
+console.log(r2.ok)
+console.log(r2.err)
+"#;
+        assert_eq!(run_ts(src), "true\n99\nfalse\nbad\n");
+    }
+
+    #[test]
+    fn two_variant_result_type() {
+        // Classic Result<T> discriminated union
+        let src = r#"
+type Result = { success: boolean; data: number; error: string }
+function divide(a: number, b: number): Result {
+  if (b === 0) {
+    return { success: false, data: 0, error: "division by zero" }
+  }
+  return { success: true, data: a / b, error: "" }
+}
+const r1 = divide(10, 2)
+const r2 = divide(5, 0)
+console.log(r1.success)
+console.log(r1.data)
+console.log(r2.success)
+console.log(r2.error)
+"#;
+        assert_eq!(run_ts(src), "true\n5\nfalse\ndivision by zero\n");
+    }
+}
+
+// ============================================================
+// 16. DATE
 // ============================================================
 mod date {
     use super::*;

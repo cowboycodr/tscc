@@ -1311,6 +1311,43 @@ impl TypeChecker {
                     }
                 }
 
+                // Union of objects: allow accessing a property present in ALL variants.
+                // This is TypeScript's discriminated-union shared-property rule.
+                if let Type::Union(ref variants) = obj_type {
+                    let all_object_like = variants.iter().all(|v| {
+                        matches!(v, Type::Object { .. } | Type::Class { .. } | Type::Unknown)
+                    });
+                    if all_object_like {
+                        let found_in_all = variants.iter().all(|v| match v {
+                            Type::Object { fields } | Type::Class { fields, .. } => {
+                                fields.iter().any(|(n, _)| n == property)
+                            }
+                            Type::Unknown => true, // Unknown passes everything
+                            _ => false,
+                        });
+                        if found_in_all {
+                            // Return the union of the property's type across all variants
+                            // (simplified: return first found type, or Unknown)
+                            let first_ty = variants.iter().find_map(|v| match v {
+                                Type::Object { fields } | Type::Class { fields, .. } => fields
+                                    .iter()
+                                    .find(|(n, _)| n == property)
+                                    .map(|(_, t)| t.clone()),
+                                _ => None,
+                            });
+                            return Ok(first_ty.unwrap_or(Type::Unknown));
+                        }
+                        // Property missing from at least one variant — error
+                        return Err(CompileError::error(
+                            format!(
+                                "Property '{}' does not exist on all variants of the union type",
+                                property
+                            ),
+                            expr.span.clone(),
+                        ));
+                    }
+                }
+
                 // Date instance methods
                 if let Type::Class { name, .. } = &obj_type {
                     if name == "Date" {

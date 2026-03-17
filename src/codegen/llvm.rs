@@ -778,7 +778,26 @@ impl<'ctx> Codegen<'ctx> {
         // Analysis pass: detect functions that can use i64 instead of f64
         self.integer_functions = Self::analyze_integer_functions(program);
 
-        // First pass: register interfaces and classes (so type_ann_to_var_type works)
+        // First pass: register type aliases, interfaces, and classes
+        // (so type_ann_to_var_type works when compiling functions in the second pass)
+        for stmt in &program.statements {
+            // Register type aliases first so they're available for interface/class resolution
+            if let StmtKind::TypeAlias {
+                name,
+                type_params,
+                type_ann,
+            } = &stmt.kind
+            {
+                self.type_aliases_for_codegen
+                    .insert(name.clone(), type_ann.clone());
+                if !type_params.is_empty() {
+                    let tp_names: Vec<String> =
+                        type_params.iter().map(|tp| tp.name.clone()).collect();
+                    self.generic_alias_params
+                        .insert(name.clone(), (tp_names, type_ann.clone()));
+                }
+            }
+        }
         for stmt in &program.statements {
             match &stmt.kind {
                 StmtKind::InterfaceDecl {
@@ -2900,7 +2919,105 @@ impl<'ctx> Codegen<'ctx> {
                 .into_struct_value();
         }
 
+        // Discriminated union widening: if a registered merged-union struct is a
+        // strict superset of our fields, automatically widen into it (zero-filling
+        // any fields this literal doesn't provide).
+        if let Some((merged_name, merged_fields)) = self.find_union_superset(&fields) {
+            let (merged_struct_type, _, _) =
+                self.class_struct_types.get(&merged_name).cloned().unwrap();
+            let mut wide_val = merged_struct_type.const_zero();
+            for (src_name, src_val, _) in &field_vals {
+                if let Some(dst_idx) = merged_fields.iter().position(|(n, _)| n == src_name) {
+                    wide_val = self
+                        .builder
+                        .build_insert_value(wide_val, *src_val, dst_idx as u32, "union.field")
+                        .unwrap()
+                        .into_struct_value();
+                }
+            }
+            let wide_vt = VarType::Object {
+                struct_type_name: merged_name,
+                fields: merged_fields,
+            };
+            return Ok((wide_val.into(), wide_vt));
+        }
+
         Ok((struct_val.into(), obj_vt))
+    }
+
+    /// Find a registered `__union_obj_*` struct whose field list is a STRICT superset
+    /// of `current_fields`. Returns `(struct_name, all_fields)` if found, else `None`.
+    fn find_union_superset(
+        &self,
+        current_fields: &[(String, VarType)],
+    ) -> Option<(String, Vec<(String, VarType)>)> {
+        // Only attempt widening when we actually have fewer fields than the candidate.
+        for (struct_name, (_, candidate_fields, _)) in &self.class_struct_types {
+            if !struct_name.starts_with("__union_obj_") {
+                continue;
+            }
+            // candidate must have strictly more fields
+            if candidate_fields.len() <= current_fields.len() {
+                continue;
+            }
+            // every current field must exist in the candidate (by name)
+            let all_present = current_fields
+                .iter()
+                .all(|(name, _)| candidate_fields.iter().any(|(n, _)| n == name));
+            if all_present {
+                return Some((struct_name.clone(), candidate_fields.clone()));
+            }
+        }
+        None
+    }
+
+    /// Coerce `val` (of `VarType::Object`) to a target `VarType::Object` that is a superset,
+    /// zero-filling any missing fields. No-op if types already match or target is not an Object.
+    fn coerce_to_object_target(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        src_vt: &VarType,
+        target_vt: &VarType,
+    ) -> (BasicValueEnum<'ctx>, VarType) {
+        if let (
+            VarType::Object {
+                fields: src_fields, ..
+            },
+            VarType::Object {
+                struct_type_name: dst_name,
+                fields: dst_fields,
+            },
+        ) = (src_vt, target_vt)
+        {
+            if dst_fields.len() > src_fields.len() {
+                if let Some((dst_struct_type, _, _)) =
+                    self.class_struct_types.get(dst_name).cloned()
+                {
+                    let src_struct = val.into_struct_value();
+                    let mut wide_val = dst_struct_type.const_zero();
+                    for (src_idx, (src_name, _)) in src_fields.iter().enumerate() {
+                        if let Some(dst_idx) = dst_fields.iter().position(|(n, _)| n == src_name) {
+                            let field_val = self
+                                .builder
+                                .build_extract_value(src_struct, src_idx as u32, src_name)
+                                .unwrap();
+                            wide_val = self
+                                .builder
+                                .build_insert_value(
+                                    wide_val,
+                                    field_val,
+                                    dst_idx as u32,
+                                    "wide.field",
+                                )
+                                .unwrap()
+                                .into_struct_value();
+                        }
+                    }
+                    return (wide_val.into(), target_vt.clone());
+                }
+            }
+        }
+        (val, src_vt.clone())
     }
 
     fn compile_member_assignment(
@@ -6854,16 +6971,19 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(vt) = self.type_substitutions.get(name) {
                     return vt.clone();
                 }
-                // Look up class struct types
+                // Look up class struct types (includes pre-registered built-ins like Date)
                 if let Some((_, field_info, _)) = self.class_struct_types.get(name) {
-                    VarType::Object {
+                    return VarType::Object {
                         struct_type_name: name.clone(),
                         fields: field_info.clone(),
-                    }
-                } else {
-                    // Unknown named type — treat as number for now
-                    self.number_mode.clone()
+                    };
                 }
+                // Resolve non-generic type aliases (e.g. `type Result = A | B`)
+                if let Some(alias_ann) = self.type_aliases_for_codegen.get(name).cloned() {
+                    return self.type_ann_to_var_type(&alias_ann);
+                }
+                // Unknown named type — treat as number for now
+                self.number_mode.clone()
             }
             TypeAnnKind::Typeof(_) => {
                 // typeof is resolved by the type checker; at codegen the variable's
@@ -6880,10 +7000,53 @@ impl<'ctx> Codegen<'ctx> {
                     .map(|v| self.type_ann_to_var_type(v))
                     .collect();
                 if var_types.is_empty() {
-                    self.number_mode.clone()
-                } else {
-                    VarType::Union(var_types)
+                    return self.number_mode.clone();
                 }
+                // If ALL variants are Object types, merge them into a single
+                // struct with the union of all fields (discriminated union pattern).
+                // This matches JavaScript's runtime behaviour: no tag needed,
+                // just a plain object with all possible fields.
+                let all_objects = var_types
+                    .iter()
+                    .all(|v| matches!(v, VarType::Object { .. }));
+                if all_objects {
+                    let mut merged_fields: Vec<(String, VarType)> = Vec::new();
+                    for vt in &var_types {
+                        if let VarType::Object { fields, .. } = vt {
+                            for (fname, fvt) in fields {
+                                if !merged_fields.iter().any(|(n, _)| n == fname) {
+                                    merged_fields.push((fname.clone(), fvt.clone()));
+                                }
+                            }
+                        }
+                    }
+                    // Build a deterministic struct name from the field list
+                    let struct_name = format!(
+                        "__union_obj_{}",
+                        merged_fields
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join("_")
+                    );
+                    // Register in class_struct_types if not already present
+                    if !self.class_struct_types.contains_key(&struct_name) {
+                        let field_llvm_types: Vec<BasicTypeEnum> = merged_fields
+                            .iter()
+                            .map(|(_, vt)| self.var_type_to_llvm(vt))
+                            .collect();
+                        let struct_type = self.context.struct_type(&field_llvm_types, false);
+                        self.class_struct_types.insert(
+                            struct_name.clone(),
+                            (struct_type, merged_fields.clone(), None),
+                        );
+                    }
+                    return VarType::Object {
+                        struct_type_name: struct_name,
+                        fields: merged_fields,
+                    };
+                }
+                VarType::Union(var_types)
             }
             TypeAnnKind::Intersection(variants) => {
                 // Intersection merges object fields — build combined object type
