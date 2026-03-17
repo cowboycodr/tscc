@@ -1617,6 +1617,648 @@ console.log(d.getTime())
 }
 
 // ============================================================
+// 17. PARITY — Output Correctness vs Node.js
+//
+// These tests assert the *exact* output Node.js produces.
+// Tests marked #[ignore] compile successfully in tscc but
+// produce wrong output today. They auto-pass once fixed.
+// Run the full parity backlog with:
+//   cargo test parity -- --ignored
+// ============================================================
+mod parity {
+    use super::*;
+
+    // --------------------------------------------------------
+    // console.log formatting
+    // --------------------------------------------------------
+    mod console_log_formatting {
+        use super::*;
+
+        #[test]
+        #[ignore = "parity: null prints as 0, should print 'null'"]
+        fn null_prints_as_null() {
+            assert_eq!(run_ts("console.log(null)"), "null\n");
+        }
+
+        #[test]
+        #[ignore = "parity: undefined prints as 0, should print 'undefined'"]
+        fn undefined_prints_as_undefined() {
+            assert_eq!(run_ts("console.log(undefined)"), "undefined\n");
+        }
+
+        #[test]
+        #[ignore = "parity: NaN prints as 'nan', should print 'NaN'"]
+        fn nan_prints_as_nan() {
+            assert_eq!(run_ts("console.log(NaN)"), "NaN\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Infinity prints as 'inf', should print 'Infinity'"]
+        fn infinity_prints_as_infinity() {
+            assert_eq!(run_ts("console.log(Infinity)"), "Infinity\n");
+        }
+
+        #[test]
+        #[ignore = "parity: -Infinity prints as '-inf', should print '-Infinity'"]
+        fn neg_infinity_prints_correctly() {
+            assert_eq!(run_ts("console.log(-Infinity)"), "-Infinity\n");
+        }
+
+        #[test]
+        #[ignore = "parity: -0 prints as 0, should print '-0'"]
+        fn neg_zero_prints_as_neg_zero() {
+            assert_eq!(run_ts("console.log(-0)"), "-0\n");
+        }
+
+        #[test]
+        #[ignore = "parity: empty array prints as '[  ]' with extra spaces, should be '[]'"]
+        fn empty_array_no_spaces() {
+            assert_eq!(run_ts("console.log([])"), "[]\n");
+        }
+
+        #[test]
+        #[ignore = "parity: empty object prints as '{  }' with extra spaces, should be '{}'"]
+        fn empty_object_no_spaces() {
+            assert_eq!(run_ts("console.log({})"), "{}\n");
+        }
+
+        #[test]
+        #[ignore = "parity: string array literal prints garbage IEEE754 numbers instead of quoted strings"]
+        fn string_array_literal() {
+            assert_eq!(
+                run_ts(r#"console.log(["a", "b", "c"])"#),
+                "[ 'a', 'b', 'c' ]\n"
+            );
+        }
+
+        #[test]
+        #[ignore = "parity: nested number array prints as garbage pointer values, should recurse"]
+        fn nested_number_array() {
+            assert_eq!(
+                run_ts("console.log([[1, 2], [3, 4]])"),
+                "[ [ 1, 2 ], [ 3, 4 ] ]\n"
+            );
+        }
+
+        #[test]
+        #[ignore = "parity: nested object prints as '{ a: [complex] }', should recurse"]
+        fn nested_object() {
+            assert_eq!(run_ts("console.log({ a: { b: 1 } })"), "{ a: { b: 1 } }\n");
+        }
+
+        #[test]
+        #[ignore = "parity: object with string value prints value unquoted, should be single-quoted"]
+        fn object_with_string_value() {
+            assert_eq!(
+                run_ts(r#"console.log({ name: "alice" })"#),
+                "{ name: 'alice' }\n"
+            );
+        }
+
+        #[test]
+        fn multiple_args_space_separated() {
+            // Node.js: console.log(1, "hi", true) => "1 hi true"
+            assert_eq!(run_ts(r#"console.log(1, "hi", true)"#), "1 hi true\n");
+        }
+
+        #[test]
+        fn array_of_numbers_format() {
+            // Verify existing number array format matches Node.js exactly
+            assert_eq!(run_ts("console.log([1, 2, 3])"), "[ 1, 2, 3 ]\n");
+        }
+
+        #[test]
+        fn object_with_number_values_format() {
+            assert_eq!(
+                run_ts("let obj = { x: 1, y: 2 }\nconsole.log(obj)"),
+                "{ x: 1, y: 2 }\n"
+            );
+        }
+
+        #[test]
+        fn boolean_in_console_log() {
+            assert_eq!(
+                run_ts("console.log(true)\nconsole.log(false)"),
+                "true\nfalse\n"
+            );
+        }
+    }
+
+    // --------------------------------------------------------
+    // Class instance printing
+    // --------------------------------------------------------
+    mod class_printing {
+        use super::*;
+
+        #[test]
+        #[ignore = "parity: class instance prints without class name prefix, should be 'Point { x: 3, y: 4 }'"]
+        fn class_instance_with_name() {
+            let src = r#"
+class Point {
+    x: number
+    y: number
+    constructor(x: number, y: number) {
+        this.x = x
+        this.y = y
+    }
+}
+console.log(new Point(3, 4))
+"#;
+            assert_eq!(run_ts(src), "Point { x: 3, y: 4 }\n");
+        }
+
+        #[test]
+        #[ignore = "parity: class with string field prints value unquoted, should be single-quoted"]
+        fn class_instance_with_string_field() {
+            let src = r#"
+class Person {
+    name: string
+    constructor(name: string) {
+        this.name = name
+    }
+}
+console.log(new Person("Alice"))
+"#;
+            assert_eq!(run_ts(src), "Person { name: 'Alice' }\n");
+        }
+
+        #[test]
+        #[ignore = "parity: child class instance prints without class name prefix"]
+        fn inherited_class_instance() {
+            let src = r#"
+class Animal {
+    name: string
+    constructor(name: string) {
+        this.name = name
+    }
+}
+class Dog extends Animal {}
+console.log(new Dog("Rex"))
+"#;
+            assert_eq!(run_ts(src), "Dog { name: 'Rex' }\n");
+        }
+
+        #[test]
+        #[ignore = "parity: class instance with mixed fields prints without class name and with wrong value formatting"]
+        fn class_instance_mixed_fields() {
+            let src = r#"
+class Item {
+    id: number
+    label: string
+    active: boolean
+    constructor(id: number, label: string, active: boolean) {
+        this.id = id
+        this.label = label
+        this.active = active
+    }
+}
+console.log(new Item(1, "foo", true))
+"#;
+            assert_eq!(run_ts(src), "Item { id: 1, label: 'foo', active: true }\n");
+        }
+    }
+
+    // --------------------------------------------------------
+    // typeof operator
+    // --------------------------------------------------------
+    mod typeof_operator {
+        use super::*;
+
+        #[test]
+        fn typeof_number() {
+            assert_eq!(run_ts(r#"console.log(typeof 42)"#), "number\n");
+        }
+
+        #[test]
+        fn typeof_string() {
+            assert_eq!(run_ts(r#"console.log(typeof "hello")"#), "string\n");
+        }
+
+        #[test]
+        fn typeof_boolean() {
+            assert_eq!(run_ts("console.log(typeof true)"), "boolean\n");
+        }
+
+        #[test]
+        fn typeof_object_literal() {
+            assert_eq!(run_ts("console.log(typeof {})"), "object\n");
+        }
+
+        #[test]
+        #[ignore = "parity: typeof null returns 'number', should return 'object' (historic JS quirk)"]
+        fn typeof_null() {
+            assert_eq!(run_ts("console.log(typeof null)"), "object\n");
+        }
+
+        #[test]
+        #[ignore = "parity: typeof undefined returns 'number', should return 'undefined'"]
+        fn typeof_undefined() {
+            assert_eq!(run_ts("console.log(typeof undefined)"), "undefined\n");
+        }
+
+        #[test]
+        #[ignore = "parity: typeof arrow function returns 'object', should return 'function'"]
+        fn typeof_arrow_function() {
+            assert_eq!(
+                run_ts("const f = () => 1\nconsole.log(typeof f)"),
+                "function\n"
+            );
+        }
+
+        #[test]
+        #[ignore = "parity: typeof named function returns 'object', should return 'function'"]
+        fn typeof_named_function() {
+            assert_eq!(
+                run_ts("function add(a: number, b: number): number { return a + b }\nconsole.log(typeof add)"),
+                "function\n"
+            );
+        }
+
+        #[test]
+        fn typeof_array_is_object() {
+            // typeof [] === "object" in Node.js
+            assert_eq!(run_ts("console.log(typeof [1, 2, 3])"), "object\n");
+        }
+    }
+
+    // --------------------------------------------------------
+    // Number formatting
+    // --------------------------------------------------------
+    mod number_formatting {
+        use super::*;
+
+        #[test]
+        #[ignore = "parity: 0.1 + 0.2 prints '0.3' due to %.15g rounding, should print '0.30000000000000004'"]
+        fn float_precision_0_1_plus_0_2() {
+            assert_eq!(run_ts("console.log(0.1 + 0.2)"), "0.30000000000000004\n");
+        }
+
+        #[test]
+        #[ignore = "parity: 1/0 prints 'inf', should print 'Infinity'"]
+        fn division_by_zero_is_infinity() {
+            assert_eq!(run_ts("console.log(1 / 0)"), "Infinity\n");
+        }
+
+        #[test]
+        #[ignore = "parity: -1/0 prints '-inf', should print '-Infinity'"]
+        fn neg_division_by_zero_is_neg_infinity() {
+            assert_eq!(run_ts("console.log(-1 / 0)"), "-Infinity\n");
+        }
+
+        #[test]
+        #[ignore = "parity: NaN === NaN returns true in tscc, should return false"]
+        fn nan_not_equal_to_itself() {
+            assert_eq!(run_ts("console.log(NaN === NaN)"), "false\n");
+        }
+
+        #[test]
+        #[ignore = "parity: large integer 9007199254740992 prints in scientific notation, should print exact digits"]
+        fn large_integer_exact() {
+            // 2^53 — max safe integer, should print exactly
+            assert_eq!(
+                run_ts("console.log(9007199254740992)"),
+                "9007199254740992\n"
+            );
+        }
+
+        #[test]
+        fn negative_float() {
+            assert_eq!(run_ts("console.log(-3.14)"), "-3.14\n");
+        }
+
+        #[test]
+        fn integer_division_result() {
+            // 10 / 2 = 5.0 but should print as 5 (integer-like)
+            assert_eq!(run_ts("console.log(10 / 2)"), "5\n");
+        }
+
+        #[test]
+        fn non_integer_division_result() {
+            assert_eq!(run_ts("console.log(7 / 2)"), "3.5\n");
+        }
+    }
+
+    // --------------------------------------------------------
+    // String coercions / concatenation with non-strings
+    // --------------------------------------------------------
+    mod string_coercions {
+        use super::*;
+
+        #[test]
+        #[ignore = "parity: '' + null yields '0', should yield 'null'"]
+        fn concat_null() {
+            assert_eq!(run_ts(r#"console.log("" + null)"#), "null\n");
+        }
+
+        #[test]
+        #[ignore = "parity: '' + undefined yields '0', should yield 'undefined'"]
+        fn concat_undefined() {
+            assert_eq!(run_ts(r#"console.log("" + undefined)"#), "undefined\n");
+        }
+
+        #[test]
+        #[ignore = "parity: '' + NaN yields 'nan', should yield 'NaN'"]
+        fn concat_nan() {
+            assert_eq!(run_ts(r#"console.log("" + NaN)"#), "NaN\n");
+        }
+
+        #[test]
+        #[ignore = "parity: '' + Infinity yields 'inf', should yield 'Infinity'"]
+        fn concat_infinity() {
+            assert_eq!(run_ts(r#"console.log("" + Infinity)"#), "Infinity\n");
+        }
+
+        #[test]
+        fn concat_true() {
+            assert_eq!(run_ts(r#"console.log("" + true)"#), "true\n");
+        }
+
+        #[test]
+        fn concat_false() {
+            assert_eq!(run_ts(r#"console.log("" + false)"#), "false\n");
+        }
+
+        #[test]
+        fn concat_number() {
+            assert_eq!(run_ts(r#"console.log("val=" + 42)"#), "val=42\n");
+        }
+
+        #[test]
+        fn concat_float() {
+            assert_eq!(run_ts(r#"console.log("val=" + 3.14)"#), "val=3.14\n");
+        }
+    }
+
+    // --------------------------------------------------------
+    // Equality parity
+    // --------------------------------------------------------
+    mod equality_parity {
+        use super::*;
+
+        #[test]
+        fn strict_eq_numbers() {
+            assert_eq!(run_ts("console.log(1 === 1)"), "true\n");
+            assert_eq!(run_ts("console.log(1 === 2)"), "false\n");
+        }
+
+        #[test]
+        fn strict_eq_strings() {
+            assert_eq!(run_ts(r#"console.log("a" === "a")"#), "true\n");
+            assert_eq!(run_ts(r#"console.log("a" === "b")"#), "false\n");
+        }
+
+        #[test]
+        fn strict_eq_booleans() {
+            assert_eq!(run_ts("console.log(true === true)"), "true\n");
+            assert_eq!(run_ts("console.log(true === false)"), "false\n");
+        }
+
+        #[test]
+        #[ignore = "parity: NaN === NaN returns true, should return false"]
+        fn nan_strict_ne_nan() {
+            assert_eq!(run_ts("console.log(NaN === NaN)"), "false\n");
+        }
+
+        #[test]
+        #[ignore = "parity: null === undefined returns true, should return false"]
+        fn null_strict_ne_undefined() {
+            assert_eq!(run_ts("console.log(null === undefined)"), "false\n");
+        }
+
+        #[test]
+        #[ignore = "parity: null == undefined — loose equality not implemented, should return true"]
+        fn null_loose_eq_undefined() {
+            assert_eq!(run_ts("console.log(null == undefined)"), "true\n");
+        }
+
+        #[test]
+        #[ignore = "parity: 0 == '' — loose equality not implemented, should return true"]
+        fn zero_loose_eq_empty_string() {
+            assert_eq!(run_ts(r#"console.log(0 == "")"#), "true\n");
+        }
+    }
+
+    // --------------------------------------------------------
+    // Math built-ins
+    // --------------------------------------------------------
+    mod math_builtins {
+        use super::*;
+
+        #[test]
+        fn floor_positive() {
+            assert_eq!(run_ts("console.log(Math.floor(1.9))"), "1\n");
+        }
+
+        #[test]
+        fn floor_negative() {
+            // Math.floor(-1.5) === -2 in Node.js
+            assert_eq!(run_ts("console.log(Math.floor(-1.5))"), "-2\n");
+        }
+
+        #[test]
+        fn ceil_positive() {
+            assert_eq!(run_ts("console.log(Math.ceil(1.1))"), "2\n");
+        }
+
+        #[test]
+        fn ceil_negative() {
+            // Math.ceil(-1.5) === -1 in Node.js
+            assert_eq!(run_ts("console.log(Math.ceil(-1.5))"), "-1\n");
+        }
+
+        #[test]
+        fn round_half_up() {
+            // Math.round(0.5) === 1
+            assert_eq!(run_ts("console.log(Math.round(0.5))"), "1\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.round(-0.5) returns -1 in tscc, should return 0 (Node.js rounds toward +Infinity)"]
+        fn round_neg_half() {
+            // Math.round(-0.5) === 0 in Node.js (rounds toward +Infinity)
+            assert_eq!(run_ts("console.log(Math.round(-0.5))"), "0\n");
+        }
+
+        #[test]
+        fn abs_negative() {
+            assert_eq!(run_ts("console.log(Math.abs(-5))"), "5\n");
+        }
+
+        #[test]
+        fn max_of_two() {
+            assert_eq!(run_ts("console.log(Math.max(3, 7))"), "7\n");
+        }
+
+        #[test]
+        fn min_of_two() {
+            assert_eq!(run_ts("console.log(Math.min(3, 7))"), "3\n");
+        }
+
+        #[test]
+        fn pow_basic() {
+            assert_eq!(run_ts("console.log(Math.pow(2, 10))"), "1024\n");
+        }
+
+        #[test]
+        fn sqrt_basic() {
+            assert_eq!(run_ts("console.log(Math.sqrt(9))"), "3\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.trunc not yet implemented"]
+        fn trunc_positive() {
+            assert_eq!(run_ts("console.log(Math.trunc(1.9))"), "1\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.trunc not yet implemented"]
+        fn trunc_negative() {
+            assert_eq!(run_ts("console.log(Math.trunc(-1.9))"), "-1\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.sign not yet implemented"]
+        fn sign_positive() {
+            assert_eq!(run_ts("console.log(Math.sign(5))"), "1\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.sign not yet implemented"]
+        fn sign_negative() {
+            assert_eq!(run_ts("console.log(Math.sign(-5))"), "-1\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.sign not yet implemented"]
+        fn sign_zero() {
+            assert_eq!(run_ts("console.log(Math.sign(0))"), "0\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.log2 not yet implemented"]
+        fn log2_basic() {
+            assert_eq!(run_ts("console.log(Math.log2(8))"), "3\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.log10 not yet implemented"]
+        fn log10_basic() {
+            assert_eq!(run_ts("console.log(Math.log10(1000))"), "3\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.hypot not yet implemented"]
+        fn hypot_basic() {
+            assert_eq!(run_ts("console.log(Math.hypot(3, 4))"), "5\n");
+        }
+
+        #[test]
+        #[ignore = "parity: Math.clz32 not yet implemented"]
+        fn clz32_basic() {
+            assert_eq!(run_ts("console.log(Math.clz32(1))"), "31\n");
+        }
+    }
+
+    // --------------------------------------------------------
+    // Array printing format
+    // --------------------------------------------------------
+    mod array_printing {
+        use super::*;
+
+        #[test]
+        fn number_array_format() {
+            assert_eq!(run_ts("console.log([1, 2, 3])"), "[ 1, 2, 3 ]\n");
+        }
+
+        #[test]
+        fn single_element_array() {
+            assert_eq!(run_ts("console.log([42])"), "[ 42 ]\n");
+        }
+
+        #[test]
+        #[ignore = "parity: empty array prints '[ ]' or '[  ]', should print '[]'"]
+        fn empty_array() {
+            assert_eq!(run_ts("console.log([])"), "[]\n");
+        }
+
+        #[test]
+        #[ignore = "parity: string array literal prints garbage, should be \"[ 'a', 'b', 'c' ]\""]
+        fn string_array() {
+            assert_eq!(
+                run_ts(r#"console.log(["a", "b", "c"])"#),
+                "[ 'a', 'b', 'c' ]\n"
+            );
+        }
+
+        #[test]
+        #[ignore = "parity: nested array prints as garbage pointer values"]
+        fn nested_number_array() {
+            assert_eq!(
+                run_ts("console.log([[1, 2], [3, 4]])"),
+                "[ [ 1, 2 ], [ 3, 4 ] ]\n"
+            );
+        }
+
+        #[test]
+        #[ignore = "parity: boolean array — booleans stored as i1, array printing may not handle booleans"]
+        fn boolean_array() {
+            assert_eq!(
+                run_ts("console.log([true, false, true])"),
+                "[ true, false, true ]\n"
+            );
+        }
+
+        #[test]
+        fn array_length_after_push() {
+            let src = "
+let arr = [1, 2, 3]
+arr.push(4)
+console.log(arr.length)
+";
+            assert_eq!(run_ts(src), "4\n");
+        }
+    }
+
+    // --------------------------------------------------------
+    // Object printing format
+    // --------------------------------------------------------
+    mod object_printing {
+        use super::*;
+
+        #[test]
+        fn simple_number_object() {
+            assert_eq!(run_ts("console.log({ x: 1, y: 2 })"), "{ x: 1, y: 2 }\n");
+        }
+
+        #[test]
+        #[ignore = "parity: empty object prints '{  }' or '{ }', should print '{}'"]
+        fn empty_object() {
+            assert_eq!(run_ts("console.log({})"), "{}\n");
+        }
+
+        #[test]
+        #[ignore = "parity: object with string value prints value without quotes, should use single quotes"]
+        fn object_string_value() {
+            assert_eq!(
+                run_ts(r#"console.log({ name: "hello" })"#),
+                "{ name: 'hello' }\n"
+            );
+        }
+
+        #[test]
+        #[ignore = "parity: nested object prints as '{ a: [complex] }', should recurse"]
+        fn nested_object() {
+            assert_eq!(run_ts("console.log({ a: { b: 1 } })"), "{ a: { b: 1 } }\n");
+        }
+
+        #[test]
+        fn object_boolean_value() {
+            assert_eq!(run_ts("console.log({ flag: true })"), "{ flag: true }\n");
+        }
+    }
+}
+
+// ============================================================
 // 16. NOT YET IMPLEMENTED — TypeScript Coverage Gap
 //
 // Each #[ignore] test represents a TypeScript feature that tscc

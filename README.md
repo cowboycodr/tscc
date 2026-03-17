@@ -121,7 +121,6 @@ class Point {
 }
 
 let p = new Point(3, 4)
-console.log(p)            // { x: 3, y: 4, toString: [complex] }
 console.log(p.toString()) // 3,4
 ```
 
@@ -148,20 +147,22 @@ The runtime (`runtime/runtime.c`) provides print functions, string operations, m
 
 ## Status
 
-Early stage. 238 tests passing, 16 pending. The goal is drop-in compatibility with existing TypeScript projects. Currently covers the core language features needed for compute-heavy programs.
+**294 tests passing, 63 pending.** The goal is drop-in compatibility with existing TypeScript projects.
 
 ## TypeScript Feature Coverage
 
-**238 passing** / **16 not yet implemented** — 94% of test suite
+**294 passing** / **63 pending** — run `cargo test` to see current counts.
 
-| Category | Feature | Status | Example |
+:white_check_mark: = implemented and correct  :warning: = compiles but known-incorrect behavior  :x: = not yet implemented
+
+| Category | Feature | Status | Notes |
 |---|---|---|---|
 | **Literals** | Integer | :white_check_mark: | `console.log(42)` |
 | | Float | :white_check_mark: | `console.log(3.14)` |
 | | Negative number | :white_check_mark: | `console.log(-7)` |
 | | String (double/single quotes) | :white_check_mark: | `"hello"`, `'world'` |
 | | Boolean | :white_check_mark: | `true`, `false` |
-| | `null` / `undefined` | :white_check_mark: | `console.log(null)` |
+| | `null` / `undefined` | :warning: | compile as `0` — print as `0` not `null`/`undefined` |
 | | BigInt | :x: | `9007199254740993n` |
 | **Variables** | `let` / `const` | :white_check_mark: | `let x = 10`, `const y = 99` |
 | | Type annotations | :white_check_mark: | `let x: number = 5` |
@@ -179,6 +180,8 @@ Early stage. 238 tests passing, 16 pending. The goal is drop-in compatibility wi
 | | Prefix `++` / `--` | :white_check_mark: | `++x`, `++arr[i]` |
 | | Unary negate | :white_check_mark: | `-x` |
 | | Ternary `? :` | :white_check_mark: | `x > 0 ? "pos" : "neg"` |
+| | `typeof` | :warning: | `typeof null` → `"number"` (should be `"object"`); `typeof function` → `"object"` |
+| | Loose equality `==` | :warning: | treated as `===` — no type coercion |
 | **Strings** | Concatenation | :white_check_mark: | `"hello" + " " + 42` |
 | | Template literals | :white_check_mark: | `` `value is ${x}` `` |
 | | `.length` | :white_check_mark: | `"hello".length` |
@@ -219,6 +222,9 @@ Early stage. 238 tests passing, 16 pending. The goal is drop-in compatibility wi
 | | `.push()` / `.pop()` | :white_check_mark: | `arr.push(4)` |
 | | `.map()` / `.filter()` / `.reduce()` | :white_check_mark: | `arr.map(x => x * 2)` |
 | | `.forEach()` | :white_check_mark: | `arr.forEach(x => console.log(x))` |
+| | String array printing | :warning: | `["a","b"]` prints as garbage IEEE754 numbers |
+| | Nested array printing | :warning: | `[[1,2],[3,4]]` prints as garbage pointer values |
+| | Empty array printing | :warning: | `[]` prints as `[ ]` with extra spaces |
 | **Objects & Classes** | Object literals | :white_check_mark: | `{ x: 1, y: 2 }` |
 | | Property / bracket access | :white_check_mark: | `obj.x`, `obj["x"]` |
 | | Shorthand properties | :white_check_mark: | `{ x, y }` |
@@ -234,6 +240,9 @@ Early stage. 238 tests passing, 16 pending. The goal is drop-in compatibility wi
 | | Class field initializers | :white_check_mark: | `class Foo { x = 5 }` |
 | | Interfaces | :white_check_mark: | `interface Point { x: number }` |
 | | Interface inheritance | :white_check_mark: | `interface B extends A` |
+| | Class instance printing | :warning: | `console.log(new Point(3,4))` omits class name prefix |
+| | Nested object printing | :warning: | `console.log({a:{b:1}})` prints `{ a: [complex] }` |
+| | Object/class string field printing | :warning: | string values printed unquoted in objects/classes |
 | **Type System** | Type annotations & inference | :white_check_mark: | `let x: number`, `let y = 42` |
 | | Union types | :white_check_mark: | `string \| number` |
 | | Intersection types | :white_check_mark: | `Named & Aged` |
@@ -259,23 +268,132 @@ Early stage. 238 tests passing, 16 pending. The goal is drop-in compatibility wi
 | | Default export/import | :x: | `export default 42` |
 | | `import * as` | :x: | `import * as math from "./math"` |
 | | Re-exports | :x: | `export { foo } from "./bar"` |
+| **Error Handling** | `try` / `catch` / `finally` | :white_check_mark: | `try { ... } catch (e) { ... }` |
+| | `throw` | :white_check_mark: | `throw "message"` |
+| **Async** | `async` / `await` | :white_check_mark: | `async function f() { await g() }` |
+| | `Promise` (basic) | :white_check_mark: | async functions return `Promise<T>` |
+| | `Promise.resolve()` / `.reject()` | :x: | static methods not yet wired up |
+| | `.then()` / `.catch()` | :x: | promise chaining not yet implemented |
+| | `setTimeout` | :x: | runtime exists, codegen not wired up |
+| **Date** | `new Date()` / `new Date(ms)` | :white_check_mark: | `new Date(0).getTime()` |
+| | `Date.now()` | :white_check_mark: | returns ms since epoch |
+| | `getFullYear/Month/Date/Hours/...` | :white_check_mark: | local and UTC variants |
+| | `toISOString()` | :white_check_mark: | `"2000-01-01T11:30:45.678Z"` |
 | **Built-ins** | `console.log()` / `.error()` / `.warn()` | :white_check_mark: | `console.log("hello")` |
-| | `typeof` | :white_check_mark: | `typeof 42` → `"number"` |
 | | `parseInt()` / `parseFloat()` | :white_check_mark: | `parseInt("42")` |
-| | `Math.*` | :white_check_mark: | `Math.floor()`, `Math.random()`, `Math.PI` |
+| | `Math.*` (floor/ceil/round/abs/max/min/pow/sqrt/log/random/PI) | :white_check_mark: | `Math.floor(1.9)` |
+| | `Math.trunc` / `Math.sign` / `Math.log2` / `Math.log10` / `Math.hypot` | :x: | not yet implemented |
 | | `Number.isInteger()` / `.isFinite()` / `.isNaN()` | :white_check_mark: | `Number.isInteger(42)` |
 | | `.toFixed()` | :white_check_mark: | `(3.14).toFixed(2)` |
 | | `Map` | :white_check_mark: | `new Map()`, `.set()`, `.get()`, `.has()`, `.delete()`, `.values()` |
 | | `JSON.stringify()` | :x: | `JSON.stringify({ a: 1 })` |
 | | `Set` | :x: | `new Set([1, 2, 3])` |
 | | `RegExp` | :x: | `/hello/.test("hello world")` |
-| **Error Handling & Async** | `try` / `catch` / `finally` | :x: | `try { ... } catch (e) { ... }` |
-| | `async` / `await` | :x: | `async function f() { await ... }` |
-| | `Promise` | :x: | `Promise.resolve(42)` |
 | **Advanced** | Namespaces | :x: | `namespace Util { ... }` |
 | | Decorators | :x: | `@log` |
 | | Symbols | :x: | `Symbol("foo")` |
 | | Generators | :x: | `function* range()` |
+
+## Parity Test Suite
+
+The parity suite (`mod parity` in `tests/integration.rs`) tracks output correctness against Node.js.
+Each test asserts the exact output Node.js produces. Tests marked **ignored** compile successfully today but produce wrong output — they auto-pass once the underlying bug is fixed.
+
+Run the full parity backlog: `cargo test parity -- --ignored`
+
+### Passing parity tests (correct Node.js output confirmed)
+
+| Area | Test | Expected output |
+|---|---|---|
+| **console.log** | multiple args space-separated | `1 hi true` |
+| | number array format | `[ 1, 2, 3 ]` |
+| | object with number values | `{ x: 1, y: 2 }` |
+| | boolean in console.log | `true` / `false` |
+| **typeof** | `typeof 42` | `"number"` |
+| | `typeof "hello"` | `"string"` |
+| | `typeof true` | `"boolean"` |
+| | `typeof {}` | `"object"` |
+| | `typeof [1,2,3]` | `"object"` |
+| **Number formatting** | negative float `-3.14` | `-3.14` |
+| | integer division `10 / 2` | `5` |
+| | non-integer division `7 / 2` | `3.5` |
+| **String coercions** | `"" + true` | `"true"` |
+| | `"" + false` | `"false"` |
+| | `"val=" + 42` | `"val=42"` |
+| | `"val=" + 3.14` | `"val=3.14"` |
+| **Equality** | `1 === 1` | `true` |
+| | `"a" === "a"` | `true` |
+| | `true === true` | `true` |
+| **Math** | `Math.floor(1.9)` | `1` |
+| | `Math.floor(-1.5)` | `-2` |
+| | `Math.ceil(1.1)` | `2` |
+| | `Math.ceil(-1.5)` | `-1` |
+| | `Math.round(0.5)` | `1` |
+| | `Math.abs(-5)` | `5` |
+| | `Math.max(3, 7)` | `7` |
+| | `Math.min(3, 7)` | `3` |
+| | `Math.pow(2, 10)` | `1024` |
+| | `Math.sqrt(9)` | `3` |
+| **Arrays** | `[1, 2, 3]` | `[ 1, 2, 3 ]` |
+| | `[42]` | `[ 42 ]` |
+| | array length after push | `4` |
+| **Objects** | `{ x: 1, y: 2 }` | `{ x: 1, y: 2 }` |
+| | `{ flag: true }` | `{ flag: true }` |
+
+### Ignored parity tests (compile OK, wrong output — backlog)
+
+| Area | Test | tscc output | Expected |
+|---|---|---|---|
+| **console.log** | `console.log(null)` | `0` | `null` |
+| | `console.log(undefined)` | `0` | `undefined` |
+| | `console.log(NaN)` | `nan` | `NaN` |
+| | `console.log(Infinity)` | `inf` | `Infinity` |
+| | `console.log(-Infinity)` | `-inf` | `-Infinity` |
+| | `console.log(-0)` | `0` | `-0` |
+| | `console.log([])` | `[  ]` | `[]` |
+| | `console.log({})` | `{  }` | `{}` |
+| | `console.log(["a","b","c"])` | garbage IEEE754 | `[ 'a', 'b', 'c' ]` |
+| | `console.log([[1,2],[3,4]])` | garbage pointers | `[ [ 1, 2 ], [ 3, 4 ] ]` |
+| | `console.log({a:{b:1}})` | `{ a: [complex] }` | `{ a: { b: 1 } }` |
+| | `console.log({name:"alice"})` | `{ name: alice }` | `{ name: 'alice' }` |
+| **Class printing** | `console.log(new Point(3,4))` | `{ x: 3, y: 4 }` | `Point { x: 3, y: 4 }` |
+| | class with string field | unquoted value | `Person { name: 'Alice' }` |
+| | inherited class instance | no class name | `Dog { name: 'Rex' }` |
+| | class with mixed fields | no class name, no quotes | `Item { id: 1, label: 'foo', active: true }` |
+| **typeof** | `typeof null` | `"number"` | `"object"` |
+| | `typeof undefined` | `"number"` | `"undefined"` |
+| | `typeof (() => {})` | `"object"` | `"function"` |
+| | `typeof function` | `"object"` | `"function"` |
+| **Number formatting** | `0.1 + 0.2` | `0.3` | `0.30000000000000004` |
+| | `1 / 0` | `inf` | `Infinity` |
+| | `-1 / 0` | `-inf` | `-Infinity` |
+| | `NaN === NaN` | `true` | `false` |
+| | `9007199254740992` | scientific notation | `9007199254740992` |
+| **String coercions** | `"" + null` | `0` | `null` |
+| | `"" + undefined` | `0` | `undefined` |
+| | `"" + NaN` | `nan` | `NaN` |
+| | `"" + Infinity` | `inf` | `Infinity` |
+| **Equality** | `NaN === NaN` | `true` | `false` |
+| | `null === undefined` | `true` | `false` |
+| | `null == undefined` | `false` | `true` |
+| | `0 == ""` | `false` | `true` |
+| **Math** | `Math.round(-0.5)` | `-1` | `0` |
+| | `Math.trunc(1.9)` | compile error / missing | `1` |
+| | `Math.trunc(-1.9)` | compile error / missing | `-1` |
+| | `Math.sign(5)` | missing | `1` |
+| | `Math.sign(-5)` | missing | `-1` |
+| | `Math.sign(0)` | missing | `0` |
+| | `Math.log2(8)` | missing | `3` |
+| | `Math.log10(1000)` | missing | `3` |
+| | `Math.hypot(3,4)` | missing | `5` |
+| | `Math.clz32(1)` | missing | `31` |
+| **Arrays** | `console.log([])` | `[  ]` | `[]` |
+| | `console.log(["a","b","c"])` | garbage | `[ 'a', 'b', 'c' ]` |
+| | `console.log([[1,2],[3,4]])` | garbage | `[ [ 1, 2 ], [ 3, 4 ] ]` |
+| | `console.log([true,false,true])` | unknown | `[ true, false, true ]` |
+| **Objects** | `console.log({})` | `{  }` | `{}` |
+| | `console.log({name:"hello"})` | unquoted value | `{ name: 'hello' }` |
+| | `console.log({a:{b:1}})` | `{ a: [complex] }` | `{ a: { b: 1 } }` |
 
 ## License
 
