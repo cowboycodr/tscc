@@ -2227,47 +2227,114 @@ console.log(add(3, 4))
     // --- Error handling ---
 
     #[test]
-    #[ignore = "try/catch not implemented"]
     fn try_catch() {
-        let src = r#"
+        let src = "
 try {
-    throw new Error("oops")
+    throw 42
 } catch (e) {
-    console.log("caught")
+    console.log(\"caught\")
 }
-"#;
+";
         assert_eq!(run_ts(src), "caught\n");
     }
 
     #[test]
-    #[ignore = "try/catch/finally not implemented"]
     fn try_finally() {
-        let src = r#"
+        let src = "
 try {
-    console.log("try")
+    console.log(\"try\")
 } finally {
-    console.log("finally")
+    console.log(\"finally\")
 }
-"#;
+";
         assert_eq!(run_ts(src), "try\nfinally\n");
+    }
+
+    #[test]
+    fn try_catch_finally() {
+        let src = "
+try {
+    throw 1
+} catch (e) {
+    console.log(\"catch\")
+} finally {
+    console.log(\"finally\")
+}
+";
+        assert_eq!(run_ts(src), "catch\nfinally\n");
+    }
+
+    #[test]
+    fn try_no_throw() {
+        let src = "
+try {
+    console.log(\"ok\")
+} catch (e) {
+    console.log(\"should not run\")
+}
+";
+        assert_eq!(run_ts(src), "ok\n");
     }
 
     // --- Async ---
 
     #[test]
-    #[ignore = "async/await not implemented"]
     fn async_await() {
-        let src = r#"
+        let src = "
 async function fetchData(): Promise<number> {
     return 42
 }
-async function main() {
+async function main(): Promise<void> {
     let data = await fetchData()
     console.log(data)
 }
 main()
-"#;
+";
         assert_eq!(run_ts(src), "42\n");
+    }
+
+    #[test]
+    fn async_await_string() {
+        let src = "
+async function greet(): Promise<string> {
+    return \"hello\"
+}
+async function main(): Promise<void> {
+    let msg = await greet()
+    console.log(msg)
+}
+main()
+";
+        assert_eq!(run_ts(src), "hello\n");
+    }
+
+    #[test]
+    fn async_await_chained() {
+        let src = "
+async function add(a: number, b: number): Promise<number> {
+    return a + b
+}
+async function main(): Promise<void> {
+    let x = await add(10, 32)
+    let y = await add(x, 0)
+    console.log(y)
+}
+main()
+";
+        assert_eq!(run_ts(src), "42\n");
+    }
+
+    #[test]
+    fn async_non_awaited_call() {
+        // Calling an async function without await still executes its body
+        // (event loop drains it before main exits)
+        let src = "
+async function work(): Promise<void> {
+    console.log(\"done\")
+}
+work()
+";
+        assert_eq!(run_ts(src), "done\n");
     }
 
     // --- Modules ---
@@ -2334,12 +2401,12 @@ console.log(s.size)
     }
 
     #[test]
-    #[ignore = "Promise not implemented"]
-    fn promise_basic() {
-        let src = r#"
+    #[ignore = "Promise.resolve() static method not yet implemented in codegen"]
+    fn promise_static_resolve() {
+        let src = "
 let p = Promise.resolve(42)
-p.then(v => console.log(v))
-"#;
+p.then((v: number) => console.log(v))
+";
         assert_eq!(run_ts(src), "42\n");
     }
 

@@ -27,6 +27,7 @@ pub enum StmtKind {
         return_type: Option<TypeAnnotation>,
         body: Vec<Statement>,
         is_exported: bool,
+        is_async: bool,
     },
     ClassDecl {
         name: String,
@@ -118,6 +119,15 @@ pub enum StmtKind {
         body: Box<Statement>,
     },
     Empty,
+    Throw {
+        value: Expr,
+    },
+    TryCatch {
+        body: Vec<Statement>,
+        catch_binding: Option<String>,
+        catch_body: Option<Vec<Statement>>,
+        finally_body: Option<Vec<Statement>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -335,6 +345,7 @@ pub enum ExprKind {
         params: Vec<Parameter>,
         return_type: Option<TypeAnnotation>,
         body: ArrowBody,
+        is_async: bool,
     },
     NewExpr {
         class_name: String,
@@ -365,6 +376,10 @@ pub enum ExprKind {
     Satisfies {
         expr: Box<Expr>,
         target_type: TypeAnnotation,
+    },
+    /// await expression (only valid inside async functions)
+    Await {
+        expr: Box<Expr>,
     },
 }
 

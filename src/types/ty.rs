@@ -30,6 +30,8 @@ pub enum Type {
     Intersection(Vec<Type>),
     /// Tuple type: [number, string] — heterogeneous fixed-length array
     Tuple(Vec<Type>),
+    /// Promise<T> — the return type of async functions
+    Promise(Box<Type>),
     // Used internally when a type cannot be determined
     Unknown,
 }
@@ -98,6 +100,7 @@ impl std::fmt::Display for Type {
                 }
                 write!(f, "]")
             }
+            Type::Promise(inner) => write!(f, "Promise<{}>", inner),
             Type::Unknown => write!(f, "unknown"),
         }
     }

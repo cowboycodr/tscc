@@ -86,6 +86,14 @@ pub enum Token {
     Switch,
     Case,
     Var,
+    Throw,
+    Try,
+    Catch,
+    Finally,
+
+    // Async keywords
+    Async,
+    Await,
 
     // Punctuation
     LeftParen,

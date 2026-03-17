@@ -1,18 +1,37 @@
+/*
+ * _XOPEN_SOURCE 700 is required to get ucontext_t on macOS/Linux.
+ * It hides some BSD/GNU extensions, so we forward-declare them where needed.
+ */
+#if !defined(_WIN32) && !defined(_WIN64)
+#  define _XOPEN_SOURCE 700
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <ctype.h>
 #include <time.h>
+#include <setjmp.h>
+#include <stdint.h>
 
-/* Platform-specific headers for CSPRNG (used by crypto.randomUUID()) */
+/* Platform-specific headers */
 #if defined(_WIN32) || defined(_WIN64)
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
-#elif defined(__linux__)
-#  include <sys/syscall.h>
-#  include <unistd.h>
+#elif defined(__APPLE__) || defined(__linux__)
+#  include <ucontext.h>
+/* arc4random_buf is not declared under _XOPEN_SOURCE on macOS — forward-declare it. */
+#  if defined(__APPLE__)
+     extern void arc4random_buf(void* buf, size_t nbytes);
+#  endif
+#  if defined(__linux__)
+#    include <sys/syscall.h>
+#    include <unistd.h>
+#  endif
 #endif
+
+/* (sys/syscall.h and unistd.h are included in the platform block above for Linux) */
 
 // ============================================================
 // String type
@@ -678,4 +697,494 @@ MgString tscc_crypto_random_uuid(void) {
         b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
     MgString s; s.data = buf; s.len = 36;
     return s;
+}
+
+// ============================================================
+// Exception handling (setjmp / longjmp based try/catch/throw)
+// ============================================================
+
+typedef struct TsccHandler {
+    jmp_buf        jb;
+    void*          thrown_value;
+} TsccHandler;
+
+#define TSCC_MAX_HANDLERS 1024
+static TsccHandler tscc_handlers[TSCC_MAX_HANDLERS];
+static int         tscc_handler_top = 0;
+
+/* Push a new handler and return its jmp_buf pointer for use with setjmp(). */
+jmp_buf* tscc_try_enter(void) {
+    if (tscc_handler_top >= TSCC_MAX_HANDLERS) {
+        fprintf(stderr, "tscc: exception handler stack overflow\n");
+        exit(1);
+    }
+    return &tscc_handlers[tscc_handler_top++].jb;
+}
+
+/* Normal exit from a try body — pop the handler. */
+void tscc_try_exit(void) {
+    if (tscc_handler_top > 0) tscc_handler_top--;
+}
+
+/* Retrieve the thrown value after setjmp returns non-zero.
+ * tscc_throw() has already decremented tscc_handler_top. */
+void* tscc_catch_value(void) {
+    return tscc_handlers[tscc_handler_top].thrown_value;
+}
+
+/* Throw an exception — longjmp to the nearest try handler. */
+void tscc_throw(void* value) {
+    if (tscc_handler_top == 0) {
+        fprintf(stderr, "Uncaught exception\n");
+        exit(1);
+    }
+    tscc_handler_top--;
+    tscc_handlers[tscc_handler_top].thrown_value = value;
+    longjmp(tscc_handlers[tscc_handler_top].jb, 1);
+}
+
+/* Box a double on the heap so it can be passed as void*. */
+void* tscc_box_number(double v) {
+    double* p = (double*)malloc(sizeof(double));
+    if (!p) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+    *p = v;
+    return p;
+}
+double tscc_unbox_number(void* p) { return *(double*)p; }
+
+/* Box/unbox boolean (stored as intptr_t). */
+void* tscc_box_boolean(int v) { return (void*)(intptr_t)(v ? 1 : 0); }
+int   tscc_unbox_boolean(void* p) { return (int)(intptr_t)p; }
+
+/* Box a string by copying the MgString header to the heap. */
+typedef struct { char* data; long long len; } MgStringBox;
+void* tscc_box_string(char* data, long long len) {
+    MgStringBox* p = (MgStringBox*)malloc(sizeof(MgStringBox));
+    if (!p) { fprintf(stderr, "tscc: out of memory\n"); exit(1); }
+    p->data = data; p->len = len;
+    return p;
+}
+/* Returns a heap-allocated MgString (for use after unboxing) */
+MgString tscc_unbox_string(void* p) {
+    MgStringBox* b = (MgStringBox*)p;
+    MgString s; s.data = b->data; s.len = b->len;
+    return s;
+}
+
+// ============================================================
+// Fibers (stackful coroutines)
+// ============================================================
+
+#define TSCC_FIBER_STACK_SIZE (512 * 1024)   /* 512 KiB per fiber */
+
+typedef struct MgFiber MgFiber;
+
+struct MgFiber {
+#if defined(_WIN32) || defined(_WIN64)
+    LPVOID           fiber_handle;   /* Windows fiber handle */
+    LPVOID           caller_handle;  /* caller's fiber handle */
+#else
+    ucontext_t       uc;             /* POSIX fiber context */
+    ucontext_t       caller_uc;      /* saved caller context */
+    void*            stack;          /* mmap'd stack */
+    size_t           stack_size;
+#endif
+    void           (*fn)(void*);     /* fiber entry function */
+    void*            arg;            /* argument to fn */
+    int              finished;       /* 1 once fn returns */
+    struct MgFiber*  resumer;        /* fiber to resume when this one yields */
+};
+
+/* Current running fiber (NULL = main execution context). */
+static MgFiber* tscc_current_fiber = NULL;
+
+#if defined(_WIN32) || defined(_WIN64)
+
+/* Windows fiber trampoline */
+static VOID WINAPI tscc_fiber_trampoline(LPVOID lpParam) {
+    MgFiber* f = (MgFiber*)lpParam;
+    f->fn(f->arg);
+    f->finished = 1;
+    SwitchToFiber(f->caller_handle);
+}
+
+MgFiber* tscc_fiber_create(void (*fn)(void*), void* arg) {
+    MgFiber* f = (MgFiber*)calloc(1, sizeof(MgFiber));
+    f->fn  = fn;
+    f->arg = arg;
+    f->fiber_handle = CreateFiber(TSCC_FIBER_STACK_SIZE, tscc_fiber_trampoline, f);
+    return f;
+}
+
+void tscc_fiber_resume(MgFiber* f) {
+    MgFiber* prev = tscc_current_fiber;
+    tscc_current_fiber = f;
+    if (f->caller_handle == NULL) {
+        /* First resume: convert current thread to a fiber if needed */
+        if (prev == NULL) {
+            /* main thread */
+            LPVOID main_fiber = ConvertThreadToFiber(NULL);
+            f->caller_handle = main_fiber;
+        } else {
+            f->caller_handle = prev->fiber_handle;
+        }
+    }
+    SwitchToFiber(f->fiber_handle);
+    tscc_current_fiber = prev;
+}
+
+void tscc_fiber_yield(void) {
+    MgFiber* f = tscc_current_fiber;
+    if (!f) return;
+    SwitchToFiber(f->caller_handle);
+}
+
+void tscc_fiber_destroy(MgFiber* f) {
+    if (f) { DeleteFiber(f->fiber_handle); free(f); }
+}
+
+#else /* POSIX (macOS + Linux) */
+
+static void tscc_fiber_trampoline(uint32_t hi, uint32_t lo) {
+    uintptr_t ptr = ((uintptr_t)hi << 32) | (uintptr_t)lo;
+    MgFiber* f = (MgFiber*)ptr;
+    f->fn(f->arg);
+    f->finished = 1;
+    /* Return to caller */
+    swapcontext(&f->uc, &f->caller_uc);
+}
+
+MgFiber* tscc_fiber_create(void (*fn)(void*), void* arg) {
+    MgFiber* f = (MgFiber*)calloc(1, sizeof(MgFiber));
+    f->fn         = fn;
+    f->arg        = arg;
+    f->stack_size = TSCC_FIBER_STACK_SIZE;
+    /* Use malloc for portability — no mmap / MAP_ANONYMOUS needed */
+    f->stack      = malloc(f->stack_size);
+    if (!f->stack) {
+        fprintf(stderr, "tscc: fiber stack allocation failed\n"); exit(1);
+    }
+    getcontext(&f->uc);
+    f->uc.uc_stack.ss_sp   = f->stack;
+    f->uc.uc_stack.ss_size = f->stack_size;
+    f->uc.uc_link          = NULL;  /* we manage return manually */
+    /* Pass the fiber pointer as two 32-bit halves (portable for 64-bit) */
+    uintptr_t ptr = (uintptr_t)f;
+    uint32_t hi = (uint32_t)(ptr >> 32);
+    uint32_t lo = (uint32_t)(ptr & 0xFFFFFFFF);
+    makecontext(&f->uc, (void(*)(void))tscc_fiber_trampoline, 2, hi, lo);
+    return f;
+}
+
+void tscc_fiber_resume(MgFiber* f) {
+    MgFiber* prev = tscc_current_fiber;
+    tscc_current_fiber = f;
+    swapcontext(&f->caller_uc, &f->uc);
+    tscc_current_fiber = prev;
+}
+
+void tscc_fiber_yield(void) {
+    MgFiber* f = tscc_current_fiber;
+    if (!f) return;
+    swapcontext(&f->uc, &f->caller_uc);
+}
+
+void tscc_fiber_destroy(MgFiber* f) {
+    if (!f) return;
+    free(f->stack);
+    free(f);
+}
+
+#endif /* POSIX */
+
+MgFiber* tscc_fiber_current(void) { return tscc_current_fiber; }
+
+// ============================================================
+// Promise
+// ============================================================
+
+typedef void (*MgPromiseCallback)(void* value, void* ctx);
+
+typedef struct MgThenNode {
+    MgPromiseCallback cb;
+    void*             ctx;
+    struct MgPromise* next_promise;  /* chained promise */
+    struct MgThenNode* next;
+} MgThenNode;
+
+typedef struct MgPromise {
+    int         state;          /* 0=pending, 1=fulfilled, 2=rejected */
+    void*       value;          /* resolved value or rejection reason */
+    MgThenNode* then_head;      /* linked list of .then callbacks */
+    MgThenNode* catch_head;     /* linked list of .catch callbacks */
+    MgFiber*    waiting_fiber;  /* fiber blocked on this promise */
+    int         fiber_rejected; /* 1 if the waiting fiber should receive a rejection */
+} MgPromise;
+
+static void tscc_microtask_enqueue(MgPromiseCallback cb, void* val, void* ctx,
+                                   MgPromise* chained);
+
+MgPromise* tscc_promise_new(void) {
+    MgPromise* p = (MgPromise*)calloc(1, sizeof(MgPromise));
+    return p;
+}
+
+static void tscc_fire_callbacks(MgPromise* p) {
+    MgThenNode* node = (p->state == 1) ? p->then_head : p->catch_head;
+    while (node) {
+        tscc_microtask_enqueue(node->cb, p->value, node->ctx, node->next_promise);
+        node = node->next;
+    }
+    /* Wake a waiting fiber */
+    if (p->waiting_fiber) {
+        p->waiting_fiber->resumer = tscc_current_fiber;  /* record who to return to */
+        tscc_fiber_resume(p->waiting_fiber);
+        p->waiting_fiber = NULL;
+    }
+}
+
+void tscc_promise_resolve(MgPromise* p, void* value) {
+    if (p->state != 0) return;  /* already settled */
+    p->state = 1;
+    p->value = value;
+    tscc_fire_callbacks(p);
+}
+
+void tscc_promise_reject(MgPromise* p, void* reason) {
+    if (p->state != 0) return;
+    p->state = 2;
+    p->value = reason;
+    p->fiber_rejected = 1;
+    tscc_fire_callbacks(p);
+}
+
+/* Append a then/catch node — returns a new chained promise. */
+static MgThenNode* tscc_append_then_node(MgPromise* p, MgPromiseCallback cb, void* ctx,
+                                         int is_catch) {
+    MgThenNode* node = (MgThenNode*)calloc(1, sizeof(MgThenNode));
+    node->cb  = cb;
+    node->ctx = ctx;
+    node->next_promise = tscc_promise_new();
+    if (is_catch) {
+        /* Append to catch list */
+        MgThenNode** tail = &p->catch_head;
+        while (*tail) tail = &(*tail)->next;
+        *tail = node;
+    } else {
+        MgThenNode** tail = &p->then_head;
+        while (*tail) tail = &(*tail)->next;
+        *tail = node;
+    }
+    return node;
+}
+
+MgPromise* tscc_promise_then(MgPromise* p,
+                              MgPromiseCallback cb, void* ctx) {
+    MgThenNode* node = tscc_append_then_node(p, cb, ctx, 0);
+    if (p->state == 1) {
+        /* Already resolved — enqueue immediately */
+        tscc_microtask_enqueue(cb, p->value, ctx, node->next_promise);
+    }
+    return node->next_promise;
+}
+
+MgPromise* tscc_promise_catch(MgPromise* p,
+                               MgPromiseCallback cb, void* ctx) {
+    MgThenNode* node = tscc_append_then_node(p, cb, ctx, 1);
+    if (p->state == 2) {
+        tscc_microtask_enqueue(cb, p->value, ctx, node->next_promise);
+    }
+    return node->next_promise;
+}
+
+/* Promise.resolve(v) — already-resolved promise */
+MgPromise* tscc_promise_resolve_val(void* value) {
+    MgPromise* p = tscc_promise_new();
+    tscc_promise_resolve(p, value);
+    return p;
+}
+
+/* Promise.reject(r) */
+MgPromise* tscc_promise_reject_val(void* reason) {
+    MgPromise* p = tscc_promise_new();
+    tscc_promise_reject(p, reason);
+    return p;
+}
+
+/* Suspend current fiber until promise settles; return resolved value.
+ * If rejected, calls tscc_throw with the rejection reason. */
+void* tscc_await(MgPromise* p) {
+    if (p->state == 1) return p->value;
+    if (p->state == 2) { tscc_throw(p->value); return NULL; }
+    /* Pending — register our fiber and yield */
+    MgFiber* me = tscc_current_fiber;
+    if (!me) {
+        fprintf(stderr, "tscc: await called outside of an async fiber\n");
+        exit(1);
+    }
+    p->waiting_fiber = me;
+    tscc_fiber_yield();
+    /* Resumed after promise settled */
+    if (p->state == 2) { tscc_throw(p->value); return NULL; }
+    return p->value;
+}
+
+/* Promise.all — resolves when all promises resolve, rejects on first rejection. */
+typedef struct { MgPromise** arr; int count; int resolved; void** values; MgPromise* out; } AllCtx;
+static void tscc_all_cb(void* val, void* ctx_raw) {
+    /* Simple approach: check if all are settled; if so resolve */
+    AllCtx* ctx = (AllCtx*)ctx_raw;
+    ctx->resolved++;
+    if (ctx->resolved == ctx->count) {
+        /* Collect values */
+        void** vals = (void**)calloc((size_t)ctx->count, sizeof(void*));
+        for (int i = 0; i < ctx->count; i++) vals[i] = ctx->arr[i]->value;
+        (void)vals; /* TODO: pass as array */
+        tscc_promise_resolve(ctx->out, val);
+    }
+}
+MgPromise* tscc_promise_all(MgPromise** arr, int count) {
+    MgPromise* out = tscc_promise_new();
+    if (count == 0) { tscc_promise_resolve(out, NULL); return out; }
+    AllCtx* ctx = (AllCtx*)calloc(1, sizeof(AllCtx));
+    ctx->arr = arr; ctx->count = count; ctx->out = out;
+    for (int i = 0; i < count; i++) {
+        tscc_promise_then(arr[i], tscc_all_cb, ctx);
+        if (arr[i]->state == 2) {
+            tscc_promise_reject(out, arr[i]->value);
+            return out;
+        }
+    }
+    return out;
+}
+
+/* Promise.race */
+static void tscc_race_cb(void* val, void* ctx_raw) {
+    MgPromise* out = (MgPromise*)ctx_raw;
+    if (out->state == 0) tscc_promise_resolve(out, val);
+}
+MgPromise* tscc_promise_race(MgPromise** arr, int count) {
+    MgPromise* out = tscc_promise_new();
+    for (int i = 0; i < count; i++) {
+        if (arr[i]->state == 1) { tscc_promise_resolve(out, arr[i]->value); return out; }
+        if (arr[i]->state == 2) { tscc_promise_reject(out, arr[i]->value); return out; }
+        tscc_promise_then(arr[i], tscc_race_cb, out);
+    }
+    return out;
+}
+
+// ============================================================
+// Event loop  (microtask + macrotask queues)
+// ============================================================
+
+/* --- Microtask queue (doubly-linked ring buffer would be ideal; using simple array) --- */
+typedef struct {
+    MgPromiseCallback cb;
+    void*             value;
+    void*             ctx;
+    MgPromise*        chained;
+} Microtask;
+
+#define TSCC_MICROTASK_CAPACITY 65536
+static Microtask tscc_microtask_queue[TSCC_MICROTASK_CAPACITY];
+static int       tscc_microtask_head = 0;
+static int       tscc_microtask_tail = 0;
+
+static void tscc_microtask_enqueue(MgPromiseCallback cb, void* val, void* ctx,
+                                   MgPromise* chained) {
+    int next = (tscc_microtask_tail + 1) % TSCC_MICROTASK_CAPACITY;
+    if (next == tscc_microtask_head) {
+        fprintf(stderr, "tscc: microtask queue overflow\n"); exit(1);
+    }
+    tscc_microtask_queue[tscc_microtask_tail] = (Microtask){ cb, val, ctx, chained };
+    tscc_microtask_tail = next;
+}
+
+static int tscc_microtask_empty(void) {
+    return tscc_microtask_head == tscc_microtask_tail;
+}
+
+static void tscc_drain_microtasks(void) {
+    while (!tscc_microtask_empty()) {
+        Microtask t = tscc_microtask_queue[tscc_microtask_head];
+        tscc_microtask_head = (tscc_microtask_head + 1) % TSCC_MICROTASK_CAPACITY;
+        /* Run the callback */
+        if (t.cb) {
+            t.cb(t.value, t.ctx);
+        }
+    }
+}
+
+/* --- Macrotask queue (setTimeout / setInterval) --- */
+typedef struct MacroTask {
+    void            (*cb)(void*);
+    void*            arg;
+    long long        fire_at_ms;   /* absolute time in ms */
+    struct MacroTask* next;
+} MacroTask;
+
+static MacroTask* tscc_macro_head = NULL;
+
+static long long tscc_now_ms(void) {
+    struct timespec ts;
+#if defined(_WIN32) || defined(_WIN64)
+    /* Use GetSystemTimeAsFileTime converted to ms */
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    long long t = ((long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return t / 10000 - 11644473600000LL; /* convert to Unix ms */
+#elif defined(CLOCK_REALTIME)
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000LL);
+#else
+    return (long long)time(NULL) * 1000LL;
+#endif
+}
+
+void tscc_set_timeout(void (*cb)(void*), void* arg, long long delay_ms) {
+    MacroTask* t = (MacroTask*)calloc(1, sizeof(MacroTask));
+    t->cb        = cb;
+    t->arg       = arg;
+    t->fire_at_ms = tscc_now_ms() + (delay_ms < 0 ? 0 : delay_ms);
+    /* Insert in sorted order (ascending fire_at_ms) */
+    MacroTask** pos = &tscc_macro_head;
+    while (*pos && (*pos)->fire_at_ms <= t->fire_at_ms)
+        pos = &(*pos)->next;
+    t->next = *pos;
+    *pos = t;
+}
+
+/* Run the event loop: drain microtasks, then fire due macrotasks, repeat. */
+void tscc_event_loop_run(void) {
+    while (1) {
+        tscc_drain_microtasks();
+
+        /* Check for due macrotasks */
+        long long now = tscc_now_ms();
+        if (!tscc_macro_head || tscc_macro_head->fire_at_ms > now) {
+            /* If there's a pending macrotask in the future, sleep until it fires */
+            if (tscc_macro_head) {
+                long long wait_ms = tscc_macro_head->fire_at_ms - now;
+                if (wait_ms > 0) {
+#if defined(_WIN32) || defined(_WIN64)
+                    Sleep((DWORD)wait_ms);
+#else
+                    struct timespec req;
+                    req.tv_sec  = (time_t)(wait_ms / 1000);
+                    req.tv_nsec = (long)((wait_ms % 1000) * 1000000L);
+                    nanosleep(&req, NULL);
+#endif
+                }
+                continue;
+            }
+            /* Nothing left — exit */
+            break;
+        }
+
+        /* Pop and fire the next due macrotask */
+        MacroTask* t = tscc_macro_head;
+        tscc_macro_head = t->next;
+        t->cb(t->arg);
+        free(t);
+    }
 }

@@ -5,11 +5,17 @@ use crate::parser::ast::*;
 pub struct Parser {
     tokens: Vec<SpannedToken>,
     current: usize,
+    /// Depth of async function nesting — await is only valid when > 0
+    async_depth: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<SpannedToken>) -> Self {
-        Self { tokens, current: 0 }
+        Self {
+            tokens,
+            current: 0,
+            async_depth: 0,
+        }
     }
 
     pub fn parse(&mut self) -> Result<Program, CompileError> {
@@ -33,7 +39,8 @@ impl Parser {
 
         match self.peek_token() {
             Token::Let | Token::Const | Token::Var => self.variable_declaration(false),
-            Token::Function => self.function_declaration(false),
+            Token::Function => self.function_declaration(false, false),
+            Token::Async => self.async_declaration(false),
             Token::Class => self.class_declaration(),
             Token::Interface => self.interface_declaration(),
             Token::Enum => self.enum_declaration(),
@@ -48,6 +55,8 @@ impl Parser {
             Token::LeftBrace => self.block_statement(),
             Token::Import => self.import_declaration(),
             Token::Export => self.export_declaration(),
+            Token::Throw => self.throw_statement(),
+            Token::Try => self.try_statement(),
             // type alias: type X = Y (contextual keyword)
             Token::Identifier(ref name) if name == "type" => {
                 // Peek ahead: if followed by an identifier, it's a type alias
@@ -185,7 +194,11 @@ impl Parser {
         })
     }
 
-    fn function_declaration(&mut self, is_exported: bool) -> Result<Statement, CompileError> {
+    fn function_declaration(
+        &mut self,
+        is_exported: bool,
+        is_async: bool,
+    ) -> Result<Statement, CompileError> {
         let start_span = self.current_span();
         self.advance();
 
@@ -209,7 +222,13 @@ impl Parser {
         };
 
         self.expect(&Token::LeftBrace, "Expected '{' before function body")?;
+        if is_async {
+            self.async_depth += 1;
+        }
         let body = self.block_body()?;
+        if is_async {
+            self.async_depth -= 1;
+        }
 
         self.consume_semicolon()?;
 
@@ -221,6 +240,119 @@ impl Parser {
                 return_type,
                 body,
                 is_exported,
+                is_async,
+            },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    /// Parse `async function f()` or `async () =>` as a statement.
+    fn async_declaration(&mut self, is_exported: bool) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'async'
+        match self.peek_token() {
+            Token::Function => self.function_declaration(is_exported, true),
+            _ => {
+                // async arrow function used as a statement (unusual but valid)
+                // fall back to expression statement
+                let expr = self.finish_async_arrow(start_span.clone())?;
+                self.consume_semicolon()?;
+                Ok(Statement {
+                    kind: StmtKind::Expression { expr },
+                    span: self.span_from(&start_span),
+                })
+            }
+        }
+    }
+
+    /// Finish parsing `async (params) => body` after 'async' has been consumed.
+    fn finish_async_arrow(&mut self, start_span: Span) -> Result<Expr, CompileError> {
+        self.expect(&Token::LeftParen, "Expected '(' after 'async'")?;
+        let params = self.parameter_list()?;
+        self.expect(
+            &Token::RightParen,
+            "Expected ')' after async arrow parameters",
+        )?;
+        let return_type = if self.match_token(&Token::Colon) {
+            Some(self.type_annotation()?)
+        } else {
+            None
+        };
+        self.expect(&Token::Arrow, "Expected '=>' in async arrow function")?;
+        self.async_depth += 1;
+        let body = if self.check(&Token::LeftBrace) {
+            self.advance();
+            ArrowBody::Block(self.block_body()?)
+        } else {
+            ArrowBody::Expr(Box::new(self.assignment()?))
+        };
+        self.async_depth -= 1;
+        Ok(Expr {
+            kind: ExprKind::ArrowFunction {
+                params,
+                return_type,
+                body,
+                is_async: true,
+            },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn throw_statement(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'throw'
+        let value = self.expression()?;
+        self.consume_semicolon()?;
+        Ok(Statement {
+            kind: StmtKind::Throw { value },
+            span: self.span_from(&start_span),
+        })
+    }
+
+    fn try_statement(&mut self) -> Result<Statement, CompileError> {
+        let start_span = self.current_span();
+        self.advance(); // consume 'try'
+        self.expect(&Token::LeftBrace, "Expected '{' after 'try'")?;
+        let body = self.block_body()?;
+
+        let (catch_binding, catch_body) = if self.check(&Token::Catch) {
+            self.advance(); // consume 'catch'
+            let binding = if self.match_token(&Token::LeftParen) {
+                let name = self.expect_identifier("Expected catch binding name")?;
+                // optional type annotation on catch binding (e.g. catch (e: unknown))
+                if self.match_token(&Token::Colon) {
+                    self.type_annotation()?; // discard
+                }
+                self.expect(&Token::RightParen, "Expected ')' after catch binding")?;
+                Some(name)
+            } else {
+                None
+            };
+            self.expect(&Token::LeftBrace, "Expected '{' after 'catch'")?;
+            let cb = self.block_body()?;
+            (binding, Some(cb))
+        } else {
+            (None, None)
+        };
+
+        let finally_body = if self.check(&Token::Finally) {
+            self.advance(); // consume 'finally'
+            self.expect(&Token::LeftBrace, "Expected '{' after 'finally'")?;
+            Some(self.block_body()?)
+        } else {
+            None
+        };
+
+        if catch_body.is_none() && finally_body.is_none() {
+            return Err(self.error("try statement must have a catch or finally clause"));
+        }
+
+        Ok(Statement {
+            kind: StmtKind::TryCatch {
+                body,
+                catch_binding,
+                catch_body,
+                finally_body,
             },
             span: self.span_from(&start_span),
         })
@@ -575,7 +707,8 @@ impl Parser {
         self.advance(); // consume 'export'
 
         match self.peek_token() {
-            Token::Function => self.function_declaration(true),
+            Token::Function => self.function_declaration(true, false),
+            Token::Async => self.async_declaration(true),
             Token::Let | Token::Const | Token::Var => self.variable_declaration(true),
             _ => Err(self.error("Expected function, let, or const after 'export'")),
         }
@@ -1433,6 +1566,7 @@ impl Parser {
                         }],
                         return_type: None,
                         body,
+                        is_async: false,
                     },
                     span: self.span_from(&span),
                 });
@@ -1823,6 +1957,23 @@ impl Parser {
                     },
                 })
             }
+            Token::Await => {
+                let span = self.current_span();
+                if self.async_depth == 0 {
+                    return Err(CompileError::error(
+                        "'await' can only be used inside an async function",
+                        span,
+                    ));
+                }
+                self.advance();
+                let operand = self.unary()?;
+                Ok(Expr {
+                    span: self.span_from(&span),
+                    kind: ExprKind::Await {
+                        expr: Box::new(operand),
+                    },
+                })
+            }
             Token::PlusPlus => {
                 let span = self.current_span();
                 self.advance();
@@ -2070,9 +2221,15 @@ impl Parser {
                         params,
                         return_type,
                         body: ArrowBody::Block(body),
+                        is_async: false,
                     },
                     span: self.span_from(&span),
                 })
+            }
+            Token::Async => {
+                // async () => body  or  async (params) => body
+                self.advance(); // consume 'async'
+                self.finish_async_arrow(span)
             }
             Token::Identifier(_) => {
                 let name = self.expect_identifier("")?;
@@ -2174,6 +2331,7 @@ impl Parser {
                                 params: params.clone(),
                                 return_type: return_type.clone(),
                                 body: ArrowBody::Block(body_stmts),
+                                is_async: false,
                             },
                             span: self.span_from(&prop_span),
                         };
@@ -2273,6 +2431,7 @@ impl Parser {
                                 params,
                                 return_type,
                                 body,
+                                is_async: false,
                             },
                             span: self.span_from(start_span),
                         }));

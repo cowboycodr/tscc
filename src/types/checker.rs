@@ -76,6 +76,23 @@ impl TypeChecker {
         );
         // Number (special object with static methods)
         self.define("Number".to_string(), Type::Unknown, true);
+        // Promise (built-in class — backed by MgPromise in the runtime)
+        self.define("Promise".to_string(), Type::Unknown, true);
+        // setTimeout global function
+        self.define(
+            "setTimeout".to_string(),
+            Type::Function {
+                params: vec![
+                    Type::Function {
+                        params: vec![],
+                        return_type: Box::new(Type::Void),
+                    },
+                    Type::Number,
+                ],
+                return_type: Box::new(Type::Void),
+            },
+            true,
+        );
         // NaN global constant
         self.define("NaN".to_string(), Type::Number, true);
         // Infinity global constant
@@ -120,6 +137,7 @@ impl TypeChecker {
                 params,
                 return_type,
                 is_exported,
+                is_async,
                 ..
             } = &stmt.kind
             {
@@ -156,14 +174,32 @@ impl TypeChecker {
                     })
                     .collect();
 
-                let ret_type = return_type
+                let raw_ret = return_type
                     .as_ref()
                     .map(|ann| self.resolve_type_annotation(ann))
                     .unwrap_or(Type::Void);
 
+                // For async functions: unwrap Promise<T> annotation → T for internal
+                // checking; the external signature exposes Promise<T>.
+                let ret_type = if *is_async {
+                    match raw_ret {
+                        Type::Promise(inner) => *inner,
+                        other => other,
+                    }
+                } else {
+                    raw_ret
+                };
+
+                // External type for callers: async fn returns Promise<T>
+                let external_ret = if *is_async {
+                    Type::Promise(Box::new(ret_type.clone()))
+                } else {
+                    ret_type.clone()
+                };
+
                 let func_type = Type::Function {
                     params: param_types.clone(),
-                    return_type: Box::new(ret_type.clone()),
+                    return_type: Box::new(external_ret),
                 };
 
                 if *is_exported {
@@ -276,6 +312,7 @@ impl TypeChecker {
                 return_type,
                 body,
                 is_exported,
+                is_async,
             } => {
                 let is_generic = !type_params.is_empty();
 
@@ -313,14 +350,30 @@ impl TypeChecker {
                     })
                     .collect();
 
-                let ret_type = return_type
+                let raw_ret = return_type
                     .as_ref()
                     .map(|ann| self.resolve_type_annotation(ann))
                     .unwrap_or(Type::Void);
 
+                // For async functions, unwrap Promise<T> from annotation if present.
+                let ret_type = if *is_async {
+                    match raw_ret {
+                        Type::Promise(inner) => *inner,
+                        other => other,
+                    }
+                } else {
+                    raw_ret
+                };
+
+                let external_ret = if *is_async {
+                    Type::Promise(Box::new(ret_type.clone()))
+                } else {
+                    ret_type.clone()
+                };
+
                 let func_type = Type::Function {
                     params: param_types.clone(),
-                    return_type: Box::new(ret_type.clone()),
+                    return_type: Box::new(external_ret),
                 };
 
                 if *is_exported {
@@ -814,6 +867,46 @@ impl TypeChecker {
             }
 
             StmtKind::Labeled { body, .. } => self.check_statement(body),
+
+            StmtKind::Throw { value } => {
+                self.check_expr(value)?;
+                Ok(())
+            }
+
+            StmtKind::TryCatch {
+                body,
+                catch_binding,
+                catch_body,
+                finally_body,
+            } => {
+                self.push_scope();
+                for stmt in body {
+                    self.check_statement(stmt)?;
+                }
+                self.pop_scope();
+
+                if let Some(catch_stmts) = catch_body {
+                    self.push_scope();
+                    if let Some(binding) = catch_binding {
+                        // catch binding has type unknown in TypeScript
+                        self.define(binding.clone(), Type::Unknown, false);
+                    }
+                    for stmt in catch_stmts {
+                        self.check_statement(stmt)?;
+                    }
+                    self.pop_scope();
+                }
+
+                if let Some(finally_stmts) = finally_body {
+                    self.push_scope();
+                    for stmt in finally_stmts {
+                        self.check_statement(stmt)?;
+                    }
+                    self.pop_scope();
+                }
+
+                Ok(())
+            }
         }
     }
 
@@ -1538,6 +1631,7 @@ impl TypeChecker {
                 params,
                 return_type,
                 body,
+                is_async: _,
             } => {
                 let param_types: Vec<Type> = params
                     .iter()
@@ -1639,6 +1733,15 @@ impl TypeChecker {
                 }
                 // satisfies returns the original (narrower) type, not the target
                 Ok(inner_type)
+            }
+
+            ExprKind::Await { expr: inner } => {
+                let inner_type = self.check_expr(inner)?;
+                // Unwrap Promise<T> → T; non-promise awaitable passes through as-is
+                Ok(match inner_type {
+                    Type::Promise(inner) => *inner,
+                    other => other,
+                })
             }
         }
     }
@@ -2092,6 +2195,10 @@ impl TypeChecker {
         if let (Type::Array(from_elem), Type::Array(to_elem)) = (from, to) {
             return self.is_assignable(from_elem, to_elem);
         }
+        // Promise covariance
+        if let (Type::Promise(from_inner), Type::Promise(to_inner)) = (from, to) {
+            return self.is_assignable(from_inner, to_inner);
+        }
         // Tuple structural compatibility: same length, each element assignable
         if let (Type::Tuple(from_elems), Type::Tuple(to_elems)) = (from, to) {
             if from_elems.len() != to_elems.len() {
@@ -2211,6 +2318,14 @@ impl TypeChecker {
                     .collect(),
             ),
             TypeAnnKind::Generic { name, type_args } => {
+                // Built-in generics
+                if name == "Promise" {
+                    let inner = type_args
+                        .first()
+                        .map(|a| self.resolve_type_annotation(a))
+                        .unwrap_or(Type::Void);
+                    return Type::Promise(Box::new(inner));
+                }
                 // Resolve generic type alias: IsNumber<number>
                 if let Some((tp_names, body)) = self.generic_type_aliases.get(name).cloned() {
                     // Resolve type args, then substitute into the body

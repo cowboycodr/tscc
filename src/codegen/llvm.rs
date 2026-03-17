@@ -76,6 +76,11 @@ pub struct Codegen<'ctx> {
     enum_string_values: HashMap<String, HashMap<String, String>>,
     /// Class field initializers: class_name -> Vec<(field_name, initializer_expr)>
     class_field_initializers: HashMap<String, Vec<(String, Expr)>>,
+    /// Inside an async function body: holds the alloca'd promise pointer variable.
+    /// Used by `return` statements and `compile_await_expr` to resolve/reject the promise.
+    current_async_promise: Option<PointerValue<'ctx>>,
+    /// VarType of the value resolved by the current async function's promise.
+    current_async_resolve_vt: Option<VarType>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +119,11 @@ enum VarType {
     /// Array of typed objects — {void**, i64, i64}; elements accessed via pointer load
     ObjArray {
         elem_vt: Box<VarType>,
+    },
+    /// A Promise<T> — a pointer to MgPromise in the runtime heap.
+    /// inner_vt is the type of the resolved value (used for unboxing after await).
+    Promise {
+        inner_vt: Box<VarType>,
     },
 }
 
@@ -182,6 +192,8 @@ impl<'ctx> Codegen<'ctx> {
             pending_loop_label: None,
             enum_string_values: HashMap::new(),
             class_field_initializers: HashMap::new(),
+            current_async_promise: None,
+            current_async_resolve_vt: None,
         };
 
         codegen.declare_runtime_functions();
@@ -613,6 +625,143 @@ impl<'ctx> Codegen<'ctx> {
                 None,
             ),
         );
+
+        // --- Exception handling (setjmp / longjmp based try/catch/throw) ---
+        // jmp_buf* tscc_try_enter(void)
+        self.module
+            .add_function("tscc_try_enter", ptr_type.fn_type(&[], false), None);
+        // void tscc_try_exit(void)
+        self.module
+            .add_function("tscc_try_exit", void_type.fn_type(&[], false), None);
+        // void* tscc_catch_value(void)
+        self.module
+            .add_function("tscc_catch_value", ptr_type.fn_type(&[], false), None);
+        // void tscc_throw(void* value)
+        self.module.add_function(
+            "tscc_throw",
+            void_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // void* tscc_box_number(double)
+        self.module.add_function(
+            "tscc_box_number",
+            ptr_type.fn_type(&[f64_type.into()], false),
+            None,
+        );
+        // double tscc_unbox_number(void*)
+        self.module.add_function(
+            "tscc_unbox_number",
+            f64_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // void* tscc_box_boolean(int)
+        self.module.add_function(
+            "tscc_box_boolean",
+            ptr_type.fn_type(&[i1_type.into()], false),
+            None,
+        );
+        // int tscc_unbox_boolean(void*)
+        self.module.add_function(
+            "tscc_unbox_boolean",
+            i1_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // void* tscc_box_string(char* data, i64 len)
+        self.module.add_function(
+            "tscc_box_string",
+            ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        // MgString tscc_unbox_string(void*)
+        self.module.add_function(
+            "tscc_unbox_string",
+            self.string_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        // --- setjmp declaration (marked returns_twice) ---
+        let i32_type = self.context.i32_type();
+        let setjmp_fn =
+            self.module
+                .add_function("setjmp", i32_type.fn_type(&[ptr_type.into()], false), None);
+        // Mark as returns_twice so LLVM doesn't eliminate the catch path
+        let returns_twice_id = Attribute::get_named_enum_kind_id("returns_twice");
+        let attr = self.context.create_enum_attribute(returns_twice_id, 0);
+        setjmp_fn.add_attribute(AttributeLoc::Function, attr);
+
+        // --- Async runtime: fibers + promises + event loop ---
+        // MgFiber* tscc_fiber_create(fn_ptr, arg)
+        self.module.add_function(
+            "tscc_fiber_create",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+        // void tscc_fiber_resume(MgFiber*)
+        self.module.add_function(
+            "tscc_fiber_resume",
+            void_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // void tscc_fiber_yield(void)
+        self.module
+            .add_function("tscc_fiber_yield", void_type.fn_type(&[], false), None);
+        // MgFiber* tscc_fiber_current(void)
+        self.module
+            .add_function("tscc_fiber_current", ptr_type.fn_type(&[], false), None);
+        // MgPromise* tscc_promise_new(void)
+        self.module
+            .add_function("tscc_promise_new", ptr_type.fn_type(&[], false), None);
+        // void tscc_promise_resolve(MgPromise*, void* value)
+        self.module.add_function(
+            "tscc_promise_resolve",
+            void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+        // void tscc_promise_reject(MgPromise*, void* reason)
+        self.module.add_function(
+            "tscc_promise_reject",
+            void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+        // MgPromise* tscc_promise_then(MgPromise*, fn_ptr, ctx)
+        self.module.add_function(
+            "tscc_promise_then",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+        // MgPromise* tscc_promise_catch(MgPromise*, fn_ptr, ctx)
+        self.module.add_function(
+            "tscc_promise_catch",
+            ptr_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+            None,
+        );
+        // void* tscc_await(MgPromise*)
+        self.module.add_function(
+            "tscc_await",
+            ptr_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // MgPromise* tscc_promise_resolve_val(void*)
+        self.module.add_function(
+            "tscc_promise_resolve_val",
+            ptr_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // MgPromise* tscc_promise_reject_val(void*)
+        self.module.add_function(
+            "tscc_promise_reject_val",
+            ptr_type.fn_type(&[ptr_type.into()], false),
+            None,
+        );
+        // void tscc_event_loop_run(void)
+        self.module
+            .add_function("tscc_event_loop_run", void_type.fn_type(&[], false), None);
+        // void tscc_set_timeout(fn_ptr, arg, delay_ms)
+        self.module.add_function(
+            "tscc_set_timeout",
+            void_type.fn_type(&[ptr_type.into(), ptr_type.into(), i64_type.into()], false),
+            None,
+        );
     }
 
     // --- Integer narrowing analysis ---
@@ -719,6 +868,24 @@ impl<'ctx> Codegen<'ctx> {
             }
             StmtKind::ObjectDestructure { initializer, .. } => {
                 Self::is_expr_integer_safe(initializer, fn_name, known)
+            }
+            StmtKind::Throw { value } => Self::is_expr_integer_safe(value, fn_name, known),
+            StmtKind::TryCatch {
+                body,
+                catch_body,
+                finally_body,
+                ..
+            } => {
+                body.iter()
+                    .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    && catch_body.as_ref().map_or(true, |b| {
+                        b.iter()
+                            .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    })
+                    && finally_body.as_ref().map_or(true, |b| {
+                        b.iter()
+                            .all(|s| Self::is_stmt_integer_safe(s, fn_name, known))
+                    })
             }
             StmtKind::FunctionDecl { .. }
             | StmtKind::Import { .. }
@@ -836,6 +1003,16 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
+        // Reserve the LLVM entry-point 'main' name before user functions are compiled.
+        // This ensures that if a user defines a TypeScript function also named 'main',
+        // it gets the name 'main.1' and the C entry point stays as 'main'.
+        if !self.is_library {
+            let i32_type = self.context.i32_type();
+            let main_placeholder_type = i32_type.fn_type(&[], false);
+            self.module
+                .add_function("main", main_placeholder_type, None);
+        }
+
         // Second pass: compile all function declarations (skip generics — they're monomorphized on demand)
         for stmt in &program.statements {
             if let StmtKind::FunctionDecl {
@@ -844,6 +1021,7 @@ impl<'ctx> Codegen<'ctx> {
                 params,
                 return_type,
                 body,
+                is_async,
                 ..
             } = &stmt.kind
             {
@@ -855,6 +1033,8 @@ impl<'ctx> Codegen<'ctx> {
                         name.clone(),
                         (tp_names, params.clone(), return_type.clone(), body.clone()),
                     );
+                } else if *is_async {
+                    self.compile_async_function_decl(name, params, return_type, body)?;
                 } else {
                     self.compile_function_decl(name, params, return_type, body)?;
                 }
@@ -867,10 +1047,13 @@ impl<'ctx> Codegen<'ctx> {
             return Ok(());
         }
 
-        // Create main function
+        // Retrieve the LLVM entry-point 'main' that was pre-reserved before user functions
+        // were compiled (to avoid name collision with a TypeScript function also named 'main').
         let i32_type = self.context.i32_type();
-        let main_fn_type = i32_type.fn_type(&[], false);
-        let main_fn = self.module.add_function("main", main_fn_type, None);
+        let main_fn = self
+            .module
+            .get_function("main")
+            .expect("LLVM entry 'main' should have been pre-reserved");
         let nounwind_id = Attribute::get_named_enum_kind_id("nounwind");
         main_fn.add_attribute(
             AttributeLoc::Function,
@@ -901,6 +1084,9 @@ impl<'ctx> Codegen<'ctx> {
             .get_terminator()
             .is_none()
         {
+            // Run the event loop to drain any pending async tasks before exiting
+            let event_loop_fn = self.module.get_function("tscc_event_loop_run").unwrap();
+            self.builder.build_call(event_loop_fn, &[], "").unwrap();
             self.builder
                 .build_return(Some(&i32_type.const_int(0, false)))
                 .unwrap();
@@ -1444,7 +1630,34 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             StmtKind::Return { value } => {
-                if let Some(val) = value {
+                // Inside an async function body, `return x` resolves the promise
+                if let Some(promise_alloca) = self.current_async_promise {
+                    let ptr_type = self.context.ptr_type(AddressSpace::default());
+                    // Load the actual promise pointer from the alloca
+                    let actual_promise = self
+                        .builder
+                        .build_load(ptr_type, promise_alloca, "actual_promise")
+                        .unwrap();
+                    let resolve_vt = self
+                        .current_async_resolve_vt
+                        .clone()
+                        .unwrap_or(VarType::Number);
+                    let boxed = if let Some(val) = value {
+                        let (ret_val, vt) = self.compile_expr(val, function)?;
+                        self.box_value(ret_val, &vt)
+                    } else {
+                        self.context
+                            .ptr_type(AddressSpace::default())
+                            .const_null()
+                            .into()
+                    };
+                    let resolve_fn = self.module.get_function("tscc_promise_resolve").unwrap();
+                    self.builder
+                        .build_call(resolve_fn, &[actual_promise.into(), boxed.into()], "")
+                        .unwrap();
+                    let _ = resolve_vt;
+                    self.builder.build_return(None).unwrap();
+                } else if let Some(val) = value {
                     let (ret_val, _) = self.compile_expr(val, function)?;
                     self.builder.build_return(Some(&ret_val)).unwrap();
                 } else {
@@ -1966,6 +2179,21 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             StmtKind::Empty => Ok(()),
+
+            StmtKind::Throw { value } => self.compile_throw(value, function),
+
+            StmtKind::TryCatch {
+                body,
+                catch_binding,
+                catch_body,
+                finally_body,
+            } => self.compile_try_catch(
+                body,
+                catch_binding.as_deref(),
+                catch_body.as_deref(),
+                finally_body.as_deref(),
+                function,
+            ),
         }
     }
 
@@ -2082,6 +2310,642 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Box/unbox helpers: convert typed values to/from void* for async runtime
+    // -----------------------------------------------------------------------
+
+    /// Box a typed value into a `void*` (ptr) for passing to tscc_promise_resolve, etc.
+    fn box_value(&mut self, val: BasicValueEnum<'ctx>, vt: &VarType) -> BasicValueEnum<'ctx> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        match vt {
+            VarType::Number => {
+                let f = self.module.get_function("tscc_box_number").unwrap();
+                self.builder
+                    .build_call(f, &[val.into()], "boxed_num")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            VarType::Integer => {
+                // Convert i64 → f64 then box
+                let f64_val = self
+                    .builder
+                    .build_signed_int_to_float(val.into_int_value(), self.context.f64_type(), "i2f")
+                    .unwrap();
+                let f = self.module.get_function("tscc_box_number").unwrap();
+                self.builder
+                    .build_call(f, &[f64_val.into()], "boxed_int")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            VarType::Boolean => {
+                let f = self.module.get_function("tscc_box_boolean").unwrap();
+                self.builder
+                    .build_call(f, &[val.into()], "boxed_bool")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            VarType::String => {
+                let data = self
+                    .builder
+                    .build_extract_value(val.into_struct_value(), 0, "str_data")
+                    .unwrap();
+                let len = self
+                    .builder
+                    .build_extract_value(val.into_struct_value(), 1, "str_len")
+                    .unwrap();
+                let f = self.module.get_function("tscc_box_string").unwrap();
+                self.builder
+                    .build_call(f, &[data.into(), len.into()], "boxed_str")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            // For pointers/objects/promises, pass the value directly as a ptr
+            VarType::Promise { .. } | VarType::Map { .. } | VarType::FunctionPtr { .. } => val,
+            _ => {
+                // For other types (objects, arrays): store on a heap alloca and return ptr
+                // This is an approximation — objects would need malloc for proper lifetime
+                let _ = ptr_type;
+                val
+            }
+        }
+    }
+
+    /// Unbox a `void*` back to a typed value of VarType `vt`.
+    fn unbox_value(&mut self, ptr: BasicValueEnum<'ctx>, vt: &VarType) -> BasicValueEnum<'ctx> {
+        match vt {
+            VarType::Number => {
+                let f = self.module.get_function("tscc_unbox_number").unwrap();
+                self.builder
+                    .build_call(f, &[ptr.into()], "unboxed_num")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            VarType::Integer => {
+                let f = self.module.get_function("tscc_unbox_number").unwrap();
+                let f64_val = self
+                    .builder
+                    .build_call(f, &[ptr.into()], "unboxed_num_f")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                self.builder
+                    .build_float_to_signed_int(
+                        f64_val.into_float_value(),
+                        self.context.i64_type(),
+                        "f2i",
+                    )
+                    .unwrap()
+                    .into()
+            }
+            VarType::Boolean => {
+                let f = self.module.get_function("tscc_unbox_boolean").unwrap();
+                self.builder
+                    .build_call(f, &[ptr.into()], "unboxed_bool")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            VarType::String => {
+                let f = self.module.get_function("tscc_unbox_string").unwrap();
+                self.builder
+                    .build_call(f, &[ptr.into()], "unboxed_str")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap()
+            }
+            // Promises/pointers pass through as-is
+            _ => ptr,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Async function compilation
+    // -----------------------------------------------------------------------
+
+    /// Compile an `async function f(params): Promise<T> { body }`.
+    ///
+    /// Strategy (stackful fibers):
+    ///   1. Generate a fiber body function `__async_body_f(void* args_ptr)` that
+    ///      unpacks args, runs the body, and resolves the promise on return.
+    ///   2. Generate the outer public function `f(params) -> MgPromise*` that:
+    ///      a. Creates a new promise via `tscc_promise_new()`
+    ///      b. Allocates an args struct on the heap (promise + params)
+    ///      c. Creates a fiber: `tscc_fiber_create(__async_body_f, args_ptr)`
+    ///      d. Resumes the fiber immediately: `tscc_fiber_resume(fiber)`
+    ///      e. Returns the promise pointer
+    fn compile_async_function_decl(
+        &mut self,
+        name: &str,
+        params: &[Parameter],
+        return_type: &Option<TypeAnnotation>,
+        body: &[Statement],
+    ) -> Result<(), CompileError> {
+        let saved_mode = self.number_mode.clone();
+        if self.integer_functions.contains(name) {
+            self.number_mode = VarType::Integer;
+        }
+
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let void_type = self.context.void_type();
+
+        // Determine the inner resolve VarType (unwrap Promise<T> -> T)
+        let resolve_vt = if let Some(ann) = return_type {
+            let vt = self.type_ann_to_var_type(ann);
+            match vt {
+                VarType::Promise { inner_vt } => *inner_vt,
+                other => other,
+            }
+        } else {
+            VarType::Number
+        };
+
+        // ---- Build the fiber body function ----
+        let body_name = format!("__async_body_{}", name);
+        let body_fn_type = void_type.fn_type(&[ptr_type.into()], false);
+        let body_fn = self.module.add_function(&body_name, body_fn_type, None);
+
+        let saved_bb = self.builder.get_insert_block();
+        let entry_bb = self.context.append_basic_block(body_fn, "entry");
+        self.builder.position_at_end(entry_bb);
+        self.push_scope();
+
+        // Unpack args struct: first element is MgPromise*, rest are the params
+        let args_raw = body_fn.get_nth_param(0).unwrap();
+
+        // Load promise pointer from args[0]
+        let promise_alloca = self
+            .builder
+            .build_alloca(ptr_type, "__async_promise")
+            .unwrap();
+
+        // The first 8 bytes of args_raw is the promise pointer
+        let promise_ptr = self
+            .builder
+            .build_load(ptr_type, args_raw.into_pointer_value(), "promise")
+            .unwrap()
+            .into_pointer_value();
+        self.builder
+            .build_store(promise_alloca, promise_ptr)
+            .unwrap();
+
+        // Unpack param values from args_raw + 8 offset per param
+        let param_vts: Vec<VarType> = params
+            .iter()
+            .map(|p| {
+                p.type_ann
+                    .as_ref()
+                    .map(|ann| self.type_ann_to_var_type(ann))
+                    .unwrap_or_else(|| self.number_mode.clone())
+            })
+            .collect();
+
+        for (i, (param, vt)) in params.iter().zip(param_vts.iter()).enumerate() {
+            let byte_offset = (i + 1) * 8; // after the promise pointer
+            let byte_offset_val = self.context.i64_type().const_int(byte_offset as u64, false);
+            let elem_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        args_raw.into_pointer_value(),
+                        &[byte_offset_val],
+                        &format!("arg{}_ptr", i),
+                    )
+                    .unwrap()
+            };
+            let llvm_type = self.var_type_to_llvm(vt);
+            let val = self
+                .builder
+                .build_load(llvm_type, elem_ptr, &param.name)
+                .unwrap();
+            let alloca = self.create_alloca(body_fn, vt, &param.name);
+            self.builder.build_store(alloca, val).unwrap();
+            self.set_variable(param.name.clone(), alloca, vt.clone());
+        }
+
+        // Set up async context
+        let prev_async_promise = self.current_async_promise;
+        let prev_async_resolve_vt = self.current_async_resolve_vt.clone();
+        self.current_async_promise = Some(promise_alloca);
+        self.current_async_resolve_vt = Some(resolve_vt.clone());
+
+        // Compile body
+        for stmt in body {
+            self.compile_statement(stmt, body_fn)?;
+        }
+
+        // If body fell through without returning, resolve with undefined (null ptr)
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            // Reload promise from alloca
+            let actual_promise = self
+                .builder
+                .build_load(ptr_type, promise_alloca, "actual_promise_fallthrough")
+                .unwrap();
+            let resolve_fn = self.module.get_function("tscc_promise_resolve").unwrap();
+            let null_val = ptr_type.const_null();
+            self.builder
+                .build_call(resolve_fn, &[actual_promise.into(), null_val.into()], "")
+                .unwrap();
+            self.builder.build_return(None).unwrap();
+        }
+
+        self.current_async_promise = prev_async_promise;
+        self.current_async_resolve_vt = prev_async_resolve_vt;
+        self.pop_scope();
+
+        // ---- Build the outer wrapper function (returns MgPromise*) ----
+        if let Some(bb) = saved_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        let llvm_param_types: Vec<BasicMetadataTypeEnum<'ctx>> = param_vts
+            .iter()
+            .map(|vt| self.var_type_to_llvm(vt).into())
+            .collect();
+        let outer_fn_type = ptr_type.fn_type(&llvm_param_types, false);
+        let outer_fn = self.module.add_function(name, outer_fn_type, None);
+        self.functions.insert(name.to_string(), outer_fn);
+
+        // Store return type as Promise
+        self.function_return_types.insert(
+            name.to_string(),
+            VarType::Promise {
+                inner_vt: Box::new(resolve_vt.clone()),
+            },
+        );
+        self.function_param_var_types
+            .insert(name.to_string(), param_vts.clone());
+
+        let outer_entry = self.context.append_basic_block(outer_fn, "entry");
+        let caller_bb = self.builder.get_insert_block();
+        self.builder.position_at_end(outer_entry);
+
+        // 1. Create promise
+        let promise_new_fn = self.module.get_function("tscc_promise_new").unwrap();
+        let promise = self
+            .builder
+            .build_call(promise_new_fn, &[], "promise")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap();
+
+        // 2. Allocate args struct on the stack:
+        //    [ promise_ptr(8 bytes), param0(8 bytes), param1(8 bytes), ... ]
+        let args_size = (params.len() + 1) as u64 * 8;
+        let args_size_val = self.context.i64_type().const_int(args_size, false);
+        let malloc_fn = self.module.get_function("malloc").unwrap_or_else(|| {
+            self.module.add_function(
+                "malloc",
+                ptr_type.fn_type(&[self.context.i64_type().into()], false),
+                None,
+            )
+        });
+        let args_buf = self
+            .builder
+            .build_call(malloc_fn, &[args_size_val.into()], "args_buf")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap()
+            .into_pointer_value();
+
+        // Store promise pointer at offset 0
+        self.builder.build_store(args_buf, promise).unwrap();
+
+        // Store each param at offset (i+1)*8
+        for (i, (param_val, vt)) in outer_fn
+            .get_params()
+            .iter()
+            .zip(param_vts.iter())
+            .enumerate()
+        {
+            let byte_offset = (i + 1) as u64 * 8;
+            let byte_offset_val = self.context.i64_type().const_int(byte_offset, false);
+            let elem_ptr = unsafe {
+                self.builder
+                    .build_gep(
+                        self.context.i8_type(),
+                        args_buf,
+                        &[byte_offset_val],
+                        &format!("arg{}_dst", i),
+                    )
+                    .unwrap()
+            };
+            let llvm_type = self.var_type_to_llvm(vt);
+            let _ = llvm_type;
+            self.builder.build_store(elem_ptr, *param_val).unwrap();
+        }
+
+        // 3. Create fiber
+        let fiber_create_fn = self.module.get_function("tscc_fiber_create").unwrap();
+        let body_fn_ptr: BasicValueEnum = body_fn.as_global_value().as_pointer_value().into();
+        let fiber = self
+            .builder
+            .build_call(
+                fiber_create_fn,
+                &[body_fn_ptr.into(), args_buf.into()],
+                "fiber",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap();
+
+        // 4. Resume fiber (starts execution up to first await or return)
+        let fiber_resume_fn = self.module.get_function("tscc_fiber_resume").unwrap();
+        self.builder
+            .build_call(fiber_resume_fn, &[fiber.into()], "")
+            .unwrap();
+
+        // 5. Return promise
+        self.builder.build_return(Some(&promise)).unwrap();
+
+        if let Some(bb) = caller_bb {
+            self.builder.position_at_end(bb);
+        }
+
+        self.number_mode = saved_mode;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // throw statement
+    // -----------------------------------------------------------------------
+
+    fn compile_throw(
+        &mut self,
+        value: &Expr,
+        function: FunctionValue<'ctx>,
+    ) -> Result<(), CompileError> {
+        let (val, vt) = self.compile_expr(value, function)?;
+        let boxed = self.box_value(val, &vt);
+        let throw_fn = self.module.get_function("tscc_throw").unwrap();
+        self.builder
+            .build_call(throw_fn, &[boxed.into()], "")
+            .unwrap();
+        // tscc_throw never returns (it longjmps), but LLVM doesn't know that.
+        // Emit an unreachable to avoid "missing terminator" errors.
+        self.builder.build_unreachable().unwrap();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // try/catch/finally
+    // -----------------------------------------------------------------------
+
+    fn compile_try_catch(
+        &mut self,
+        body: &[Statement],
+        catch_binding: Option<&str>,
+        catch_body: Option<&[Statement]>,
+        finally_body: Option<&[Statement]>,
+        function: FunctionValue<'ctx>,
+    ) -> Result<(), CompileError> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let i32_type = self.context.i32_type();
+
+        // Basic blocks:
+        //   try_bb   — the try body
+        //   catch_bb — entered when setjmp returns non-zero (an exception was thrown)
+        //   finally_bb — always-executed cleanup (if any)
+        //   merge_bb — continuation after try/catch/finally
+        let try_bb = self.context.append_basic_block(function, "try");
+        let catch_bb = self.context.append_basic_block(function, "catch");
+        let merge_bb = self.context.append_basic_block(function, "try_merge");
+
+        // Alloca for setjmp return value (must be accessible in both branches)
+        let sjlj_result_alloca = self.builder.build_alloca(i32_type, "sjlj_result").unwrap();
+
+        // 1. Call tscc_try_enter() → jmp_buf*
+        let try_enter_fn = self.module.get_function("tscc_try_enter").unwrap();
+        let jb_ptr = self
+            .builder
+            .build_call(try_enter_fn, &[], "jb_ptr")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap();
+
+        // 2. Call setjmp(jb_ptr) — marked returns_twice
+        let setjmp_fn = self.module.get_function("setjmp").unwrap();
+        let sjlj_ret = self
+            .builder
+            .build_call(setjmp_fn, &[jb_ptr.into()], "sjlj_ret")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap();
+        self.builder
+            .build_store(sjlj_result_alloca, sjlj_ret)
+            .unwrap();
+
+        // 3. Branch: if sjlj_ret == 0, go to try_bb, else go to catch_bb
+        let is_catch = self
+            .builder
+            .build_int_compare(
+                IntPredicate::NE,
+                sjlj_ret.into_int_value(),
+                i32_type.const_int(0, false),
+                "is_catch",
+            )
+            .unwrap();
+        self.builder
+            .build_conditional_branch(is_catch, catch_bb, try_bb)
+            .unwrap();
+
+        // ---- try body ----
+        self.builder.position_at_end(try_bb);
+        self.push_scope();
+        for stmt in body {
+            self.compile_statement(stmt, function)?;
+            // If a statement emitted a terminator (e.g., return/throw), stop
+            if self
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_terminator()
+                .is_some()
+            {
+                break;
+            }
+        }
+        self.pop_scope();
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            // Normal exit: pop the handler, jump to finally/merge
+            let try_exit_fn = self.module.get_function("tscc_try_exit").unwrap();
+            self.builder.build_call(try_exit_fn, &[], "").unwrap();
+            self.builder.build_unconditional_branch(merge_bb).unwrap();
+        }
+
+        // ---- catch body ----
+        self.builder.position_at_end(catch_bb);
+        if let Some(catch_stmts) = catch_body {
+            self.push_scope();
+            if let Some(binding) = catch_binding {
+                // tscc_catch_value() returns the thrown void*
+                let catch_val_fn = self.module.get_function("tscc_catch_value").unwrap();
+                let caught_raw = self
+                    .builder
+                    .build_call(catch_val_fn, &[], "caught_raw")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                // Bind the caught value as a ptr (type unknown at this point)
+                let binding_alloca = self.builder.build_alloca(ptr_type, binding).unwrap();
+                self.builder
+                    .build_store(binding_alloca, caught_raw)
+                    .unwrap();
+                self.set_variable(
+                    binding.to_string(),
+                    binding_alloca,
+                    VarType::FunctionPtr {
+                        fn_name: String::new(),
+                    },
+                );
+            }
+            for stmt in catch_stmts {
+                self.compile_statement(stmt, function)?;
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            self.pop_scope();
+        }
+        if self
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_terminator()
+            .is_none()
+        {
+            self.builder.build_unconditional_branch(merge_bb).unwrap();
+        }
+
+        // ---- merge / finally ----
+        self.builder.position_at_end(merge_bb);
+        if let Some(finally_stmts) = finally_body {
+            self.push_scope();
+            for stmt in finally_stmts {
+                self.compile_statement(stmt, function)?;
+                if self
+                    .builder
+                    .get_insert_block()
+                    .unwrap()
+                    .get_terminator()
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            self.pop_scope();
+        }
+        // If merge_bb has no terminator yet, it just falls through (normal execution continues)
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // await expression
+    // -----------------------------------------------------------------------
+
+    fn compile_await_expr(
+        &mut self,
+        inner: &Expr,
+        function: FunctionValue<'ctx>,
+        span: &Span,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        let (val, vt) = self.compile_expr(inner, function)?;
+
+        // Determine the inner VarType we expect back
+        let resolve_vt = match &vt {
+            VarType::Promise { inner_vt } => *inner_vt.clone(),
+            _ => {
+                // await non-promise: wrap in a resolved promise and await it
+                // (TypeScript spec: await x where x is not a Promise == await Promise.resolve(x))
+                let boxed = self.box_value(val, &vt);
+                let resolve_val_fn = self
+                    .module
+                    .get_function("tscc_promise_resolve_val")
+                    .unwrap();
+                let promise = self
+                    .builder
+                    .build_call(resolve_val_fn, &[boxed.into()], "wrapped_promise")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                let await_fn = self.module.get_function("tscc_await").unwrap();
+                let raw_result = self
+                    .builder
+                    .build_call(await_fn, &[promise.into()], "await_result")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .left()
+                    .unwrap();
+                let unboxed = self.unbox_value(raw_result, &vt);
+                return Ok((unboxed, vt));
+            }
+        };
+
+        // val is already a MgPromise* — call tscc_await
+        let await_fn = self.module.get_function("tscc_await").unwrap();
+
+        // The promise value might be a struct value if stored as such; need ptr
+        // For Promise VarType, val should be a pointer (ptr_type)
+        let promise_ptr = if val.is_pointer_value() {
+            val
+        } else {
+            return Err(CompileError::error(
+                "internal: await on non-pointer promise value",
+                span.clone(),
+            ));
+        };
+
+        let raw_result = self
+            .builder
+            .build_call(await_fn, &[promise_ptr.into()], "await_result")
+            .unwrap()
+            .try_as_basic_value()
+            .left()
+            .unwrap();
+
+        // Unbox the result based on the resolve VarType
+        let unboxed = self.unbox_value(raw_result, &resolve_vt);
+        Ok((unboxed, resolve_vt))
     }
 
     fn compile_expr(
@@ -2633,6 +3497,7 @@ impl<'ctx> Codegen<'ctx> {
                 params,
                 return_type,
                 body,
+                is_async,
             } => {
                 // Generate unique function name
                 let fn_name = format!("__arrow_{}", self.arrow_counter);
@@ -2694,6 +3559,8 @@ impl<'ctx> Codegen<'ctx> {
             ExprKind::NewExpr { class_name, args } => {
                 self.compile_new_expr(class_name, args, function, &expr.span)
             }
+
+            ExprKind::Await { expr: inner } => self.compile_await_expr(inner, function, &expr.span),
         }
     }
 
@@ -3976,6 +4843,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "function",
             VarType::Union(_) => "object", // fallback for non-identifier unions
             VarType::Map { .. } | VarType::ObjArray { .. } => "object",
+            VarType::Promise { .. } => "object",
         };
         Ok((self.create_string_literal(type_str), VarType::String))
     }
@@ -5207,6 +6075,9 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 VarType::ObjArray { .. } => {
                     self.print_string_literal("[Array]", print_str);
+                }
+                VarType::Promise { .. } => {
+                    self.print_string_literal("[Promise]", print_str);
                 }
             }
         }
@@ -6840,6 +7711,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Tuple(_) => Ok(self.create_string_literal("[tuple]")),
             VarType::Map { .. } => Ok(self.create_string_literal("[Map]")),
             VarType::ObjArray { .. } => Ok(self.create_string_literal("[Array]")),
+            VarType::Promise { .. } => Ok(self.create_string_literal("[Promise]")),
         }
     }
 
@@ -6944,6 +7816,8 @@ impl<'ctx> Codegen<'ctx> {
                     .collect();
                 self.context.struct_type(&field_types, false).into()
             }
+            // Promise is a pointer to MgPromise
+            VarType::Promise { .. } => self.context.ptr_type(AddressSpace::default()).into(),
         }
     }
 
@@ -7096,6 +7970,16 @@ impl<'ctx> Codegen<'ctx> {
                 VarType::Tuple(element_types)
             }
             TypeAnnKind::Generic { name, type_args } => {
+                // Promise<T> → VarType::Promise { inner_vt: T }
+                if name == "Promise" {
+                    let inner_vt = type_args
+                        .first()
+                        .map(|a| self.type_ann_to_var_type(a))
+                        .unwrap_or(VarType::Number);
+                    return VarType::Promise {
+                        inner_vt: Box::new(inner_vt),
+                    };
+                }
                 // Map<K, V> → VarType::Map { val_vt }
                 if name == "Map" && type_args.len() >= 2 {
                     let val_vt = self.type_ann_to_var_type(&type_args[1]);
@@ -7199,6 +8083,11 @@ impl<'ctx> Codegen<'ctx> {
                 .const_null()
                 .into(),
             VarType::ObjArray { .. } => self.array_type.const_zero().into(),
+            VarType::Promise { .. } => self
+                .context
+                .ptr_type(AddressSpace::default())
+                .const_null()
+                .into(),
         }
     }
 
@@ -8019,6 +8908,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Tuple(_) => "t",
             VarType::Map { .. } => "m",
             VarType::ObjArray { .. } => "oa",
+            VarType::Promise { .. } => "p",
         }
     }
 
