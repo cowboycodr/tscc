@@ -4508,6 +4508,179 @@ impl<'ctx> Codegen<'ctx> {
             ));
         }
 
+        // new Promise(executor) — allocate a MgPromise, build a resolve-shim closure,
+        // call the executor synchronously with that closure as its first argument,
+        // and return the promise pointer.
+        //
+        // The resolve shim is a real LLVM function:
+        //   void __promise_resolve_N(void* val, void* ctx)
+        //     → tscc_promise_resolve((MgPromise*)ctx, val)
+        //
+        // The shim + promise_ptr form a standard {fn_ptr, env_ptr} closure struct that
+        // the executor receives as its `resolve` parameter.  Because it follows the normal
+        // closure ABI, it can be stored, passed to setTimeout, or called directly — no
+        // special-casing at the call site.
+        if class_name == "Promise" {
+            if args.len() != 1 {
+                return Err(CompileError::error(
+                    "new Promise() requires exactly one executor function argument",
+                    span.clone(),
+                ));
+            }
+
+            let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+            // 1. Allocate the promise: MgPromise* promise = tscc_promise_new()
+            let promise_new_fn = self.module.get_function("tscc_promise_new").unwrap();
+            let promise_ptr = self
+                .builder
+                .build_call(promise_new_fn, &[], "promise_ptr")
+                .unwrap()
+                .try_as_basic_value()
+                .left()
+                .unwrap()
+                .into_pointer_value();
+
+            // 2. Emit the resolve shim function (once per call site, uniquely named).
+            //    Signature: void __promise_resolve_N(void* val, void* ctx)
+            //    Body: tscc_promise_resolve(ctx, val)
+            let shim_name = format!("__promise_resolve_{}", self.arrow_counter);
+            self.arrow_counter += 1;
+
+            let void_type = self.context.void_type();
+            let shim_fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+            let shim_fn = self.module.add_function(&shim_name, shim_fn_type, None);
+            {
+                let shim_bb = self.context.append_basic_block(shim_fn, "entry");
+                let saved_bb = self.builder.get_insert_block();
+                self.builder.position_at_end(shim_bb);
+
+                let val_arg = shim_fn.get_nth_param(0).unwrap().into_pointer_value();
+                let ctx_arg = shim_fn.get_nth_param(1).unwrap().into_pointer_value();
+
+                let resolve_fn = self.module.get_function("tscc_promise_resolve").unwrap();
+                self.builder
+                    .build_call(
+                        resolve_fn,
+                        &[ctx_arg.into(), val_arg.into()],
+                        "resolve_call",
+                    )
+                    .unwrap();
+                self.builder.build_return(None).unwrap();
+
+                // Restore insertion point
+                if let Some(bb) = saved_bb {
+                    self.builder.position_at_end(bb);
+                }
+            }
+
+            // 3. Build the resolve closure struct { fn_ptr: shim, env_ptr: promise_ptr }
+            //    This is identical to the closure layout produced by compile_closure().
+            let shim_fn_ptr = shim_fn.as_global_value().as_pointer_value();
+            let resolve_closure_val = {
+                let zero = self.closure_type.const_zero();
+                let with_fn = self
+                    .builder
+                    .build_insert_value(zero, shim_fn_ptr, 0, "resolve.fn")
+                    .unwrap()
+                    .into_struct_value();
+                self.builder
+                    .build_insert_value(with_fn, promise_ptr, 1, "resolve.env")
+                    .unwrap()
+                    .into_struct_value()
+            };
+
+            // Store the resolve closure into an alloca so compile_closure_call can load it.
+            let resolve_alloca = self
+                .builder
+                .build_alloca(self.closure_type, "resolve_alloca")
+                .unwrap();
+            self.builder
+                .build_store(resolve_alloca, resolve_closure_val)
+                .unwrap();
+
+            // 4. Compile the executor expression — must be an arrow / closure.
+            let (exec_val, exec_vt) = self.compile_expr(&args[0], function)?;
+
+            // The executor has signature: (resolve: (val) => void) => void
+            // Its resolve parameter is a Closure<[Number] -> Number> (Number is the void stand-in).
+            let resolve_param_vt = VarType::Closure {
+                fn_name: shim_name.clone(),
+                param_types: vec![VarType::Number],
+                return_type: Box::new(VarType::Number),
+            };
+
+            match exec_vt {
+                VarType::Closure {
+                    ref param_types,
+                    ref return_type,
+                    ..
+                } => {
+                    // Store executor struct into an alloca to hand to compile_closure_call.
+                    let exec_alloca = self
+                        .builder
+                        .build_alloca(self.closure_type, "executor_alloca")
+                        .unwrap();
+                    self.builder
+                        .build_store(exec_alloca, exec_val.into_struct_value())
+                        .unwrap();
+
+                    // Build the LLVM call manually so we can pass an already-compiled arg
+                    // (the resolve_alloca) rather than going through &[Expr].
+                    let closure_struct = self
+                        .builder
+                        .build_load(self.closure_type, exec_alloca, "exec_closure")
+                        .unwrap();
+                    let exec_fn_ptr = self
+                        .builder
+                        .build_extract_value(closure_struct.into_struct_value(), 0, "exec_fn_ptr")
+                        .unwrap()
+                        .into_pointer_value();
+                    let exec_env_ptr = self
+                        .builder
+                        .build_extract_value(closure_struct.into_struct_value(), 1, "exec_env_ptr")
+                        .unwrap();
+
+                    // Executor LLVM type: (ptr env, closure_type resolve) -> void
+                    let exec_fn_type =
+                        void_type.fn_type(&[ptr_type.into(), self.closure_type.into()], false);
+
+                    // Load the resolve closure value to pass by value.
+                    let resolve_val = self
+                        .builder
+                        .build_load(self.closure_type, resolve_alloca, "resolve_val")
+                        .unwrap();
+
+                    let _ = param_types; // acknowledged — executor takes one closure arg
+                    let _ = return_type;
+
+                    self.builder
+                        .build_indirect_call(
+                            exec_fn_type,
+                            exec_fn_ptr,
+                            &[exec_env_ptr.into(), resolve_val.into()],
+                            "executor_call",
+                        )
+                        .unwrap();
+                }
+                _ => {
+                    return Err(CompileError::error(
+                        "new Promise() executor must be a function",
+                        span.clone(),
+                    ));
+                }
+            }
+
+            let _ = resolve_param_vt; // used above for documentation; silences unused warning
+
+            return Ok((
+                promise_ptr.into(),
+                VarType::Promise {
+                    inner_vt: Box::new(VarType::Number),
+                },
+            ));
+        }
+
         let (struct_type, field_info, parent_class) = self
             .class_struct_types
             .get(class_name)

@@ -1611,6 +1611,23 @@ impl TypeChecker {
                     });
                 }
 
+                // new Promise(executor) — built-in Promise constructor.
+                // The executor is (resolve, reject) => void; we type-check it but do not
+                // attempt to infer T from the executor's resolve parameter type.
+                // The inner type defaults to Void; callers that need a concrete T should
+                // annotate the return type (e.g. `: Promise<number>`), which the type checker
+                // will honour via the function's declared return type annotation.
+                if class_name == "Promise" {
+                    if args.len() != 1 {
+                        return Err(CompileError::error(
+                            "new Promise() requires exactly one executor function argument",
+                            expr.span.clone(),
+                        ));
+                    }
+                    self.check_expr(&args[0])?;
+                    return Ok(Type::Promise(Box::new(Type::Void)));
+                }
+
                 let class_type = self.class_types.get(class_name).cloned().ok_or_else(|| {
                     CompileError::error(
                         format!("Cannot find class '{}'", class_name),
@@ -2195,9 +2212,21 @@ impl TypeChecker {
         if let (Type::Array(from_elem), Type::Array(to_elem)) = (from, to) {
             return self.is_assignable(from_elem, to_elem);
         }
-        // Promise covariance
+        // Promise covariance: Promise<A> assignable to Promise<B> when A assignable to B
         if let (Type::Promise(from_inner), Type::Promise(to_inner)) = (from, to) {
             return self.is_assignable(from_inner, to_inner);
+        }
+        // Promise flattening: inside an async function the declared return type is the
+        // unwrapped inner T, but `return somePromise` is valid TypeScript — the async
+        // machinery awaits it implicitly.  Promise<T> is therefore assignable to T and
+        // to Void (for async functions declared `: Promise<void>`).
+        if let Type::Promise(from_inner) = from {
+            if self.is_assignable(from_inner, to) {
+                return true;
+            }
+            if matches!(to, Type::Void) {
+                return true;
+            }
         }
         // Tuple structural compatibility: same length, each element assignable
         if let (Type::Tuple(from_elems), Type::Tuple(to_elems)) = (from, to) {
