@@ -1247,7 +1247,8 @@ impl<'ctx> Codegen<'ctx> {
                         let ret_llvm = self.var_type_to_llvm(&ret_vt);
                         let mfn_type = ret_llvm.fn_type(&mp_types, false);
                         let mfn = self.module.add_function(&method_fn_name, mfn_type, None);
-                        self.functions.insert(method_fn_name, mfn);
+                        self.functions.insert(method_fn_name.clone(), mfn);
+                        self.function_return_types.insert(method_fn_name, ret_vt);
                     }
 
                     // Pre-declare monomorphized parent methods (generic parent case).
@@ -1295,7 +1296,8 @@ impl<'ctx> Codegen<'ctx> {
                                     let ret_llvm = self.var_type_to_llvm(&ret_vt);
                                     let mfn_type = ret_llvm.fn_type(&mp_types, false);
                                     let mfn = self.module.add_function(&mono_name, mfn_type, None);
-                                    self.functions.insert(mono_name, mfn);
+                                    self.functions.insert(mono_name.clone(), mfn);
+                                    self.function_return_types.insert(mono_name, ret_vt);
                                 }
                             }
                             self.type_substitutions = saved_subs;
@@ -5567,6 +5569,8 @@ impl<'ctx> Codegen<'ctx> {
             method_fn.add_attribute(AttributeLoc::Function, nounwind);
 
             self.functions.insert(method_fn_name.clone(), method_fn);
+            self.function_return_types
+                .insert(method_fn_name.clone(), ret_vt.clone());
 
             let entry = self.context.append_basic_block(method_fn, "entry");
             let saved_block = self.builder.get_insert_block();
@@ -5656,6 +5660,8 @@ impl<'ctx> Codegen<'ctx> {
             method_fn.add_attribute(AttributeLoc::Function, nounwind);
 
             self.functions.insert(mono_name.clone(), method_fn);
+            self.function_return_types
+                .insert(mono_name.clone(), ret_vt.clone());
 
             let entry = self.context.append_basic_block(method_fn, "entry");
             let saved_block = self.builder.get_insert_block();
@@ -6469,38 +6475,45 @@ impl<'ctx> Codegen<'ctx> {
                                 .unwrap();
 
                             if let Some(val) = result.try_as_basic_value().left() {
-                                // Determine return type from the method's return type
-                                let ret_type = method_fn.get_type().get_return_type();
-                                let ret_vt = if let Some(rt) = ret_type {
-                                    if rt.is_float_type() {
-                                        VarType::Number
-                                    } else if rt.is_int_type() {
-                                        let bw = rt.into_int_type().get_bit_width();
-                                        if bw == 1 {
-                                            VarType::Boolean
-                                        } else {
-                                            VarType::Integer
-                                        }
-                                    } else if rt.is_struct_type() {
-                                        // Check if it's a string type
-                                        let st = rt.into_struct_type();
-                                        if st.count_fields() == 2 {
-                                            VarType::String
-                                        } else if let Some((_, fi, _)) =
-                                            self.class_struct_types.get(struct_type_name)
-                                        {
-                                            VarType::Object {
-                                                struct_type_name: struct_type_name.clone(),
-                                                fields: fi.clone(),
+                                // Use stored return type if available (accurate — avoids
+                                // reconstructing struct identity from raw LLVM types).
+                                let ret_vt = if let Some(stored_vt) =
+                                    self.function_return_types.get(fn_name)
+                                {
+                                    stored_vt.clone()
+                                } else {
+                                    // Fallback: infer from LLVM return type
+                                    let ret_type = method_fn.get_type().get_return_type();
+                                    if let Some(rt) = ret_type {
+                                        if rt.is_float_type() {
+                                            VarType::Number
+                                        } else if rt.is_int_type() {
+                                            let bw = rt.into_int_type().get_bit_width();
+                                            if bw == 1 {
+                                                VarType::Boolean
+                                            } else {
+                                                VarType::Integer
+                                            }
+                                        } else if rt.is_struct_type() {
+                                            let st = rt.into_struct_type();
+                                            if st.count_fields() == 2 {
+                                                VarType::String
+                                            } else if let Some((_, fi, _)) =
+                                                self.class_struct_types.get(struct_type_name)
+                                            {
+                                                VarType::Object {
+                                                    struct_type_name: struct_type_name.clone(),
+                                                    fields: fi.clone(),
+                                                }
+                                            } else {
+                                                VarType::String
                                             }
                                         } else {
-                                            VarType::String
+                                            VarType::Number
                                         }
                                     } else {
                                         VarType::Number
                                     }
-                                } else {
-                                    VarType::Number
                                 };
                                 return Ok((val, ret_vt));
                             } else {

@@ -2977,6 +2977,32 @@ fill(repo)
         assert_eq!(run_ts(src), "2\n");
     }
 
+    #[test]
+    fn method_return_type_field_access() {
+        // Method returning an object — accessing a field on the return value
+        // must preserve the return type's struct identity, not the receiver's.
+        let src = "
+class Point {
+  x: number
+  y: number
+  constructor(x: number, y: number) {
+    this.x = x
+    this.y = y
+  }
+}
+class PointFactory {
+  make(x: number, y: number): Point {
+    return new Point(x, y)
+  }
+}
+const factory = new PointFactory()
+const p = factory.make(3, 4)
+console.log(p.x)
+console.log(p.y)
+";
+        assert_eq!(run_ts(src), "3\n4\n");
+    }
+
     // --- Interfaces ---
 
     #[test]
