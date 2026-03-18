@@ -5840,6 +5840,19 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
 
+        // String enum member access — resolved at compile time from enum_string_values.
+        // This short-circuits before compile_expr(object) so that enum names do not
+        // need to be in the variable scope stack (which they aren't inside closures /
+        // async function bodies compiled before top-level EnumDecl statements run).
+        if let ExprKind::Identifier(enum_name) = &object.kind {
+            if let Some(members) = self.enum_string_values.get(enum_name.as_str()).cloned() {
+                if let Some(val) = members.get(property) {
+                    let s = self.create_string_literal(val);
+                    return Ok((s, VarType::String));
+                }
+            }
+        }
+
         // Object member access
         let (obj_val, obj_vt) = self.compile_expr(object, function)?;
 

@@ -3114,6 +3114,25 @@ console.log(Direction.Up)
     // Verifies that type_ann_to_var_type resolves Named("Status") → VarType::String,
     // so the struct layout is correct and field access returns a string, not a float.
     #[test]
+    fn string_enum_member_access_in_async_function() {
+        // String enum member access (e.g. Status.Active) must work inside async
+        // function bodies. Enums are resolved at compile time from enum_string_values,
+        // so they don't require the enum variable to be in the closure's scope.
+        let src = "
+enum Status {
+  Active = \"active\",
+  Done = \"done\"
+}
+async function run(): Promise<void> {
+  console.log(Status.Active)
+  console.log(Status.Done)
+}
+run()
+";
+        assert_eq!(run_ts(src), "active\ndone\n");
+    }
+
+    #[test]
     fn string_enum_as_struct_field_type() {
         let src = "
 enum Status {
