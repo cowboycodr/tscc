@@ -3003,6 +3003,91 @@ console.log(p.y)
         assert_eq!(run_ts(src), "3\n4\n");
     }
 
+    #[test]
+    fn generic_function_with_callback_infers_param_type() {
+        // Unannotated arrow function parameter in a generic call should
+        // receive the inferred concrete type from the non-arrow arguments.
+        let src = "
+interface Task {
+  title: string
+  status: string
+}
+function doWith<T>(item: T, action: (item: T) => void): void {
+  action(item)
+}
+const t: Task = { title: \"hello\", status: \"done\" }
+doWith(t, x => console.log(x.title))
+";
+        assert_eq!(run_ts(src), "hello\n");
+    }
+
+    #[test]
+    #[ignore = "requires array literal → ObjArray coercion from type annotation"]
+    fn generic_function_array_param_infers_element_type() {
+        // T[] argument should infer T from the array element type.
+        let src = "
+interface Item { name: string }
+function first<T>(items: T[]): T { return items[0] }
+const items: Item[] = [{ name: \"alpha\" }]
+const r = first(items)
+console.log(r.name)
+";
+        assert_eq!(run_ts(src), "alpha\n");
+    }
+
+    #[test]
+    #[ignore = "requires array literal → ObjArray coercion from type annotation"]
+    fn generic_function_callback_with_template_literal() {
+        // Callback using template literal on inferred T fields.
+        let src = "
+interface Task { title: string; status: string }
+function printList<T>(items: T[], formatter: (item: T) => string): void {
+  items.forEach(i => console.log(formatter(i)))
+}
+const tasks: Task[] = [{ title: \"Learn\", status: \"done\" }]
+printList(tasks, t => `${t.title} [${t.status}]`)
+";
+        assert_eq!(run_ts(src), "Learn [done]\n");
+    }
+
+    #[test]
+    fn nullable_union_strips_undefined() {
+        // T | undefined should resolve to T in codegen (zero value = absent).
+        // Uses Map.get which returns the value type directly (not ObjArray coercion).
+        let src = "
+const m: Map<string, number> = new Map()
+m.set(\"a\", 42)
+function get(map: Map<string, number>, key: string): number | undefined {
+  return map.get(key)
+}
+const t = get(m, \"a\")
+if (t) {
+  console.log(t)
+}
+";
+        assert_eq!(run_ts(src), "42\n");
+    }
+
+    #[test]
+    fn class_field_initializer_in_async_function() {
+        // Class with field initializer (new Map()) must work when
+        // instantiated inside an async function body.
+        let src = "
+class Store {
+  data: Map<string, number> = new Map()
+  set(k: string, v: number): void { this.data.set(k, v) }
+  get(k: string): number { return this.data.get(k) }
+}
+async function main() {
+  const s = new Store()
+  s.set(\"x\", 42)
+  console.log(s.get(\"x\"))
+}
+main()
+";
+        assert_eq!(run_ts(src), "42\n");
+    }
+
     // --- Interfaces ---
 
     #[test]

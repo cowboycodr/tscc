@@ -197,6 +197,7 @@ pub fn compile_multi_file(
 }
 
 pub fn link_and_output(codegen: &Codegen, output: &str) -> Result<(), String> {
+    // Module verification available via codegen.verify_module() for debugging.
     let obj_path = PathBuf::from(format!("{}.o", output));
     codegen
         .write_object_file(&obj_path)

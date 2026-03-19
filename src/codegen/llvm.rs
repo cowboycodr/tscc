@@ -1203,6 +1203,20 @@ impl<'ctx> Codegen<'ctx> {
                     self.class_struct_types
                         .insert(name.clone(), (struct_type, all_fields, effective_parent));
 
+                    // Pre-register field initializers so that `new ClassName()` calls
+                    // from functions compiled in the second pass (e.g. async function bodies)
+                    // can run `run_field_initializers` correctly.  Without this, classes
+                    // with field initializers (e.g. `items: Map<…> = new Map()`) would
+                    // have their initializers silently skipped, leaving fields at zero/null.
+                    let early_initializers: Vec<(String, Expr)> = fields
+                        .iter()
+                        .filter_map(|f| f.initializer.as_ref().map(|e| (f.name.clone(), e.clone())))
+                        .collect();
+                    if !early_initializers.is_empty() {
+                        self.class_field_initializers
+                            .insert(name.clone(), early_initializers);
+                    }
+
                     // Pre-declare constructor and own method LLVM functions so that calls
                     // from function bodies compiled in the second pass can find them in
                     // self.functions.  Bodies are compiled later by compile_class_decl in
@@ -8855,21 +8869,99 @@ impl<'ctx> Codegen<'ctx> {
                     .unwrap();
                 Ok(result.into())
             }
+        } else if val.is_struct_value() {
+            let st = val.into_struct_value();
+            let st_type = st.get_type();
+            let field_count = st_type.count_fields();
+
+            if field_count == 0 {
+                return Ok(self.context.bool_type().const_int(0, false).into());
+            }
+
+            // Inspect the type of field 0 to distinguish struct kinds:
+            //   i8  → generic union box { i8 tag, double, ptr, i64 }
+            //   ptr → string { ptr, i64 }  (field 1 is i64 length)
+            //   struct → object whose first field is itself a struct (e.g. a string field)
+            //   i64/i32 → object whose first field is an integer (e.g. Date { i64 })
+            let f0_type = st_type.get_field_type_at_index(0).unwrap();
+
+            if f0_type.is_int_type() && f0_type.into_int_type().get_bit_width() == 8 {
+                // Generic union box: { i8 (tag), double, ptr, i64 }
+                // Truthy when tag != 0.
+                let tag = self.builder.build_extract_value(st, 0, "tag").unwrap();
+                let result = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        tag.into_int_value(),
+                        self.context.i8_type().const_int(0, false),
+                        "tobool",
+                    )
+                    .unwrap();
+                Ok(result.into())
+            } else if f0_type.is_pointer_type() {
+                // String: { ptr, i64 } — truthy when length (field 1) > 0.
+                let len = self.builder.build_extract_value(st, 1, "slen").unwrap();
+                let result = self
+                    .builder
+                    .build_int_compare(
+                        IntPredicate::SGT,
+                        len.into_int_value(),
+                        self.context.i64_type().const_int(0, false),
+                        "tobool",
+                    )
+                    .unwrap();
+                Ok(result.into())
+            } else if f0_type.is_struct_type() {
+                // Object whose first field is a struct (e.g. Task where field 0 = id: string).
+                // Check the string length inside that first field (sub-field 1 = i64 length).
+                // Zero object (all fields zeroed) → first string has length 0 → falsy.
+                let first_field = self
+                    .builder
+                    .build_extract_value(st, 0, "f0")
+                    .unwrap()
+                    .into_struct_value();
+                let f0_f1 = first_field.get_type().get_field_type_at_index(1);
+                if f0_f1.map(|t| t.is_int_type()).unwrap_or(false) {
+                    let len = self
+                        .builder
+                        .build_extract_value(first_field, 1, "slen")
+                        .unwrap();
+                    let result = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::SGT,
+                            len.into_int_value(),
+                            self.context.i64_type().const_int(0, false),
+                            "tobool",
+                        )
+                        .unwrap();
+                    Ok(result.into())
+                } else {
+                    // Can't determine nullity — objects are truthy in JS.
+                    Ok(self.context.bool_type().const_int(1, false).into())
+                }
+            } else {
+                // Integer or float first field (e.g. Date { i64 }) — check non-zero.
+                let f0 = self.builder.build_extract_value(st, 0, "f0").unwrap();
+                if f0.is_int_value() {
+                    let result = self
+                        .builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            f0.into_int_value(),
+                            self.context.i64_type().const_int(0, false),
+                            "tobool",
+                        )
+                        .unwrap();
+                    Ok(result.into())
+                } else {
+                    Ok(self.context.bool_type().const_int(1, false).into())
+                }
+            }
         } else {
-            let len = self
-                .builder
-                .build_extract_value(val.into_struct_value(), 1, "slen")
-                .unwrap();
-            let result = self
-                .builder
-                .build_int_compare(
-                    IntPredicate::SGT,
-                    len.into_int_value(),
-                    self.context.i64_type().const_int(0, false),
-                    "tobool",
-                )
-                .unwrap();
-            Ok(result.into())
+            // Pointer or other — treat as truthy.
+            Ok(self.context.bool_type().const_int(1, false).into())
         }
     }
 
@@ -8993,7 +9085,30 @@ impl<'ctx> Codegen<'ctx> {
             TypeAnnKind::NumberLiteral(_) => self.number_mode.clone(),
             TypeAnnKind::BooleanLiteral(_) => VarType::Boolean,
             TypeAnnKind::Union(variants) => {
-                let var_types: Vec<VarType> = variants
+                // Strip `| undefined | null | void` variants before resolving.
+                // tscc represents "absent" values as zero values of the concrete type
+                // (e.g. Map.get returns a zero-struct on miss).  Keeping undefined/null
+                // in the union would produce the generic union LLVM type
+                // { i8, double, ptr, i64 } whose layout is incompatible with the
+                // actual value returned by the method body.
+                let non_nullish: Vec<&TypeAnnotation> = variants
+                    .iter()
+                    .filter(|v| {
+                        !matches!(
+                            v.kind,
+                            TypeAnnKind::Undefined | TypeAnnKind::Null | TypeAnnKind::Void
+                        )
+                    })
+                    .collect();
+                // If only one non-nullish variant remains, unwrap directly.
+                if non_nullish.len() == 1 {
+                    return self.type_ann_to_var_type(non_nullish[0]);
+                }
+                // If all were nullish, fall back to void/number.
+                if non_nullish.is_empty() {
+                    return self.number_mode.clone();
+                }
+                let var_types: Vec<VarType> = non_nullish
                     .iter()
                     .map(|v| self.type_ann_to_var_type(v))
                     .collect();
@@ -9931,6 +10046,52 @@ impl<'ctx> Codegen<'ctx> {
     /// Monomorphize and call a generic function.
     /// Infers type parameters from compiled argument types, generates a specialized
     /// function if not already compiled, then calls it.
+    /// Recursively infer generic type-parameter bindings from a parameter annotation
+    /// and the VarType of the compiled argument.
+    ///
+    /// Examples:
+    ///   ann = `T`,        arg_vt = Object{"Task",...}  →  T = Object{"Task",...}
+    ///   ann = `T[]`,      arg_vt = ObjArray{Task}      →  T = Object{"Task",...}
+    ///   ann = `(T)=>R`,   arg_vt = (irrelevant)        →  descend into param types
+    fn infer_type_params_from(
+        ann: &TypeAnnotation,
+        arg_vt: &VarType,
+        tp_names: &[String],
+        subs: &mut HashMap<String, VarType>,
+    ) {
+        match &ann.kind {
+            TypeAnnKind::Named(type_name) if tp_names.contains(type_name) => {
+                subs.entry(type_name.clone())
+                    .or_insert_with(|| arg_vt.clone());
+            }
+            TypeAnnKind::Array(elem_ann) => {
+                // Extract the element VarType from the compiled array argument.
+                let elem_vt = match arg_vt {
+                    VarType::ObjArray { elem_vt } => (**elem_vt).clone(),
+                    VarType::StringArray => VarType::String,
+                    VarType::Array => VarType::Number,
+                    // If the arg compiled to something else (e.g. a closure or
+                    // an error), skip — we can't infer from it.
+                    _ => return,
+                };
+                Self::infer_type_params_from(elem_ann, &elem_vt, tp_names, subs);
+            }
+            // FunctionType: descend into param type annotations.
+            // We don't know the concrete arg VarTypes for the callback's parameters
+            // at this point, so we only recurse here if there's useful structure
+            // (e.g. nested generics). Callback params are handled in Phase 2.
+            TypeAnnKind::FunctionType { params, .. } => {
+                for p_ann in params {
+                    // We don't have a matching arg_vt to pair with each param here,
+                    // so this is a no-op unless we add more context. Kept as a
+                    // structural placeholder for future extension.
+                    let _ = p_ann;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn compile_generic_call(
         &mut self,
         name: &str,
@@ -9938,13 +10099,8 @@ impl<'ctx> Codegen<'ctx> {
         function: FunctionValue<'ctx>,
         span: &Span,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
-        // Compile arguments first to determine concrete types
-        let mut compiled_args: Vec<(BasicValueEnum<'ctx>, VarType)> = Vec::new();
-        for arg in args {
-            compiled_args.push(self.compile_expr(arg, function)?);
-        }
-
-        // Look up the generic template
+        // Look up the generic template early (before compiling any args) so we
+        // can distinguish arrow-function arguments from non-arrow ones.
         let (tp_names, params, return_type, body) =
             self.generic_templates.get(name).cloned().ok_or_else(|| {
                 CompileError::error(
@@ -9953,19 +10109,138 @@ impl<'ctx> Codegen<'ctx> {
                 )
             })?;
 
-        // Infer type parameters from argument VarTypes
+        // Phase 1: compile non-arrow arguments and infer type-parameter substitutions.
+        // Arrow-function arguments are deferred to Phase 2 so that their unannotated
+        // parameters can be given the correct concrete type (e.g. T → Task).
+        let mut compiled_args: Vec<Option<(BasicValueEnum<'ctx>, VarType)>> =
+            vec![None; args.len()];
+
+        for (i, arg) in args.iter().enumerate() {
+            if matches!(arg.kind, ExprKind::ArrowFunction { .. }) {
+                continue; // defer
+            }
+            compiled_args[i] = Some(self.compile_expr(arg, function)?);
+        }
+
+        // Infer type parameters from non-arrow argument VarTypes using recursive matching.
+        // This handles T, T[], (T)=>R, etc.
         let mut substitutions: HashMap<String, VarType> = HashMap::new();
         for (i, param) in params.iter().enumerate() {
             if let Some(ref ann) = param.type_ann {
-                if let TypeAnnKind::Named(ref type_name) = ann.kind {
-                    if tp_names.contains(type_name) {
-                        if let Some((_, ref arg_vt)) = compiled_args.get(i) {
-                            substitutions.insert(type_name.clone(), arg_vt.clone());
+                if let Some(Some((_, ref arg_vt))) = compiled_args.get(i) {
+                    Self::infer_type_params_from(ann, arg_vt, &tp_names, &mut substitutions);
+                }
+            }
+        }
+
+        // Phase 2: compile arrow-function arguments now that substitutions are known.
+        // For each arrow arg, look at the corresponding template parameter annotation.
+        // If it is a FunctionType, map each of its param types through the substitution
+        // table to produce param_vt_overrides for compile_closure.
+        for (i, arg) in args.iter().enumerate() {
+            let ExprKind::ArrowFunction {
+                params: arrow_params,
+                return_type: arrow_ret,
+                body: arrow_body,
+                is_async: arrow_async,
+            } = &arg.kind
+            else {
+                continue;
+            };
+
+            // Derive per-parameter type overrides from the template's function-type annotation.
+            let mut param_vt_overrides: Vec<VarType> = Vec::new();
+            if let Some(ref ann) = params.get(i).and_then(|p| p.type_ann.as_ref()) {
+                if let TypeAnnKind::FunctionType {
+                    params: fn_param_anns,
+                    ..
+                } = &ann.kind
+                {
+                    for (j, p_ann) in fn_param_anns.iter().enumerate() {
+                        // Only override if the arrow parameter has no explicit annotation.
+                        let needs_override = arrow_params
+                            .get(j)
+                            .map(|p| p.type_ann.is_none())
+                            .unwrap_or(false);
+                        if needs_override {
+                            // Apply substitutions to the template param type annotation.
+                            let concrete_vt = match &p_ann.kind {
+                                TypeAnnKind::Named(tp) => substitutions
+                                    .get(tp)
+                                    .cloned()
+                                    .unwrap_or_else(|| self.type_ann_to_var_type(p_ann)),
+                                _ => self.type_ann_to_var_type(p_ann),
+                            };
+                            param_vt_overrides.push(concrete_vt);
+                        } else {
+                            // Annotated — push a placeholder so indices align.
+                            param_vt_overrides.push(
+                                arrow_params
+                                    .get(j)
+                                    .and_then(|p| p.type_ann.as_ref())
+                                    .map(|a| self.type_ann_to_var_type(a))
+                                    .unwrap_or(VarType::Number),
+                            );
                         }
                     }
                 }
             }
+
+            // Convert arrow body to statement list (mirrors ExprKind::ArrowFunction arm).
+            let body_stmts: Vec<Statement> = match arrow_body {
+                ArrowBody::Expr(e) => vec![Statement {
+                    kind: StmtKind::Return {
+                        value: Some(*e.clone()),
+                    },
+                    span: e.span.clone(),
+                }],
+                ArrowBody::Block(stmts) => stmts.clone(),
+            };
+
+            let fn_name = format!("__arrow_{}", self.arrow_counter);
+            self.arrow_counter += 1;
+
+            let captures = self.find_captures(&body_stmts, arrow_params);
+
+            let compiled = if *arrow_async {
+                // Async arrows are rare in generic callbacks; fall back to no overrides.
+                self.compile_closure(
+                    &fn_name,
+                    arrow_params,
+                    arrow_ret,
+                    &body_stmts,
+                    captures,
+                    function,
+                    &[],
+                )?
+            } else {
+                self.compile_closure(
+                    &fn_name,
+                    arrow_params,
+                    arrow_ret,
+                    &body_stmts,
+                    captures,
+                    function,
+                    &param_vt_overrides,
+                )?
+            };
+
+            compiled_args[i] = Some(compiled);
         }
+
+        // Unwrap: every slot must be filled by now.
+        let compiled_args: Vec<(BasicValueEnum<'ctx>, VarType)> = compiled_args
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                opt.ok_or_else(|| {
+                    CompileError::error(
+                        format!("Failed to compile argument {} of '{}'", i, name),
+                        span.clone(),
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         // Generate mangled specialization name
         let suffix: String = tp_names
@@ -10163,6 +10438,10 @@ impl<'ctx> Codegen<'ctx> {
         self.module
             .run_passes("default<O3>", &machine, options)
             .map_err(|e| e.to_string())
+    }
+
+    pub fn verify_module(&self) -> Result<(), String> {
+        self.module.verify().map_err(|e| e.to_string())
     }
 
     pub fn write_object_file(&self, path: &Path) -> Result<(), String> {
