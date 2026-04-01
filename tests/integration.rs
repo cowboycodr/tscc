@@ -1590,6 +1590,31 @@ if (isSuccess(r)) {
     }
 
     #[test]
+    fn type_predicate_generic_called_in_async_function() {
+        // Generic specialization must not inherit the outer async function's
+        // promise context when the predicate body returns.
+        let src = r#"
+type Result<T> =
+  | { success: true; data: T }
+  | { success: false; error: string }
+
+function isSuccess<T>(result: Result<T>): result is { success: true; data: T } {
+  return result.success
+}
+
+async function main(): Promise<void> {
+  const r: Result<number> = { success: true, data: 42, error: "" }
+  if (isSuccess(r)) {
+    console.log(r.data)
+  }
+}
+
+main()
+"#;
+        assert_eq!(run_ts(src), "42\n");
+    }
+
+    #[test]
     fn type_predicate_else_branch() {
         // The else branch narrows to the non-matching union variants.
         let src = r#"
@@ -1607,6 +1632,84 @@ if (isCircle(s)) {
 }
 "#;
         assert_eq!(run_ts(src), "5\n");
+    }
+}
+
+mod utility_types {
+    use super::*;
+
+    #[test]
+    fn mapped_type() {
+        let src = r#"
+type Readonly<T> = {
+    readonly [P in keyof T]: T[P]
+}
+"#;
+        run_ts(src);
+    }
+
+    #[test]
+    fn partial_omit_object_spread_update() {
+        let src = r#"
+enum Status {
+    Todo = "todo",
+    InProgress = "in-progress"
+}
+
+interface Task {
+    id: string
+    title: string
+    status: Status
+    createdAt: number
+}
+
+type TaskUpdate = Partial<Omit<Task, "id" | "createdAt">>
+
+function update(task: Task, patch: TaskUpdate): Task {
+    return { ...task, ...patch }
+}
+
+const task: Task = {
+    id: "1",
+    title: "Learn TypeScript",
+    status: Status.Todo,
+    createdAt: 1
+}
+
+const next = update(task, { status: Status.InProgress })
+console.log(next.title)
+console.log(next.status)
+"#;
+        assert_eq!(run_ts(src), "Learn TypeScript\nin-progress\n");
+    }
+
+    #[test]
+    fn mapped_type_over_string_enum_keys() {
+        let src = r#"
+enum TaskStatus {
+    Todo = "todo",
+    InProgress = "in-progress",
+    Done = "done"
+}
+
+type StatusCounts = {
+    [K in TaskStatus]: number
+}
+
+function make_counts(): StatusCounts {
+    return {
+        [TaskStatus.Todo]: 1,
+        [TaskStatus.InProgress]: 2,
+        [TaskStatus.Done]: 3
+    }
+}
+
+const counts = make_counts()
+console.log(counts["todo"])
+console.log(counts["in-progress"])
+console.log(counts.done)
+"#;
+        assert_eq!(run_ts(src), "1\n2\n3\n");
     }
 }
 
@@ -3678,16 +3781,6 @@ let x: IsNumber<number> = "yes"
 console.log(x)
 "#;
         assert_eq!(run_ts(src), "yes\n");
-    }
-
-    #[test]
-    fn mapped_type() {
-        let src = r#"
-type Readonly<T> = {
-    readonly [P in keyof T]: T[P]
-}
-"#;
-        run_ts(src);
     }
 
     #[test]

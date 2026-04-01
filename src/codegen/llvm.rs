@@ -88,6 +88,9 @@ pub struct Codegen<'ctx> {
     /// String enum member values: enum_name -> (member_name -> string_value)
     /// Used to resolve computed property keys like [TaskStatus.Todo] → "todo"
     enum_string_values: HashMap<String, HashMap<String, String>>,
+    /// String enum values in declaration order, for mapped types like
+    /// `{ [K in TaskStatus]: number }`.
+    enum_string_value_order: HashMap<String, Vec<String>>,
     /// Class field initializers: class_name -> Vec<(field_name, initializer_expr)>
     class_field_initializers: HashMap<String, Vec<(String, Expr)>>,
     /// Inside an async function body: holds the alloca'd promise pointer variable.
@@ -110,13 +113,17 @@ enum VarType {
     /// Closure: a function value with optional captured environment
     /// Represented as { fn_ptr, env_ptr } struct in LLVM
     Closure {
-        fn_name: String,
         param_types: Vec<VarType>,
         return_type: Box<VarType>,
     },
     /// Object/class instance with ordered fields
     Object {
         struct_type_name: String,
+        fields: Vec<(String, VarType)>,
+    },
+    /// Object with presence flags for each field, used for `Partial<T>` so
+    /// object spread can distinguish omitted fields from explicit zero values.
+    PartialObject {
         fields: Vec<(String, VarType)>,
     },
     /// Tagged union: runtime type tag + variant data
@@ -206,6 +213,7 @@ impl<'ctx> Codegen<'ctx> {
             generic_alias_params: HashMap::new(),
             pending_loop_label: None,
             enum_string_values: HashMap::new(),
+            enum_string_value_order: HashMap::new(),
             class_field_initializers: HashMap::new(),
             current_async_promise: None,
             current_async_resolve_vt: None,
@@ -994,15 +1002,19 @@ impl<'ctx> Codegen<'ctx> {
         for stmt in &program.statements {
             if let StmtKind::EnumDecl { name, members } = &stmt.kind {
                 let mut string_members: HashMap<String, String> = HashMap::new();
+                let mut string_values = Vec::new();
                 let mut is_string_enum = false;
                 for member in members {
                     if let Some(crate::parser::ast::EnumValue::String(s)) = &member.value {
                         string_members.insert(member.name.clone(), s.clone());
+                        string_values.push(s.clone());
                         is_string_enum = true;
                     }
                 }
                 if is_string_enum {
                     self.enum_string_values.insert(name.clone(), string_members);
+                    self.enum_string_value_order
+                        .insert(name.clone(), string_values);
                 }
             }
         }
@@ -1245,12 +1257,14 @@ impl<'ctx> Codegen<'ctx> {
                     for method in methods.iter() {
                         let method_fn_name = format!("{}_{}", name, method.name);
                         let mut mp_types: Vec<BasicMetadataTypeEnum> = vec![ptr_type.into()];
+                        let mut param_vts = Vec::new();
                         for param in &method.params {
                             let vt = param
                                 .type_ann
                                 .as_ref()
                                 .map(|ann| self.type_ann_to_var_type(ann))
                                 .unwrap_or(VarType::Number);
+                            param_vts.push(vt.clone());
                             mp_types.push(self.var_type_to_llvm(&vt).into());
                         }
                         let ret_vt = method
@@ -1262,6 +1276,8 @@ impl<'ctx> Codegen<'ctx> {
                         let mfn_type = ret_llvm.fn_type(&mp_types, false);
                         let mfn = self.module.add_function(&method_fn_name, mfn_type, None);
                         self.functions.insert(method_fn_name.clone(), mfn);
+                        self.function_param_var_types
+                            .insert(method_fn_name.clone(), param_vts);
                         self.function_return_types.insert(method_fn_name, ret_vt);
                     }
 
@@ -1561,6 +1577,7 @@ impl<'ctx> Codegen<'ctx> {
 
                 // Collect string enum values for computed property key resolution
                 let mut string_members: HashMap<String, String> = HashMap::new();
+                let mut string_values = Vec::new();
 
                 for member in members {
                     match &member.value {
@@ -1568,6 +1585,7 @@ impl<'ctx> Codegen<'ctx> {
                             field_names.push(member.name.clone());
                             field_values.push((self.create_string_literal(s), VarType::String));
                             string_members.insert(member.name.clone(), s.clone());
+                            string_values.push(s.clone());
                         }
                         Some(EnumValue::Number(n)) => {
                             next_index = *n as i64;
@@ -1628,6 +1646,8 @@ impl<'ctx> Codegen<'ctx> {
                 // Register string enum values for computed property key resolution
                 if !string_members.is_empty() {
                     self.enum_string_values.insert(name.clone(), string_members);
+                    self.enum_string_value_order
+                        .insert(name.clone(), string_values);
                 }
 
                 Ok(())
@@ -3948,7 +3968,7 @@ impl<'ctx> Codegen<'ctx> {
                 params,
                 return_type,
                 body,
-                is_async,
+                is_async: _,
             } => {
                 // Generate unique function name
                 let fn_name = format!("__arrow_{}", self.arrow_counter);
@@ -4043,12 +4063,211 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    fn compile_plain_object_literal(
+        &mut self,
+        properties: &[ObjectProperty],
+        function: FunctionValue<'ctx>,
+    ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        enum ObjectWrite<'ctx> {
+            SpreadObject {
+                value: inkwell::values::StructValue<'ctx>,
+                fields: Vec<(String, VarType)>,
+            },
+            SpreadPartial {
+                value: inkwell::values::StructValue<'ctx>,
+                fields: Vec<(String, VarType)>,
+            },
+            Property {
+                key: String,
+                value: BasicValueEnum<'ctx>,
+            },
+        }
+
+        let mut computed_counter: usize = 0;
+        let mut writes: Vec<ObjectWrite<'ctx>> = Vec::new();
+        let mut final_fields: Vec<(String, VarType)> = Vec::new();
+
+        for prop in properties {
+            if prop.is_spread {
+                let (spread_val, spread_vt) = self.compile_expr(&prop.value, function)?;
+                match spread_vt {
+                    VarType::Object { fields, .. } => {
+                        for (field_name, field_vt) in &fields {
+                            Self::upsert_object_field(
+                                &mut final_fields,
+                                field_name.clone(),
+                                field_vt.clone(),
+                            );
+                        }
+                        writes.push(ObjectWrite::SpreadObject {
+                            value: spread_val.into_struct_value(),
+                            fields,
+                        });
+                    }
+                    VarType::PartialObject { fields } => {
+                        for (field_name, field_vt) in &fields {
+                            Self::upsert_object_field(
+                                &mut final_fields,
+                                field_name.clone(),
+                                field_vt.clone(),
+                            );
+                        }
+                        writes.push(ObjectWrite::SpreadPartial {
+                            value: spread_val.into_struct_value(),
+                            fields,
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            let key = if let Some(ref key_expr) = prop.computed_key {
+                self.try_resolve_computed_key(key_expr, &mut computed_counter)
+            } else {
+                prop.key.clone()
+            };
+            let (value, vt) = self.compile_expr(&prop.value, function)?;
+            Self::upsert_object_field(&mut final_fields, key.clone(), vt);
+            writes.push(ObjectWrite::Property { key, value });
+        }
+
+        let obj_vt = VarType::Object {
+            struct_type_name: format!("__obj_{}", self.arrow_counter),
+            fields: final_fields.clone(),
+        };
+        self.arrow_counter += 1;
+
+        let struct_type = self.var_type_to_llvm(&obj_vt).into_struct_type();
+        let result_alloca = self.create_alloca(function, &obj_vt, "obj_tmp");
+        self.builder
+            .build_store(result_alloca, struct_type.const_zero())
+            .unwrap();
+
+        for write in writes {
+            match write {
+                ObjectWrite::SpreadObject { value, fields } => {
+                    for (src_idx, (field_name, _)) in fields.iter().enumerate() {
+                        if let Some(dst_idx) = Self::object_field_index(&final_fields, field_name) {
+                            let field_val = self
+                                .builder
+                                .build_extract_value(value, src_idx as u32, field_name)
+                                .unwrap();
+                            let field_ptr = self
+                                .builder
+                                .build_struct_gep(
+                                    struct_type,
+                                    result_alloca,
+                                    dst_idx as u32,
+                                    &format!("obj.{}", field_name),
+                                )
+                                .unwrap();
+                            self.builder.build_store(field_ptr, field_val).unwrap();
+                        }
+                    }
+                }
+                ObjectWrite::SpreadPartial { value, fields } => {
+                    for (src_idx, (field_name, _)) in fields.iter().enumerate() {
+                        let Some(dst_idx) = Self::object_field_index(&final_fields, field_name)
+                        else {
+                            continue;
+                        };
+
+                        let present = self
+                            .builder
+                            .build_extract_value(
+                                value,
+                                (src_idx * 2) as u32,
+                                &format!("partial.present.{}", field_name),
+                            )
+                            .unwrap()
+                            .into_int_value();
+                        let field_val = self
+                            .builder
+                            .build_extract_value(value, (src_idx * 2 + 1) as u32, field_name)
+                            .unwrap();
+
+                        let store_bb = self.context.append_basic_block(function, "partial.store");
+                        let next_bb = self.context.append_basic_block(function, "partial.next");
+                        self.builder
+                            .build_conditional_branch(present, store_bb, next_bb)
+                            .unwrap();
+
+                        self.builder.position_at_end(store_bb);
+                        let field_ptr = self
+                            .builder
+                            .build_struct_gep(
+                                struct_type,
+                                result_alloca,
+                                dst_idx as u32,
+                                &format!("obj.{}", field_name),
+                            )
+                            .unwrap();
+                        self.builder.build_store(field_ptr, field_val).unwrap();
+                        self.builder.build_unconditional_branch(next_bb).unwrap();
+
+                        self.builder.position_at_end(next_bb);
+                    }
+                }
+                ObjectWrite::Property { key, value } => {
+                    if let Some(dst_idx) = Self::object_field_index(&final_fields, &key) {
+                        let field_ptr = self
+                            .builder
+                            .build_struct_gep(
+                                struct_type,
+                                result_alloca,
+                                dst_idx as u32,
+                                &format!("obj.{}", key),
+                            )
+                            .unwrap();
+                        self.builder.build_store(field_ptr, value).unwrap();
+                    }
+                }
+            }
+        }
+
+        let result = self
+            .builder
+            .build_load(struct_type, result_alloca, "obj")
+            .unwrap();
+
+        if let Some((merged_name, merged_fields)) = self.find_union_superset(&final_fields) {
+            let (merged_struct_type, _, _) =
+                self.class_struct_types.get(&merged_name).cloned().unwrap();
+            let mut wide_val = merged_struct_type.const_zero();
+            for (src_idx, (src_name, _)) in final_fields.iter().enumerate() {
+                if let Some(dst_idx) = merged_fields.iter().position(|(n, _)| n == src_name) {
+                    let src_val = self
+                        .builder
+                        .build_extract_value(result.into_struct_value(), src_idx as u32, src_name)
+                        .unwrap();
+                    wide_val = self
+                        .builder
+                        .build_insert_value(wide_val, src_val, dst_idx as u32, "union.field")
+                        .unwrap()
+                        .into_struct_value();
+                }
+            }
+            let wide_vt = VarType::Object {
+                struct_type_name: merged_name,
+                fields: merged_fields,
+            };
+            return Ok((wide_val.into(), wide_vt));
+        }
+
+        Ok((result, obj_vt))
+    }
+
     fn compile_object_literal(
         &mut self,
         properties: &[ObjectProperty],
         function: FunctionValue<'ctx>,
         span: &Span,
     ) -> Result<(BasicValueEnum<'ctx>, VarType), CompileError> {
+        if properties.iter().all(|prop| !prop.is_method) {
+            return self.compile_plain_object_literal(properties, function);
+        }
+
         // Compile all property values and determine their VarTypes
         let mut field_vals: Vec<(String, BasicValueEnum<'ctx>, VarType)> = Vec::new();
 
@@ -4338,6 +4557,115 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         (val, src_vt.clone())
+    }
+
+    fn coerce_to_partial_object_target(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        src_vt: &VarType,
+        target_vt: &VarType,
+    ) -> (BasicValueEnum<'ctx>, VarType) {
+        let VarType::PartialObject {
+            fields: target_fields,
+        } = target_vt
+        else {
+            return (val, src_vt.clone());
+        };
+
+        let partial_type = self.partial_object_llvm_type(target_fields);
+        let mut partial_val = partial_type.const_zero();
+
+        match src_vt {
+            VarType::Object {
+                fields: src_fields, ..
+            } => {
+                let src_struct = val.into_struct_value();
+                for (target_idx, (target_name, _)) in target_fields.iter().enumerate() {
+                    if let Some(src_idx) =
+                        src_fields.iter().position(|(name, _)| name == target_name)
+                    {
+                        let field_val = self
+                            .builder
+                            .build_extract_value(src_struct, src_idx as u32, target_name)
+                            .unwrap();
+                        partial_val = self
+                            .builder
+                            .build_insert_value(
+                                partial_val,
+                                self.context.bool_type().const_int(1, false),
+                                (target_idx * 2) as u32,
+                                "partial.present",
+                            )
+                            .unwrap()
+                            .into_struct_value();
+                        partial_val = self
+                            .builder
+                            .build_insert_value(
+                                partial_val,
+                                field_val,
+                                (target_idx * 2 + 1) as u32,
+                                "partial.value",
+                            )
+                            .unwrap()
+                            .into_struct_value();
+                    }
+                }
+                (partial_val.into(), target_vt.clone())
+            }
+            VarType::PartialObject { fields: src_fields } => {
+                let src_struct = val.into_struct_value();
+                for (target_idx, (target_name, _)) in target_fields.iter().enumerate() {
+                    if let Some(src_idx) =
+                        src_fields.iter().position(|(name, _)| name == target_name)
+                    {
+                        let present = self
+                            .builder
+                            .build_extract_value(
+                                src_struct,
+                                (src_idx * 2) as u32,
+                                "partial.present",
+                            )
+                            .unwrap();
+                        let field_val = self
+                            .builder
+                            .build_extract_value(src_struct, (src_idx * 2 + 1) as u32, target_name)
+                            .unwrap();
+                        partial_val = self
+                            .builder
+                            .build_insert_value(
+                                partial_val,
+                                present,
+                                (target_idx * 2) as u32,
+                                "partial.present",
+                            )
+                            .unwrap()
+                            .into_struct_value();
+                        partial_val = self
+                            .builder
+                            .build_insert_value(
+                                partial_val,
+                                field_val,
+                                (target_idx * 2 + 1) as u32,
+                                "partial.value",
+                            )
+                            .unwrap()
+                            .into_struct_value();
+                    }
+                }
+                (partial_val.into(), target_vt.clone())
+            }
+            _ => (val, src_vt.clone()),
+        }
+    }
+
+    fn coerce_value_to_target(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        src_vt: &VarType,
+        target_vt: &VarType,
+    ) -> (BasicValueEnum<'ctx>, VarType) {
+        let (val, vt) = self.coerce_to_object_target(val, src_vt, target_vt);
+        self.coerce_to_partial_object_target(val, &vt, target_vt)
     }
 
     fn compile_member_assignment(
@@ -5074,7 +5402,6 @@ impl<'ctx> Codegen<'ctx> {
             // env_ptr (the promise pointer) and resolves the promise with null/undefined.
             // param_types = [] because there are no JS-level arguments to resolve().
             let resolve_param_vt = VarType::Closure {
-                fn_name: shim_name.clone(),
                 param_types: vec![],
                 return_type: Box::new(VarType::Number),
             };
@@ -5583,6 +5910,8 @@ impl<'ctx> Codegen<'ctx> {
             method_fn.add_attribute(AttributeLoc::Function, nounwind);
 
             self.functions.insert(method_fn_name.clone(), method_fn);
+            self.function_param_var_types
+                .insert(method_fn_name.clone(), param_vts.clone());
             self.function_return_types
                 .insert(method_fn_name.clone(), ret_vt.clone());
 
@@ -5749,9 +6078,11 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Number | VarType::Integer => "number",
             VarType::String => "string",
             VarType::Boolean => "boolean",
-            VarType::Array | VarType::StringArray | VarType::Object { .. } | VarType::Tuple(_) => {
-                "object"
-            }
+            VarType::Array
+            | VarType::StringArray
+            | VarType::Object { .. }
+            | VarType::PartialObject { .. }
+            | VarType::Tuple(_) => "object",
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "function",
             VarType::Union(_) => "object", // fallback for non-identifier unions
             VarType::Map { .. } | VarType::ObjArray { .. } => "object",
@@ -6491,8 +6822,17 @@ impl<'ctx> Codegen<'ctx> {
                             };
 
                             let mut call_args: Vec<BasicMetadataValueEnum> = vec![obj_ptr.into()];
-                            for arg in args {
-                                let (val, _) = self.compile_expr(arg, function)?;
+                            let method_param_vts =
+                                self.function_param_var_types.get(fn_name).cloned();
+                            for (arg_idx, arg) in args.iter().enumerate() {
+                                let (val, vt) = self.compile_expr(arg, function)?;
+                                let val = if let Some(target_vt) =
+                                    method_param_vts.as_ref().and_then(|pvts| pvts.get(arg_idx))
+                                {
+                                    self.coerce_value_to_target(val, &vt, target_vt).0
+                                } else {
+                                    val
+                                };
                                 call_args.push(val.into());
                             }
 
@@ -6692,7 +7032,15 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 let target_param_vts = self.function_param_var_types.get(name).cloned();
                 for (arg_idx, arg) in args.iter().enumerate() {
-                    let (val, vt) = self.compile_expr(arg, function)?;
+                    let (mut val, mut vt) = self.compile_expr(arg, function)?;
+
+                    if let Some(target_vt) =
+                        target_param_vts.as_ref().and_then(|pvts| pvts.get(arg_idx))
+                    {
+                        let coerced = self.coerce_value_to_target(val, &vt, target_vt);
+                        val = coerced.0;
+                        vt = coerced.1;
+                    }
 
                     // Check if the target parameter is a union type
                     let is_union_param = target_param_vts
@@ -6996,6 +7344,9 @@ impl<'ctx> Codegen<'ctx> {
                         }
                     }
                     self.print_string_literal(" }", print_str);
+                }
+                VarType::PartialObject { .. } => {
+                    self.print_string_literal("[object Object]", print_str);
                 }
                 VarType::Union(_) => {
                     // Unions should be narrowed before printing; fallback to [union]
@@ -8828,6 +9179,7 @@ impl<'ctx> Codegen<'ctx> {
                 Ok(self.create_string_literal("[Function]"))
             }
             VarType::Object { .. } => Ok(self.create_string_literal("[object Object]")),
+            VarType::PartialObject { .. } => Ok(self.create_string_literal("[object Object]")),
             VarType::Union(_) => {
                 // Unions should be narrowed before to_string is called; fallback
                 Ok(self.create_string_literal("[union]"))
@@ -8982,6 +9334,15 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap()
     }
 
+    fn partial_object_llvm_type(&self, fields: &[(String, VarType)]) -> StructType<'ctx> {
+        let mut field_types: Vec<BasicTypeEnum> = Vec::with_capacity(fields.len() * 2);
+        for (_, field_vt) in fields {
+            field_types.push(self.context.bool_type().into());
+            field_types.push(self.var_type_to_llvm(field_vt));
+        }
+        self.context.struct_type(&field_types, false)
+    }
+
     fn var_type_to_llvm(&self, vt: &VarType) -> BasicTypeEnum<'ctx> {
         match vt {
             VarType::Number => self.context.f64_type().into(),
@@ -9010,6 +9371,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.context.struct_type(&field_types, false).into()
                 }
             }
+            VarType::PartialObject { fields } => self.partial_object_llvm_type(fields).into(),
             VarType::Union(_) => self.get_union_llvm_type().into(),
             VarType::Tuple(ref elements) => {
                 let field_types: Vec<BasicTypeEnum> = elements
@@ -9021,6 +9383,70 @@ impl<'ctx> Codegen<'ctx> {
             // Promise is a pointer to MgPromise
             VarType::Promise { .. } => self.context.ptr_type(AddressSpace::default()).into(),
         }
+    }
+
+    fn extract_string_literal_keys_from_type_ann(
+        &self,
+        ann: &TypeAnnotation,
+    ) -> Option<Vec<String>> {
+        match &ann.kind {
+            TypeAnnKind::StringLiteral(s) => Some(vec![s.clone()]),
+            TypeAnnKind::Union(variants) => {
+                let mut keys = Vec::new();
+                for variant in variants {
+                    keys.extend(self.extract_string_literal_keys_from_type_ann(variant)?);
+                }
+                Some(keys)
+            }
+            TypeAnnKind::Named(name) => self.enum_string_value_order.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    fn upsert_object_field(fields: &mut Vec<(String, VarType)>, name: String, vt: VarType) {
+        if let Some(existing_idx) = fields
+            .iter()
+            .position(|(field_name, _)| field_name == &name)
+        {
+            fields[existing_idx].1 = vt;
+        } else {
+            fields.push((name, vt));
+        }
+    }
+
+    fn object_field_index(fields: &[(String, VarType)], name: &str) -> Option<usize> {
+        fields.iter().position(|(field_name, _)| field_name == name)
+    }
+
+    fn omit_object_fields(
+        &mut self,
+        source_vt: VarType,
+        keys_ann: &TypeAnnotation,
+    ) -> Option<Vec<(String, VarType)>> {
+        let keys = self.extract_string_literal_keys_from_type_ann(keys_ann)?;
+        let VarType::Object { fields, .. } = source_vt else {
+            return None;
+        };
+        Some(
+            fields
+                .into_iter()
+                .filter(|(field_name, _)| !keys.iter().any(|key| key == field_name))
+                .collect(),
+        )
+    }
+
+    fn mapped_object_fields(
+        &mut self,
+        constraint: &TypeAnnotation,
+        value_type: &TypeAnnotation,
+    ) -> Option<Vec<(String, VarType)>> {
+        let keys = self.extract_string_literal_keys_from_type_ann(constraint)?;
+        let value_vt = self.type_ann_to_var_type(value_type);
+        Some(
+            keys.into_iter()
+                .map(|key| (key, value_vt.clone()))
+                .collect(),
+        )
     }
 
     fn type_ann_to_var_type(&mut self, ann: &TypeAnnotation) -> VarType {
@@ -9196,7 +9622,6 @@ impl<'ctx> Codegen<'ctx> {
                     .collect();
                 let ret_vt = self.type_ann_to_var_type(return_type);
                 VarType::Closure {
-                    fn_name: String::new(),
                     param_types,
                     return_type: Box::new(ret_vt),
                 }
@@ -9218,6 +9643,23 @@ impl<'ctx> Codegen<'ctx> {
                     return VarType::Promise {
                         inner_vt: Box::new(inner_vt),
                     };
+                }
+                if name == "Omit" && type_args.len() >= 2 {
+                    let source_vt = self.type_ann_to_var_type(&type_args[0]);
+                    if let Some(fields) = self.omit_object_fields(source_vt, &type_args[1]) {
+                        return VarType::Object {
+                            struct_type_name: format!("__omit_obj_{}", fields.len()),
+                            fields,
+                        };
+                    }
+                    return self.number_mode.clone();
+                }
+                if name == "Partial" && !type_args.is_empty() {
+                    let source_vt = self.type_ann_to_var_type(&type_args[0]);
+                    if let VarType::Object { fields, .. } = source_vt {
+                        return VarType::PartialObject { fields };
+                    }
+                    return self.number_mode.clone();
                 }
                 // Map<K, V> → VarType::Map { val_vt }
                 if name == "Map" && type_args.len() >= 2 {
@@ -9264,7 +9706,20 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             TypeAnnKind::Mapped { .. } => {
-                // Mapped types are type-only — no runtime representation
+                if let TypeAnnKind::Mapped {
+                    constraint,
+                    value_type,
+                    ..
+                } = &ann.kind
+                {
+                    if let Some(fields) = self.mapped_object_fields(constraint, value_type) {
+                        return VarType::Object {
+                            struct_type_name: format!("__mapped_obj_{}", fields.len()),
+                            fields,
+                        };
+                    }
+                }
+                // Unsupported mapped types remain type-only for now.
                 self.number_mode.clone()
             }
             TypeAnnKind::IndexedAccess { .. } => {
@@ -9303,6 +9758,11 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 val.into()
             }
+            VarType::PartialObject { .. } => self
+                .var_type_to_llvm(vt)
+                .into_struct_type()
+                .const_zero()
+                .into(),
             VarType::Union(_) => self.get_union_llvm_type().const_zero().into(),
             VarType::Tuple(ref elements) => {
                 let llvm_type = self.var_type_to_llvm(vt);
@@ -10035,7 +10495,6 @@ impl<'ctx> Codegen<'ctx> {
             .into_struct_value();
 
         let closure_vt = VarType::Closure {
-            fn_name: fn_name.to_string(),
             param_types: param_vts,
             return_type: Box::new(ret_vt.unwrap_or(VarType::Number)),
         };
@@ -10260,6 +10719,8 @@ impl<'ctx> Codegen<'ctx> {
             // Save current state
             let prev_subs = std::mem::replace(&mut self.type_substitutions, substitutions.clone());
             let prev_mode = self.number_mode.clone();
+            let prev_async_promise = self.current_async_promise.take();
+            let prev_async_resolve_vt = self.current_async_resolve_vt.take();
 
             // Compile the specialized function
             self.compile_function_decl(&mangled_name, &params, &return_type, &body)?;
@@ -10267,6 +10728,8 @@ impl<'ctx> Codegen<'ctx> {
             // Restore state
             self.type_substitutions = prev_subs;
             self.number_mode = prev_mode;
+            self.current_async_promise = prev_async_promise;
+            self.current_async_resolve_vt = prev_async_resolve_vt;
         }
 
         // Call the specialized function
@@ -10322,6 +10785,7 @@ impl<'ctx> Codegen<'ctx> {
             VarType::Array | VarType::StringArray => "a",
             VarType::FunctionPtr { .. } | VarType::Closure { .. } => "f",
             VarType::Object { .. } => "o",
+            VarType::PartialObject { .. } => "po",
             VarType::Union(_) => "u",
             VarType::Tuple(_) => "t",
             VarType::Map { .. } => "m",

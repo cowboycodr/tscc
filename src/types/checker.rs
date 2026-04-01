@@ -36,6 +36,11 @@ pub struct TypeChecker {
     generic_functions: HashMap<String, (Vec<String>, Vec<Type>, Type)>,
     /// Generic type aliases: name -> (type_param_names, body)
     generic_type_aliases: HashMap<String, (Vec<String>, TypeAnnotation)>,
+    /// String enum member values by enum/member name.
+    enum_string_members: HashMap<String, HashMap<String, String>>,
+    /// String enum members in declaration order, for mapped types like
+    /// `{ [K in Status]: number }`.
+    enum_string_values: HashMap<String, Vec<String>>,
     /// Type predicate functions: fn_name → (param_name, narrowed_type).
     /// Populated when a function with `param is T` return annotation is declared.
     /// Used to narrow the argument type in `if (fn(x))` conditions.
@@ -56,6 +61,8 @@ impl TypeChecker {
             type_param_types: HashMap::new(),
             generic_functions: HashMap::new(),
             generic_type_aliases: HashMap::new(),
+            enum_string_members: HashMap::new(),
+            enum_string_values: HashMap::new(),
             type_predicates: HashMap::new(),
         };
         checker.push_scope();
@@ -603,18 +610,24 @@ impl TypeChecker {
             StmtKind::EnumDecl { name, members } => {
                 // Register enum as an object type with member fields
                 let mut field_types = Vec::new();
-                let mut next_index: f64 = 0.0;
+                let mut string_members = HashMap::new();
+                let mut string_values = Vec::new();
+                let mut all_string = true;
                 for member in members {
                     let member_type = match &member.value {
-                        Some(EnumValue::String(_)) => Type::String,
+                        Some(EnumValue::String(s)) => {
+                            string_members.insert(member.name.clone(), s.clone());
+                            string_values.push(s.clone());
+                            Type::String
+                        }
                         Some(EnumValue::Number(_)) => Type::Number,
                         None => {
-                            next_index += 1.0;
+                            all_string = false;
                             Type::Number
                         }
                     };
-                    if let Some(EnumValue::Number(n)) = &member.value {
-                        next_index = n + 1.0;
+                    if let Some(EnumValue::Number(_)) = &member.value {
+                        all_string = false;
                     }
                     field_types.push((member.name.clone(), member_type));
                 }
@@ -622,6 +635,11 @@ impl TypeChecker {
                     fields: field_types,
                 };
                 self.define(name.clone(), enum_type, true);
+                if all_string && !string_values.is_empty() {
+                    self.enum_string_members
+                        .insert(name.clone(), string_members);
+                    self.enum_string_values.insert(name.clone(), string_values);
+                }
                 Ok(())
             }
 
@@ -1028,18 +1046,21 @@ impl TypeChecker {
                     if prop.is_spread {
                         // Spread: { ...expr } — merge source fields into this object's type
                         let spread_ty = self.check_expr(&prop.value)?;
-                        if let Type::Object {
-                            fields: spread_fields,
-                        } = spread_ty
-                        {
+                        if let Some(spread_fields) = Self::object_fields_for_type(&spread_ty) {
                             for (name, ty) in spread_fields {
-                                fields.push((name, ty));
+                                Self::upsert_object_field(&mut fields, name, ty);
                             }
                         }
                     } else if prop.computed_key.is_some() {
-                        // Computed key: { [expr]: value } — type-check both sides, skip field tracking
+                        // Computed key: { [expr]: value } — track fields when the key can be
+                        // resolved at compile time (string literal / string enum member).
                         self.check_expr(prop.computed_key.as_ref().unwrap())?;
-                        self.check_expr(&prop.value)?;
+                        let value_ty = self.check_expr(&prop.value)?;
+                        if let Some(key) =
+                            self.resolve_computed_object_key(prop.computed_key.as_ref().unwrap())
+                        {
+                            Self::upsert_object_field(&mut fields, key, value_ty);
+                        }
                     } else if prop.is_method {
                         // For methods, build a function type
                         let param_types: Vec<Type> = prop
@@ -1061,10 +1082,10 @@ impl TypeChecker {
                             params: param_types,
                             return_type: Box::new(ret_type),
                         };
-                        fields.push((prop.key.clone(), method_type));
+                        Self::upsert_object_field(&mut fields, prop.key.clone(), method_type);
                     } else {
                         let ty = self.check_expr(&prop.value)?;
-                        fields.push((prop.key.clone(), ty));
+                        Self::upsert_object_field(&mut fields, prop.key.clone(), ty);
                     }
                 }
 
@@ -2331,6 +2352,109 @@ impl TypeChecker {
         false
     }
 
+    fn object_fields_for_type(ty: &Type) -> Option<Vec<(String, Type)>> {
+        match ty {
+            Type::Object { fields } | Type::Class { fields, .. } => Some(fields.clone()),
+            _ => None,
+        }
+    }
+
+    fn upsert_object_field(fields: &mut Vec<(String, Type)>, name: String, ty: Type) {
+        if let Some(existing_idx) = fields
+            .iter()
+            .position(|(field_name, _)| field_name == &name)
+        {
+            fields[existing_idx].1 = ty;
+        } else {
+            fields.push((name, ty));
+        }
+    }
+
+    fn extract_string_literal_keys(&self, ann: &TypeAnnotation) -> Option<Vec<String>> {
+        match &ann.kind {
+            TypeAnnKind::StringLiteral(s) => Some(vec![s.clone()]),
+            TypeAnnKind::Union(variants) => {
+                let mut keys = Vec::new();
+                for variant in variants {
+                    keys.extend(self.extract_string_literal_keys(variant)?);
+                }
+                Some(keys)
+            }
+            TypeAnnKind::Named(name) => self.enum_string_values.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    fn omit_object_fields(
+        &self,
+        source_ty: &Type,
+        keys_ann: &TypeAnnotation,
+    ) -> Option<Vec<(String, Type)>> {
+        let fields = Self::object_fields_for_type(source_ty)?;
+        let keys = self.extract_string_literal_keys(keys_ann)?;
+        Some(
+            fields
+                .into_iter()
+                .filter(|(field_name, _)| !keys.iter().any(|key| key == field_name))
+                .collect(),
+        )
+    }
+
+    fn build_partial_type(fields: &[(String, Type)]) -> Type {
+        if fields.is_empty() {
+            return Type::Object { fields: Vec::new() };
+        }
+
+        if fields.len() >= usize::BITS as usize {
+            return Type::Unknown;
+        }
+
+        let variant_count = 1usize << fields.len();
+        let mut variants = Vec::with_capacity(variant_count);
+        for mask in 0..variant_count {
+            let mut subset = Vec::new();
+            for (idx, (name, ty)) in fields.iter().enumerate() {
+                if (mask & (1usize << idx)) != 0 {
+                    subset.push((name.clone(), ty.clone()));
+                }
+            }
+            variants.push(Type::Object { fields: subset });
+        }
+
+        Type::Union(variants)
+    }
+
+    fn resolve_computed_object_key(&self, expr: &Expr) -> Option<String> {
+        match &expr.kind {
+            ExprKind::StringLiteral(s) => Some(s.clone()),
+            ExprKind::Member { object, property } => {
+                if let ExprKind::Identifier(enum_name) = &object.kind {
+                    return self
+                        .enum_string_members
+                        .get(enum_name)
+                        .and_then(|members| members.get(property))
+                        .cloned();
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_mapped_object_fields(
+        &self,
+        constraint: &TypeAnnotation,
+        value_type: &TypeAnnotation,
+    ) -> Option<Vec<(String, Type)>> {
+        let keys = self.extract_string_literal_keys(constraint)?;
+        let value_ty = self.resolve_type_annotation(value_type);
+        Some(
+            keys.into_iter()
+                .map(|key| (key, value_ty.clone()))
+                .collect(),
+        )
+    }
+
     fn resolve_type_annotation(&self, ann: &TypeAnnotation) -> Type {
         match &ann.kind {
             TypeAnnKind::Number => Type::Number,
@@ -2445,6 +2569,20 @@ impl TypeChecker {
                         .unwrap_or(Type::Void);
                     return Type::Promise(Box::new(inner));
                 }
+                if name == "Omit" && type_args.len() >= 2 {
+                    let source_ty = self.resolve_type_annotation(&type_args[0]);
+                    if let Some(fields) = self.omit_object_fields(&source_ty, &type_args[1]) {
+                        return Type::Object { fields };
+                    }
+                    return Type::Unknown;
+                }
+                if name == "Partial" && !type_args.is_empty() {
+                    let source_ty = self.resolve_type_annotation(&type_args[0]);
+                    if let Some(fields) = Self::object_fields_for_type(&source_ty) {
+                        return Self::build_partial_type(&fields);
+                    }
+                    return Type::Unknown;
+                }
                 // Resolve generic type alias: IsNumber<number>
                 if let Some((tp_names, body)) = self.generic_type_aliases.get(name).cloned() {
                     // Resolve type args, then substitute into the body
@@ -2478,7 +2616,18 @@ impl TypeChecker {
                 }
             }
             TypeAnnKind::Mapped { .. } => {
-                // Mapped types produce no runtime values — resolve to Unknown
+                if let TypeAnnKind::Mapped {
+                    constraint,
+                    value_type,
+                    ..
+                } = &ann.kind
+                {
+                    if let Some(fields) = self.resolve_mapped_object_fields(constraint, value_type)
+                    {
+                        return Type::Object { fields };
+                    }
+                }
+                // Unsupported mapped types remain type-only for now.
                 Type::Unknown
             }
             TypeAnnKind::IndexedAccess {
